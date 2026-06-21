@@ -77,13 +77,12 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from ingest import GRAPH_ENABLED, RAW_DATA_DIR, embed_texts, get_collection_name, get_projects, ingest
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import FieldCondition, Filter, MatchValue
-
-from ingest import GRAPH_ENABLED, RAW_DATA_DIR, embed_texts, get_collection_name, get_embeddings, get_projects, ingest
 
 
 def _require_env(name: str) -> str:

@@ -252,7 +252,7 @@ class Tools:
 
         roles = self._roles()
         result_lines = [
-            f"✅ **Workflow đã được khởi chạy**",
+            "✅ **Workflow đã được khởi chạy**",
             f"- **ID:** `{workflow_id}`",
             f"- **Project:** {resolved_project or 'all'}",
             f"- **Steps:** {' → '.join(roles)}",

@@ -31,3 +31,8 @@ os.environ.setdefault("CHAT_MODEL", "qwen3.6:35b")
 os.environ.setdefault("RAG_TOP_K", "5")
 os.environ.setdefault("RAG_API_URL", "http://localhost:8090")
 os.environ.setdefault("RAW_DATA_DIR", str(ROOT / "data" / "raw"))
+# rag-api/ingest.py đọc các biến này bằng _require_env (raise nếu thiếu) lúc import —
+# phải set đủ để `import ingest` thành công khi CI đã cài service deps.
+os.environ.setdefault("CHUNK_SIZE", "1000")
+os.environ.setdefault("CHUNK_OVERLAP", "150")
+os.environ.setdefault("UPSERT_BATCH_SIZE", "32")
