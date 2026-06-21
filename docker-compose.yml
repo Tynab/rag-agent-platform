@@ -218,7 +218,13 @@ services:
       RAG_EMBEDDING_MODEL: ${EMBEDDING_MODEL}
       RAG_TOP_K: ${RAG_TOP_K}
       USER_AGENT: "rag-agent-platform/1.0"
-      CORS_ALLOW_ORIGIN: "http://18.191.161.84:8085,http://localhost:8085,http://127.0.0.1:8085"
+      # Bật WebSocket (Socket.IO) tường minh để câu trả lời stream real-time về browser
+      # (không phải F5 mới thấy). Mặc định đã true nhưng set rõ cho chắc.
+      ENABLE_WEBSOCKET_SUPPORT: "true"
+      # DEV: "*" để loại trừ nguyên nhân CORS chặn WebSocket handshake. Khi deploy thật,
+      # đổi lại allowlist cụ thể (giá trị cũ):
+      # "http://18.191.161.84:8085,http://localhost:8085,http://127.0.0.1:8085"
+      CORS_ALLOW_ORIGIN: "*"
     networks:
       - yan
     depends_on:
