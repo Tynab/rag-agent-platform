@@ -1,0 +1,19 @@
+# Cấu hình tooling dev cho rag-agent-platform (T1/T5).
+# Repo chạy chủ yếu qua Docker Compose; file này chỉ phục vụ test + lint cục bộ/CI,
+# KHÔNG biến repo thành một Python package cài đặt được.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["data", ".git"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort. Bỏ qua E501 (độ dài dòng) vì nhiều
+# system_prompt và docstring tiếng Việt dài — không phải lỗi logic.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

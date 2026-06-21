@@ -50,7 +50,7 @@ Mỗi PointStruct có payload đầy đủ:
     relative_path   — đường dẫn tương đối trong data/raw/
     file_type       — phần mở rộng (md, pdf, py ...)
     chunk_index     — số thứ tự chunk trong file
-    content_hash    — MD5 hash nội dung chunk (dùng cho idempotency)
+    content_hash    — SHA-256 hash nội dung chunk (dùng cho idempotency)
     embedding_model — tên model embedding đã dùng
     module          — tên thư mục con (dùng để filter theo module trong /ask)
     doc_type        — loại tài liệu: prd, schema, api, architecture, spec, other
@@ -87,6 +87,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -303,12 +304,24 @@ def split_documents(docs: list[Document]) -> list[Document]:
 
     chunks = splitter.split_documents(docs)
 
-    for chunk_index, chunk in enumerate(chunks):
+    # A7: chunk_index đánh số THEO TỪNG FILE (0..n trong mỗi file) thay vì global
+    # toàn project. split_documents giữ nguyên thứ tự nên chunk cùng file nằm liền
+    # nhau. Lợi ích: thêm/xóa một file không làm dịch chunk_index của file khác →
+    # make_point_id của các chunk không đổi vẫn ổn định (idempotency thực sự).
+    # LƯU Ý: đổi cách đánh số ⇒ point_id thay đổi ⇒ cần /reset-ingest một lần.
+    per_file_index: dict[tuple, int] = {}
+    for chunk in chunks:
+        key = (
+            chunk.metadata.get("relative_path", ""),
+            chunk.metadata.get("loader_index", ""),
+        )
+        idx = per_file_index.get(key, 0)
+        per_file_index[key] = idx + 1
         content_hash = hashlib.sha256(
             chunk.page_content.encode("utf-8")).hexdigest()
         chunk.metadata.update(
             {
-                "chunk_index": chunk_index,
+                "chunk_index": idx,
                 "content_hash": content_hash,
                 "chunk_size": CHUNK_SIZE,
                 "chunk_overlap": CHUNK_OVERLAP,
@@ -376,6 +389,31 @@ def get_embeddings() -> OllamaEmbeddings:
     )
 
 
+# A1: timeout cho lần embed đồng bộ (query path). Lấy theo RAG_TIMEOUT nếu có.
+_EMBED_HTTP_TIMEOUT: float = float(os.environ.get("RAG_TIMEOUT", "600"))
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """A1 — đường embed DUY NHẤT, dùng chung cho ingest (đồng bộ) và /ask.
+
+    Gọi thẳng Ollama /api/embed với CÙNG contract như batch ingest
+    ({"model": EMBEDDING_MODEL, "input": [...]}) → vector câu hỏi và vector tài liệu
+    luôn được sinh theo đúng một cách, tránh lệch recall do trước đây /ask dùng
+    LangChain OllamaEmbeddings.embed_query còn ingest dùng raw httpx /api/embed.
+    """
+    with httpx.Client(timeout=_EMBED_HTTP_TIMEOUT) as client:
+        resp = client.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": EMBEDDING_MODEL, "input": texts},
+        )
+        resp.raise_for_status()
+        return resp.json()["embeddings"]
+
+
+# R2: số lần retry khi embed một batch lúc ingest thất bại (OOM/transient HTTP).
+_INGEST_EMBED_RETRIES: int = int(os.environ.get("INGEST_EMBED_RETRIES", "3"))
+
+
 async def _embed_and_upsert_batch_async(
     http_client: httpx.AsyncClient,
     qdrant: AsyncQdrantClient,
@@ -393,12 +431,26 @@ async def _embed_and_upsert_batch_async(
     async with sem:
         texts = [c.page_content for c in chunk_batch]
         logger.info("Embed %s/%s: %s chunks...", batch_no, total_batches, len(texts))
-        resp = await http_client.post(
-            f"{OLLAMA_BASE_URL}/api/embed",
-            json={"model": EMBEDDING_MODEL, "input": texts},
-        )
-        resp.raise_for_status()
-        vectors = resp.json()["embeddings"]
+        # R2: retry embed lúc ingest (trước đây chỉ query path của /ask mới retry OOM).
+        vectors = None
+        for _attempt in range(1, _INGEST_EMBED_RETRIES + 1):
+            try:
+                resp = await http_client.post(
+                    f"{OLLAMA_BASE_URL}/api/embed",
+                    json={"model": EMBEDDING_MODEL, "input": texts},
+                )
+                resp.raise_for_status()
+                vectors = resp.json()["embeddings"]
+                break
+            except Exception as exc:
+                if _attempt >= _INGEST_EMBED_RETRIES:
+                    raise
+                _wait = 2.0 * _attempt
+                logger.warning(
+                    "Embed batch %s/%s thất bại (lần %s/%s) — retry sau %.1fs: %s",
+                    batch_no, total_batches, _attempt, _INGEST_EMBED_RETRIES, _wait, exc,
+                )
+                await asyncio.sleep(_wait)
 
         _now = datetime.now(timezone.utc).isoformat()
         points = [
@@ -417,7 +469,9 @@ async def _embed_and_upsert_batch_async(
                         chunk.metadata.get("relative_path", ""),
                     ),
                     "chunk_type": _infer_chunk_type(chunk.page_content),
-                    "language": "vi",
+                    # A6: trước đây hardcode "vi" cho mọi chunk (gây hiểu nhầm và mâu
+                    # thuẫn docstring). Dùng file_type thực tế làm nhãn thay thế.
+                    "language": chunk.metadata.get("file_type", "text"),
                     "status": "active",
                     "created_at": _now,
                 },
@@ -480,37 +534,54 @@ async def _run_async_pipeline(
             )
             for i, batch in enumerate(chunk_batches)
         ]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         await qdrant.close()
 
-    all_pairs: list[tuple] = [pair for pairs in results for pair in pairs]
+    # R1: một batch lỗi KHÔNG làm hỏng cả project ingest. Bỏ qua batch lỗi và ghi
+    # log số batch thất bại; các batch thành công vẫn được upsert. count phản ánh
+    # đúng số point thực tế đã vào Qdrant (partial, thay vì mất sạch như asyncio.gather mặc định).
+    failed = [r for r in results if isinstance(r, Exception)]
+    if failed:
+        logger.error(
+            "Ingest project=%s: %d/%d batch thất bại (đã bỏ qua, phần còn lại vẫn upsert). Lỗi đầu tiên: %s",
+            project, len(failed), len(tasks), failed[0],
+        )
+    all_pairs: list[tuple] = [
+        pair for r in results if not isinstance(r, Exception) for pair in r
+    ]
     count = sync_client.count(collection_name=collection_name, exact=True)
     return all_pairs, count.count
 
 
 # ── Helpers suy luận metadata chunk ──────────────────────────────────────────
 
-_DOC_TYPE_PATTERNS: list[tuple[str, str]] = [
-    ("prd",          "prd"),
-    ("brd",          "brd"),
-    ("schema",       "schema"),
-    ("api-",         "api"),
-    ("-api-",        "api"),
-    ("architecture", "architecture"),
-    ("hardening",    "security"),
-    ("audit",        "audit"),
-    ("portal",       "portal"),
-    ("marketplace",  "marketplace"),
-    ("terminology",  "glossary"),
-    ("settings",     "settings"),
-    ("billing",      "billing"),
-    ("auth-",        "auth"),
-    ("-auth-",       "auth"),
-    ("partner",      "partner"),
-    ("meeting",      "meeting-notes"),
-    ("substrate",    "infrastructure"),
-    ("foundation",   "infrastructure"),
-    ("intelligence", "intelligence"),
+# R5: pattern suy luận doc_type, khớp trên chuỗi đã chuẩn hóa ('_' và '-' → khoảng
+# trắng) nên bắt được cả tên file underscore/prose như "08_API_Specification.md",
+# "07_Data_Model_ERD.md", "05_RBAC_Permissions_Matrix.md" — trước đây các pattern
+# yêu cầu hyphen nên gần như luôn rơi về 'document'. Pattern đặt từ cụ thể → tổng quát.
+_DOC_TYPE_REGEXES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bprd\b|product requirement"),                        "prd"),
+    (re.compile(r"\bbrd\b|business requirement"),                       "brd"),
+    (re.compile(r"\bsrs\b|software requirement"),                       "srs"),
+    (re.compile(r"\bapi\b|api specification|api spec"),                 "api"),
+    (re.compile(r"\berd\b|data model|entity relationship"),            "data-model"),
+    (re.compile(r"\brbac\b|permission|role matrix|access control"),     "rbac"),
+    (re.compile(r"\bschema\b|\bddl\b"),                                 "schema"),
+    (re.compile(r"architecture|\bc4\b|tech stack|technical design"),    "architecture"),
+    (re.compile(r"user stor|acceptance criteria|backlog"),             "user-stories"),
+    (re.compile(r"\bqa\b|test strateg|test case|test plan|\buat\b"),    "test"),
+    (re.compile(r"security|privacy|compliance|hardening|\bgdpr\b|owasp"), "security"),
+    (re.compile(r"devops|operations|\bci/cd\b|ci cd|deployment"),       "devops"),
+    (re.compile(r"roadmap|release|milestone"),                         "roadmap"),
+    (re.compile(r"analytic|reporting|\bkpi\b|dashboard"),               "analytics"),
+    (re.compile(r"glossary|terminology"),                              "glossary"),
+    (re.compile(r"\bux\b|sitemap|wireframe|user flow|design system"),   "ux"),
+    (re.compile(r"product brief|one page|\boverview\b|\bvision\b"),     "brief"),
+    (re.compile(r"\bauth\b|authentication|\bjwt\b"),                    "auth"),
+    (re.compile(r"billing|payment|invoice|subscription"),              "billing"),
+    (re.compile(r"marketplace"),                                       "marketplace"),
+    (re.compile(r"partner"),                                           "partner"),
+    (re.compile(r"meeting"),                                           "meeting-notes"),
 ]
 
 
@@ -528,10 +599,16 @@ def _infer_module(relative_path: str, project: str) -> str:
 
 
 def _infer_doc_type(source_file: str, relative_path: str) -> str:
-    """Suy luận loại tài liệu (prd, schema, api...) từ tên file và đường dẫn."""
-    combined = (source_file + " " + relative_path).lower()
-    for keyword, doc_type in _DOC_TYPE_PATTERNS:
-        if keyword in combined:
+    """Suy luận loại tài liệu (prd, srs, api, data-model, rbac, security...) từ tên
+    file và đường dẫn.
+
+    R5: chuẩn hóa '_' và '-' thành khoảng trắng rồi collapse whitespace trước khi khớp
+    word-boundary regex — bắt được tên file underscore/prose mà phiên bản cũ bỏ sót.
+    """
+    combined = re.sub(r"[_\-]+", " ", (source_file + " " + relative_path).lower())
+    combined = re.sub(r"\s+", " ", combined)
+    for pat, doc_type in _DOC_TYPE_REGEXES:
+        if pat.search(combined):
             return doc_type
     return "document"
 
