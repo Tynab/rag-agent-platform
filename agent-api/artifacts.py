@@ -154,6 +154,21 @@ def _sanitize_relpath(raw: str) -> str:
     return p or "file.txt"
 
 
+def _safe_segment(seg: str) -> str:
+    """Làm sạch một path segment đơn lẻ (workflow_id, role) trước khi ghép vào đường dẫn.
+
+    Chỉ giữ ký tự an toàn (word chars, dấu chấm, gạch ngang) — mọi separator ('/', '\\')
+    bị thay bằng '_'. Vì dấu chấm được phép, phải XỬ LÝ RIÊNG '.' và '..' (nếu không
+    chúng sống sót và trở thành traversal). Đây là lớp phòng thủ chiều sâu (C5): workflow_id
+    và role đến trực tiếp từ URL nên không được tin tưởng, dù check resolve().relative_to()
+    phía sau vẫn là chốt chặn cuối cùng.
+    """
+    cleaned = re.sub(r"[^\w.\-]", "_", seg)
+    if cleaned in ("", ".", ".."):
+        return "_"
+    return cleaned
+
+
 def _ext_for_lang(lang: str) -> str:
     v = _LANG_EXT.get(lang.lower(), lang.lower() or "txt")
     return "Dockerfile" if v == "__dockerfile__" else (v or "txt")
@@ -310,7 +325,7 @@ def list_artifacts(workflow_id: str) -> dict[str, list[dict]]:
     Mỗi phần tử metadata bao gồm: path, filename, language, size (bytes).
     Trả về {} nếu workflow chưa có artifact hoặc thư mục không tồn tại.
     """
-    wf_dir = Path(ARTIFACT_BASE) / workflow_id
+    wf_dir = Path(ARTIFACT_BASE) / _safe_segment(workflow_id)
     if not wf_dir.exists():
         return {}
     result: dict[str, list[dict]] = {}
@@ -348,7 +363,8 @@ def read_artifact(workflow_id: str, role: str, rel_path: str) -> tuple[str, str]
     """
     safe = _sanitize_relpath(rel_path)
     base = Path(ARTIFACT_BASE)
-    path = base / workflow_id / role / safe
+    # workflow_id và role cũng đến từ URL — sanitize từng segment (C5) thay vì ghép thô.
+    path = base / _safe_segment(workflow_id) / _safe_segment(role) / safe
     # Đảm bảo đường dẫn đã resolve nằm trong ARTIFACT_BASE để chặn traversal
     # qua workflow_id hoặc role parameter giả mạo từ HTTP request.
     try:

@@ -60,7 +60,12 @@ class Tools:
     class Valves(BaseModel):
         rag_api_url: str = Field(
             default="http://rag-api:8090",
-            description="URL của rag-api service (nội bộ Docker network)",
+            description=(
+                "URL của rag-api service. Mặc định hostname nội bộ Docker network "
+                "(http://rag-api:8090) — đúng khi Open WebUI chạy cùng compose `yan`. "
+                "Nếu chạy ngoài network đó: http://localhost:8090 hoặc "
+                "http://host.docker.internal:8090."
+            ),
         )
         timeout: int = Field(
             default=120,
@@ -117,7 +122,12 @@ class Tools:
             resp.raise_for_status()
             data = resp.json()
         except requests.exceptions.ConnectionError:
-            return "❌ Không kết nối được rag-api. Kiểm tra service có đang chạy không."
+            return (
+                f"❌ Không kết nối được rag-api tại {self.valves.rag_api_url}. "
+                "Kiểm tra service đang chạy (`docker ps | grep rag-api`). Nếu Open WebUI "
+                "chạy ngoài Docker network `yan`, đổi Valve rag_api_url sang "
+                "http://localhost:8090 hoặc http://host.docker.internal:8090."
+            )
         except requests.exceptions.Timeout:
             return f"❌ rag-api timeout sau {self.valves.timeout}s. Thử lại hoặc tăng timeout trong Valves."
         except requests.exceptions.HTTPError as exc:

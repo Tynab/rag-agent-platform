@@ -25,6 +25,18 @@ services:
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
       OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH}
       OLLAMA_FLASH_ATTENTION: "1"
+    # D2: healthcheck để các service phụ thuộc chờ Ollama THỰC SỰ sẵn sàng
+    # (server đã lên), thay vì chỉ chờ container start. `ollama list` nói chuyện
+    # với daemon nội bộ nên xác nhận server đã phục vụ.
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    # D7: GPU reservation là vô điều kiện. Trên host KHÔNG có nvidia runtime
+    # (Windows/Mac dev, hoặc Linux chưa chạy setup.sh), hãy chạy kèm
+    # `-f docker-compose.cpu.yml` để gỡ block deploy này, hoặc comment nó ra.
     deploy:
       resources:
         reservations:
@@ -111,10 +123,15 @@ services:
       - ./data/raw:/data/raw
     networks:
       - yan
+    # D2: chờ Ollama healthy (model server đã lên) trước khi rag-api khởi động.
+    # qdrant/neo4j chỉ cần started — rag-api degrade graceful nếu Neo4j chưa sẵn sàng.
     depends_on:
-      - ollama
-      - qdrant
-      - neo4j
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      neo4j:
+        condition: service_started
     restart: unless-stopped
 
   agent-api:
@@ -166,10 +183,14 @@ services:
       - ./data/artifacts:/data/artifacts
     networks:
       - yan
+    # D2: agent-api cần rag-api healthy (mọi node gọi /ask) và Ollama healthy.
     depends_on:
-      - ollama
-      - qdrant
-      - rag-api
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      rag-api:
+        condition: service_healthy
     restart: unless-stopped
 
   open-webui:
@@ -201,8 +222,10 @@ services:
     networks:
       - yan
     depends_on:
-      - ollama
-      - qdrant
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -210,6 +233,13 @@ services:
   watchtower:
     image: containrrr/watchtower
     container_name: watchtower
+    # D5: publish HTTP API ra localhost để runbook trong README (localhost:8080/v1/*)
+    # chạy được. Chỉ bind 127.0.0.1 — không expose ra ngoài host.
+    ports:
+      - "127.0.0.1:8080:8080"
+    # D4: watchtower CẦN quyền ghi docker.sock để pull + recreate container nên không
+    # thể mount :ro. Đánh đổi: compromise image này = quyền root trên host. Muốn giảm
+    # blast radius thật sự thì dùng docker-socket-proxy (chỉ mở endpoint cần thiết).
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -230,6 +260,8 @@ services:
     container_name: deunhealth
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+    # D4: deunhealth cũng cần ghi docker.sock để restart container unhealthy → cùng
+    # rủi ro root-on-host như watchtower. Cân nhắc socket-proxy nếu môi trường nhạy cảm.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:

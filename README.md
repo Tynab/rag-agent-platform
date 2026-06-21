@@ -160,7 +160,7 @@ BA → PM → SA → TA → Designer → Team Lead → FE → Mobile → DBA →
 Các agent `fe`, `mobile`, `be`, `dba`, `da`, `tech_lead`, `devsecops` sử dụng quy trình sinh code **2 pha**:
 
 **Pha 1 — Lập kế hoạch file:**
-- `CODING_PLANNER_MODEL` (model nhẹ, ví dụ `granite3.3:2b`) nhận danh sách task từ TL output
+- `CODING_PLANNER_MODEL` (model nhẹ, ví dụ `granite4.1:8b`) nhận danh sách task từ TL output
 - Sinh JSON array các file cần tạo: `[{"filename": "src/auth/login.tsx", "description": "...", "language": "typescript"}]`
 - Tối đa `MAX_FILES_PER_ROLE` file mỗi role
 
@@ -270,34 +270,34 @@ rag-agent-platform/
 OLLAMA_HOST=0.0.0.0
 OLLAMA_ORIGINS=*
 OLLAMA_CONTEXT_LENGTH=32768
-OLLAMA_MAX_LOADED_MODELS=2
-OLLAMA_NUM_PARALLEL=2
+OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_NUM_PARALLEL=1
 OLLAMA_KEEP_ALIVE=5m
 OLLAMA_REQUEST_TIMEOUT=1200
 
 # ─── Models ──────────────────────────────────────────────────────────────────
-EMBEDDING_MODEL=nomic-embed-text
-CHAT_MODEL=qwen2.5:7b
-CODING_PLANNER_MODEL=granite3.3:2b
+EMBEDDING_MODEL=qwen3-embedding:8b
+CHAT_MODEL=qwen3.6:35b
+CODING_PLANNER_MODEL=granite4.1:8b
 
-BA_MODEL=qwen2.5:14b
-PM_MODEL=qwen2.5:14b
-SA_MODEL=qwen2.5:14b
-TA_MODEL=qwen2.5:14b
-DA_MODEL=qwen2.5:14b
+BA_MODEL=qwen3.6:35b
+PM_MODEL=qwen3.6:35b
+SA_MODEL=qwen3.6:35b
+TA_MODEL=qwen3.6:35b
+DA_MODEL=qwen3.6:35b
 
-TL_MODEL=qwen2.5:7b
+TL_MODEL=north-mini-code-1.0:q4_K_M
 
-FE_MODEL=qwen2.5-coder:7b
-MOBILE_MODEL=qwen2.5-coder:7b
-BE_MODEL=qwen2.5-coder:7b
-DBA_MODEL=qwen2.5-coder:7b
-TECH_LEAD_MODEL=qwen2.5-coder:7b
-DEVSECOPS_MODEL=qwen2.5-coder:7b
+FE_MODEL=north-mini-code-1.0:q4_K_M
+MOBILE_MODEL=north-mini-code-1.0:q4_K_M
+BE_MODEL=north-mini-code-1.0:q4_K_M
+DBA_MODEL=north-mini-code-1.0:q4_K_M
+TECH_LEAD_MODEL=north-mini-code-1.0:q4_K_M
+DEVSECOPS_MODEL=north-mini-code-1.0:q4_K_M
 
-DESIGNER_MODEL=gemma2:9b
-TESTER_MODEL=mistral:7b
-CLARIFIER_MODEL=qwen2.5:14b
+DESIGNER_MODEL=gemma4:31b
+TESTER_MODEL=qwen3.6:35b
+CLARIFIER_MODEL=qwen3.6:35b
 
 # ─── RAG ─────────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL=http://ollama:11434
@@ -496,6 +496,13 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 
 ## 7. Biến môi trường chi tiết
 
+> **Lưu ý nguồn chuẩn (D6):** File `.env` đang chạy là **nguồn sự thật duy nhất**. Các giá trị ví dụ trong tài liệu này (model, `RAG_TOP_K`, `CHUNK_OVERLAP`, `UPSERT_BATCH_SIZE`…) mang tính minh hoạ và **có thể khác** `.env` thực tế — khi lệch nhau, hãy tin `.env`. Xem nhanh cấu hình runtime bằng `curl -s localhost:8090/health | jq` và `curl -s localhost:8091/agents | jq`.
+>
+> **Thư mục runtime (D8):** Trước lần `docker compose up` đầu tiên, tạo sẵn các thư mục mount để tránh Docker tự tạo (có thể bị root sở hữu trên Linux):
+> ```bash
+> mkdir -p ./data/raw ./data/memory/episodic ./data/artifacts
+> ```
+
 ### Nhóm Ollama
 
 | Biến | Mặc định | Mô tả |
@@ -598,8 +605,8 @@ curl -s http://localhost:8091/agents | jq
 
 ```json
 {
-  "ba": { "step_id": 1, "name": "BA Agent — Business Analysis", "model": "qwen2.5:14b", "depends_on": [] },
-  "pm": { "step_id": 2, "name": "PM Agent — Project Management", "model": "qwen2.5:14b", "depends_on": ["ba"] }
+  "ba": { "step_id": 1, "name": "BA Agent — Business Analysis", "model": "qwen3.6:35b", "depends_on": [] },
+  "pm": { "step_id": 2, "name": "PM Agent — Project Management", "model": "qwen3.6:35b", "depends_on": ["ba"] }
 }
 ```
 
@@ -674,7 +681,7 @@ curl -s -X POST http://localhost:8091/agent/sa \
 {
   "role": "fe",
   "name": "FE Agent — Frontend Engineering",
-  "model": "qwen2.5-coder:7b",
+  "model": "north-mini-code-1.0:q4_K_M",
   "output": "## FE Agent\n\n### FILE: src/pages/OrderManagement.tsx\n```typescript\n..."
 }
 ```
@@ -833,8 +840,8 @@ curl -s http://localhost:8090/health | jq
   "ollama_base_url": "http://ollama:11434",
   "qdrant_url": "http://qdrant:6333",
   "collection_prefix": "yan_raw_docs",
-  "embedding_model": "nomic-embed-text",
-  "chat_model": "qwen2.5:7b",
+  "embedding_model": "qwen3-embedding:8b",
+  "chat_model": "qwen3.6:35b",
   "rag_top_k": 5,
   "graph": {
     "enabled": true,
@@ -1033,7 +1040,7 @@ curl -s http://localhost:11434/
 curl -s -X POST http://localhost:11434/api/chat \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen2.5:7b",
+    "model": "qwen3.6:35b",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": false
   }' | jq .message.content
@@ -1315,10 +1322,10 @@ Tất cả model được quản lý trong `.env`. Sau khi đổi model, chỉ c
 
 ```bash
 # Đổi model reasoning — ví dụ nâng BA_MODEL
-# 1. Sửa trong .env: BA_MODEL=qwen2.5:32b
+# 1. Sửa trong .env: BA_MODEL=qwen3.6:35b
 
 # 2. Pull model mới
-docker exec ollama ollama pull qwen2.5:32b
+docker exec ollama ollama pull qwen3.6:35b
 
 # 3. Restart agent-api
 docker compose restart agent-api
@@ -1338,7 +1345,7 @@ curl -s -X POST http://localhost:8090/ingest | jq
 
 ```bash
 # Pull model cụ thể
-docker exec ollama ollama pull qwen2.5:14b
+docker exec ollama ollama pull qwen3.6:35b
 
 # Xem tất cả model đã pull
 docker exec ollama ollama list
@@ -1359,23 +1366,27 @@ grep -E '^(EMBEDDING_MODEL|CHAT_MODEL|CODING_PLANNER_MODEL|BA_MODEL|PM_MODEL|SA_
 ### Cấu hình cho phần cứng yếu (16 GB RAM)
 
 ```env
-BA_MODEL=qwen2.5:7b
-PM_MODEL=qwen2.5:7b
-SA_MODEL=qwen2.5:7b
-TA_MODEL=qwen2.5:7b
-DA_MODEL=qwen2.5:7b
-TL_MODEL=qwen2.5:7b
-FE_MODEL=qwen2.5-coder:7b
-MOBILE_MODEL=qwen2.5-coder:7b
-BE_MODEL=qwen2.5-coder:7b
-DBA_MODEL=qwen2.5-coder:7b
-TECH_LEAD_MODEL=qwen2.5-coder:7b
-DEVSECOPS_MODEL=qwen2.5-coder:7b
-DESIGNER_MODEL=qwen2.5:7b
-TESTER_MODEL=qwen2.5:7b
-CLARIFIER_MODEL=qwen2.5:7b
-CODING_PLANNER_MODEL=qwen2.5:1.5b
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+CHAT_MODEL=qwen3.5:9b
+BA_MODEL=qwen3.5:9b
+PM_MODEL=qwen3.5:9b
+SA_MODEL=qwen3.5:9b
+TA_MODEL=qwen3.5:9b
+DA_MODEL=qwen3.5:9b
+TL_MODEL=qwen3.5:9b
+FE_MODEL=qwen3.5:9b
+MOBILE_MODEL=qwen3.5:9b
+BE_MODEL=qwen3.5:9b
+DBA_MODEL=qwen3.5:9b
+TECH_LEAD_MODEL=qwen3.5:9b
+DEVSECOPS_MODEL=qwen3.5:9b
+DESIGNER_MODEL=qwen3.5:9b
+TESTER_MODEL=qwen3.5:9b
+CLARIFIER_MODEL=qwen3.5:9b
+CODING_PLANNER_MODEL=granite4.1:3b
 OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_NUM_PARALLEL=1
+OLLAMA_CONTEXT_LENGTH=8192
 MAX_FILES_PER_ROLE=3
 CLARIFIER_REGEN_LOOPS=0
 ```
@@ -1488,7 +1499,7 @@ curl -s -X POST http://localhost:8090/ask \
 | Embedding timeout | Model chưa được pull | Pull lại `EMBEDDING_MODEL` |
 | SDLC workflow `status=failed` | Xem field `error` | `curl .../workflow/{id} | jq .error` |
 | Step output bắt đầu bằng `[LỖI` | LLM timeout hoặc model chưa pull | Kiểm tra model; tăng `OLLAMA_REQUEST_TIMEOUT` |
-| Output chứa `<think>...</think>` thô | Model reasoning chưa nhận diện | Tên model phải chứa: `phi4-mini-reasoning`, `phi4-reasoning`, `qwq`, `deepseek-r1`, hoặc `qwen3` |
+| Output chứa `<think>...</think>` thô | Model reasoning chưa nhận diện | Tên model phải chứa: `phi4-mini-reasoning`, `phi4-reasoning`, `qwq`, `deepseek-r1`, `qwen3`, `north-mini-code`, `gemma4` hoặc `mistral-medium-3.5` |
 | `user_input` bị cắt ngắn | Input > 10.000 ký tự | Chia nhỏ input |
 | `workflow_runs.jsonl` không được tạo | Volume chưa mount | Kiểm tra `./data/memory:/data/memory` trong docker-compose |
 | Artifacts không được lưu | Volume chưa mount | Kiểm tra `./data/artifacts:/data/artifacts` trong docker-compose |

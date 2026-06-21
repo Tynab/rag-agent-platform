@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest ruff
+
+      - name: Install service deps (cho test ingest/workflow)
+        run: |
+          pip install -r rag-api/requirements.txt
+          pip install -r agent-api/requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check rag-api agent-api open-webui-tools tests
+
+      - name: Unit tests (pytest)
+        run: pytest -q

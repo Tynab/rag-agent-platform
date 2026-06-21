@@ -51,8 +51,9 @@ Hàm công khai
           tech_stack   Chuỗi các công nghệ bắt buộc, phân cách bằng dấu phẩy.
                        Ví dụ: "NestJS, React, PostgreSQL, Kubernetes"
 
-    run_agent_step(role, user_input, project, tech_stack) → str
+    run_agent_step(role, user_input, extra_context, project, tech_stack) → str
         Chạy đồng bộ một agent đơn lẻ, trả về output ngay.
+        (extra_context là tham số vị trí thứ 3 — context bổ sung tùy chọn.)
         Hữu ích khi muốn xem nhanh kết quả của một bước cụ thể.
         Ví dụ: role="sa" để xem kiến trúc giải pháp.
 
@@ -107,8 +108,8 @@ _ROLE_DESCRIPTIONS = {
     "tl":           "Team Lead Agent — Engineering Task Planning",
     "fe":           "FE Agent — Frontend Engineering",
     "mobile":       "Mobile Agent — Mobile Engineering",
-    "be":           "BE Agent — Backend Implementation",
     "dba":          "DBA Agent — Database Architecture",
+    "be":           "BE Agent — Backend Implementation",
     "da":           "DA Agent — Data Analysis & Reporting",
     "tech_lead":    "Tech Lead Agent — Code Review & Standards",
     "tester":       "Tester Agent — Testing & Quality Assurance",
@@ -121,7 +122,20 @@ class Tools:
     class Valves(BaseModel):
         agent_api_url: str = Field(
             default="http://agent-api:8091",
-            description="URL của agent-api service (nội bộ Docker network)",
+            description=(
+                "URL của agent-api service. Mặc định là hostname nội bộ Docker network "
+                "(http://agent-api:8091) — đúng khi Open WebUI chạy CÙNG compose `yan`. "
+                "Nếu Open WebUI chạy ngoài network đó, đổi sang http://localhost:8091 "
+                "hoặc http://host.docker.internal:8091."
+            ),
+        )
+        block_until_complete: bool = Field(
+            default=False,
+            description=(
+                "O1: nếu True, run_sdlc_workflow sẽ poll đồng bộ tới khi xong (có thể "
+                "30+ phút, dễ vượt timeout proxy/browser). Mặc định False = trả về "
+                "workflow_id ngay rồi dùng get_workflow_result để xem kết quả sau."
+            ),
         )
         timeout: int = Field(
             default=600,
@@ -162,8 +176,30 @@ class Tools:
         return (
             f"❌ Không kết nối được agent-api tại {self._base_url()}.\n"
             f"Kiểm tra service có đang chạy không: `docker ps | grep agent-api`\n"
+            f"Nếu Open WebUI chạy ngoài Docker network `yan`, đổi Valve agent_api_url "
+            f"sang http://localhost:8091 hoặc http://host.docker.internal:8091.\n"
             f"Chi tiết: {exc}"
         )
+
+    def _roles(self) -> list[str]:
+        """A3 — danh sách role lấy ĐỘNG từ agent-api /agents (cache theo instance),
+        fallback về _VALID_ROLES nếu không gọi được. Tránh phải đồng bộ tay danh sách
+        role với agents.WORKFLOW_STEPS ở backend mỗi khi thêm/bớt role.
+        """
+        cached = getattr(self, "_roles_cache", None)
+        if cached:
+            return cached
+        try:
+            resp = requests.get(f"{self._base_url()}/agents", timeout=10)
+            resp.raise_for_status()
+            agents = resp.json()
+            ordered = sorted(agents.keys(), key=lambda r: agents[r].get("step_id", 999))
+            if ordered:
+                self._roles_cache = ordered
+                return ordered
+        except Exception:
+            pass
+        return _VALID_ROLES
 
     # ── Công cụ ─────────────────────────────────────────────────────────────────
 
@@ -209,16 +245,34 @@ class Tools:
         except Exception as exc:
             return f"❌ Lỗi khi submit workflow: {exc}"
 
-        workflow_id: str = data["workflow_id"].strip()
+        # O4: tránh KeyError nếu backend trả body thiếu workflow_id.
+        workflow_id = (data.get("workflow_id") or "").strip()
+        if not workflow_id:
+            return f"❌ agent-api không trả về workflow_id. Body: {data}"
+
+        roles = self._roles()
         result_lines = [
             f"✅ **Workflow đã được khởi chạy**",
             f"- **ID:** `{workflow_id}`",
             f"- **Project:** {resolved_project or 'all'}",
-            f"- **Steps:** {' → '.join(_VALID_ROLES)}",
-            f"\n⏳ Đang chạy... (có thể mất 15–45 phút tùy model và độ phức tạp)",
+            f"- **Steps:** {' → '.join(roles)}",
         ]
 
-        # Poll for completion
+        # O1: mặc định KHÔNG block. Trả workflow_id ngay để tránh vượt timeout
+        # proxy/browser; người dùng dùng get_workflow_result để theo dõi & lấy kết quả.
+        # Bật polling đồng bộ bằng Valve block_until_complete=True.
+        if not self.valves.block_until_complete:
+            result_lines.append(
+                f"\n⏳ Đang chạy nền (15–45 phút tùy model). "
+                f"Dùng `get_workflow_result('{workflow_id}')` để theo dõi tiến trình & lấy kết quả."
+            )
+            return "\n".join(result_lines)
+
+        result_lines.append(
+            "\n⏳ Đang chạy... (có thể mất 15–45 phút tùy model và độ phức tạp)"
+        )
+
+        # Poll for completion (chỉ khi block_until_complete=True)
         for attempt in range(self.valves.poll_max_attempts):
             time.sleep(self.valves.poll_interval)
             try:
@@ -242,7 +296,7 @@ class Tools:
             if status == "completed":
                 result_lines.append("\n---\n## ✅ Workflow Hoàn thành\n")
                 step_outputs: dict = wf.get("step_outputs", {})
-                for role in _VALID_ROLES:
+                for role in roles:
                     if role in step_outputs:
                         role_name = _ROLE_DESCRIPTIONS.get(role, role)
                         preview = step_outputs[role][:400].replace("\n", " ")
@@ -282,10 +336,11 @@ class Tools:
         :param tech_stack: Các công nghệ bắt buộc, phân cách bằng dấu phẩy (ví dụ: 'nextjs,nestjs,mongodb').
         :return: Output của agent role được chọn
         """
-        if role not in _VALID_ROLES:
+        valid_roles = self._roles()
+        if role not in valid_roles:
             return (
                 f"❌ Role không hợp lệ: `{role}`\n"
-                f"Các role hợp lệ: {', '.join(_VALID_ROLES)}"
+                f"Các role hợp lệ: {', '.join(valid_roles)}"
             )
 
         resolved_project = project or self.valves.default_project
@@ -364,10 +419,11 @@ class Tools:
         status = wf.get("status", "unknown")
         completed = wf.get("completed_steps", [])
         step_outputs: dict = wf.get("step_outputs", {})
+        roles = self._roles()
 
         if role:
-            if role not in _VALID_ROLES:
-                return f"❌ Role không hợp lệ: `{role}`. Hợp lệ: {', '.join(_VALID_ROLES)}"
+            if role not in roles:
+                return f"❌ Role không hợp lệ: `{role}`. Hợp lệ: {', '.join(roles)}"
             if role not in step_outputs:
                 return (
                     f"⚠️ Step `{role}` chưa có output.\n"
@@ -381,7 +437,7 @@ class Tools:
             f"## Workflow `{workflow_id}`",
             f"- **Status:** {status}",
             f"- **Project:** {wf.get('project') or 'all'}",
-            f"- **Completed steps:** {len(completed)}/{len(_VALID_ROLES)}",
+            f"- **Completed steps:** {len(completed)}/{len(roles)}",
             f"- **Created:** {wf.get('created_at', 'N/A')}",
             f"- **Completed at:** {wf.get('completed_at', 'N/A')}",
         ]
@@ -390,7 +446,7 @@ class Tools:
             lines.append(f"- **Error:** {wf['error']}")
 
         lines.append("\n---\n### Step Outputs\n")
-        for r in _VALID_ROLES:
+        for r in roles:
             if r in step_outputs:
                 role_name = _ROLE_DESCRIPTIONS.get(r, r)
                 preview = step_outputs[r][:300].replace("\n", " ")
@@ -419,8 +475,10 @@ class Tools:
         except Exception as exc:
             return f"❌ Lỗi: {exc}"
 
+        # A3: thứ tự lấy trực tiếp từ response /agents (theo step_id), fallback hardcode.
+        ordered = sorted(agents.keys(), key=lambda r: agents[r].get("step_id", 999)) or _VALID_ROLES
         rows = []
-        for role in _VALID_ROLES:
+        for role in ordered:
             info = agents.get(role, {})
             rows.append(
                 f"| **{info.get('step_id', '?')}** | `{role}` | {info.get('name', role)} | `{info.get('model', '?')}` |"

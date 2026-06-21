@@ -1,4 +1,4 @@
-﻿"""
+"""
 app.py — API RAG cục bộ của rag-agent-platform (cổng 8090)
 ===========================================================
 
@@ -83,7 +83,7 @@ from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import FieldCondition, Filter, MatchValue
 
-from ingest import GRAPH_ENABLED, RAW_DATA_DIR, get_collection_name, get_embeddings, get_projects, ingest
+from ingest import GRAPH_ENABLED, RAW_DATA_DIR, embed_texts, get_collection_name, get_embeddings, get_projects, ingest
 
 
 def _require_env(name: str) -> str:
@@ -192,8 +192,30 @@ def get_chat_model() -> ChatOllama:
             base_url=OLLAMA_BASE_URL,
             temperature=0.1,
             request_timeout=OLLAMA_REQUEST_TIMEOUT,
+            # R9: ép timeout xuống httpx client của ollama để chắc chắn được áp dụng
+            # (request_timeout có thể bị bỏ qua tùy phiên bản langchain-ollama).
+            client_kwargs={"timeout": OLLAMA_REQUEST_TIMEOUT},
         )
     return _llm
+
+
+def _collection_vector_size(client, collection_name: str) -> int | None:
+    """A2 — trả về số chiều vector của collection (None nếu không đọc được).
+
+    Dùng để phát hiện sớm việc đổi EMBEDDING_MODEL (lệch dimension) và báo lỗi rõ ràng
+    yêu cầu /reset-ingest, thay vì để Qdrant ném lỗi khó hiểu giữa chừng truy vấn.
+    """
+    try:
+        params = client.get_collection(collection_name).config.params.vectors
+        if hasattr(params, "size"):
+            return int(params.size)
+        if isinstance(params, dict) and params:
+            first = next(iter(params.values()))
+            size = getattr(first, "size", None)
+            return int(size) if size else None
+    except Exception as exc:
+        logger.debug("A2: không đọc được vector size của %s: %s", collection_name, exc)
+    return None
 
 
 @app.get("/health")
@@ -298,11 +320,12 @@ def ask(req: AskRequest) -> AskResponse:
                     detail="Chưa có project nào được index. Chạy POST /ingest trước.",
                 )
 
-        embeddings = get_embeddings()
+        # A1: embed câu hỏi qua đường THỐNG NHẤT embed_texts (→ Ollama /api/embed),
+        # giống hệt cách ingest embed tài liệu — tránh lệch vector giữa hai code path.
         query_vector: list[float] | None = None
         for _attempt in range(1, _EMBED_MAX_RETRIES + 1):
             try:
-                query_vector = embeddings.embed_query(req.question)
+                query_vector = embed_texts([req.question])[0]
                 break
             except Exception as _exc:  # noqa: BLE001
                 _is_oom = any(kw in str(_exc) for kw in _OOM_KEYWORDS)
@@ -324,6 +347,18 @@ def ask(req: AskRequest) -> AskResponse:
 
         all_hits = []
         for _proj, coll_name in collections_to_search:
+            # A2: chặn truy vấn lên collection được index bằng EMBEDDING_MODEL khác
+            # (lệch số chiều vector) — báo lỗi rõ ràng thay vì để Qdrant fail mơ hồ.
+            _dim = _collection_vector_size(client, coll_name)
+            if _dim is not None and _dim != len(query_vector):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Collection '{coll_name}' có vector dim={_dim} nhưng EMBEDDING_MODEL "
+                        f"hiện tại sinh dim={len(query_vector)} → EMBEDDING_MODEL đã thay đổi. "
+                        f"Chạy POST /reset-ingest để dựng lại index."
+                    ),
+                )
             query_filter: Filter | None = None
             if req.module:
                 query_filter = Filter(
@@ -431,6 +466,25 @@ def ask(req: AskRequest) -> AskResponse:
                 )
             context = context + "\n\n---\n\n" + \
                 "\n\n---\n\n".join(graph_blocks)
+
+            # R3: graph chunks cũng được đưa vào `sources` (trước đây chỉ nhồi vào
+            # context LLM mà không trả về) để client thấy đầy đủ nguồn đã dùng.
+            for g in graph_extra:
+                sources.append(
+                    SourceItem(
+                        score=0.0,  # graph traversal không có cosine score
+                        project=str(g.get("project", "unknown")),
+                        module=None,
+                        doc_type="graph",
+                        chunk_type="graph",
+                        source_file=g.get("source_file"),
+                        source_path=None,
+                        relative_path=None,
+                        file_type=None,
+                        chunk_index=None,
+                        preview=str(g.get("text", ""))[:500],
+                    )
+                )
 
         messages = [
             SystemMessage(content=(

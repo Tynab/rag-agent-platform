@@ -63,7 +63,8 @@ Giới hạn context window
 Xử lý reasoning models
 -----------------------
     _REASONING_MODELS: frozenset khớp chuỗi con tên model reasoning
-    (phi4-mini-reasoning, phi4-reasoning, qwq, deepseek-r1, qwen3).
+    (phi4-mini-reasoning, phi4-reasoning, qwq, deepseek-r1, qwen3,
+    north-mini-code, gemma4, mistral-medium-3.5).
     _strip_thinking(): loại bỏ <think>...</think> khỏi output trước khi
     lưu vào step_outputs — chỉ giữ lại phần nội dung thực sự.
 
@@ -132,7 +133,7 @@ OLLAMA_REQUEST_TIMEOUT: int = int(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "1200
 # không phải coding model, vì nhiệm vụ là phân tích task rồi xuất JSON array.
 CODING_PLANNER_MODEL: str = os.environ.get(
     "CODING_PLANNER_MODEL",
-    os.environ.get("BA_MODEL", "granite3.3:2b"),
+    "granite4.1:8b",
 )
 # Giới hạn số file tối đa mỗi coding agent được phép sinh ra trong một workflow.
 # Tăng giá trị này nếu project phức tạp cần nhiều file hơn.
@@ -230,7 +231,16 @@ def _truncate(text: str, max_chars: int = MAX_PREV_OUTPUT_CHARS) -> str:
 # Frozenset các chuỗi con khớp tên model reasoning. Khi tên model chứa
 # một trong các chuỗi này, _strip_thinking() sẽ loại bỏ <think>...</think>
 # khỏi output trước khi lưu vào step_outputs.
-_REASONING_MODELS: frozenset[str] = frozenset({"phi4-mini-reasoning", "phi4-reasoning", "qwq", "deepseek-r1", "qwen3"})
+_REASONING_MODELS: frozenset[str] = frozenset({
+    "phi4-mini-reasoning",
+    "phi4-reasoning",
+    "qwq",
+    "deepseek-r1",
+    "qwen3",
+    "north-mini-code",
+    "gemma4",
+    "mistral-medium-3.5",
+})
 
 
 def _strip_thinking(text: str) -> str:
@@ -301,16 +311,17 @@ Context summary:
 # Mỗi file được sinh độc lập với context tập trung (filename + description)
 # để tránh model bị phân tán bởi context quá lớn.
 _FILE_GEN_PROMPT_TMPL = """\
-Write the complete {language} source code for: {filename}
+Write the {language} source file: {filename}
 Purpose: {description}
 Tech stack: {tech_stack}
 {extra}
 
 Strict rules:
-- Respond with one triple-backtick code block containing the full working implementation.
+- Respond with one triple-backtick code block containing the file content.
 - Do not include author/date/version/license/copyright metadata headers.
 - Do not repeat identical import lines or boilerplate blocks.
-- Prefer concise, production-ready code over placeholders.
+- Match the depth in the guidance above: a SCAFFOLD leaves `// TODO:` markers for feature
+  logic; a non-scaffold file must be complete and production-ready. Do not pad either way.
 """
 
 
@@ -518,6 +529,16 @@ def _parse_clarifier_regen_list(clarifier_output: str) -> list[str]:
                     seen.add(role)
                     break
 
+    # W4 — fallback prose/bullet: nếu model KHÔNG format §10 thành bảng Markdown
+    # (chỉ liệt kê dạng gạch đầu dòng hoặc câu văn), vòng quét theo "|" ở trên sẽ
+    # rỗng. Quét lại toàn bộ section text để bắt tên role hợp lệ theo word-boundary,
+    # tránh để regen loop âm thầm no-op khi model nhỏ format lỏng.
+    if not seen:
+        lowered = section_text.lower()
+        for role in _REGEN_ELIGIBLE_ROLES:
+            if re.search(rf"\b{re.escape(role)}\b", lowered):
+                seen.add(role)
+
     # Trả về theo thứ tự WORKFLOW_STEPS để đảm bảo dependency được tôn trọng:
     # agent phụ thuộc vào agent khác sẽ được re-gen sau agent đó.
     return [r for r in WORKFLOW_STEPS if r in seen]
@@ -651,68 +672,54 @@ def _compute_extra_instruction(role: str, tech_stack: list[str] | None) -> str:
                 "SQL for relational data, MongoDB for document data."
             )
 
+    # SCAFFOLD mode cho engineer roles (fe/mobile/be): chỉ DỰNG KHUNG codebase —
+    # imports, types, signatures, config, wiring — với marker `// TODO: implement`
+    # nơi feature logic sẽ được dev "vibe code" trong IDE. KHÔNG viết business logic.
+    # (DBA giữ schema thật vì là nền tảng; devsecops giữ infra thật.)
+    _scaffold = (
+        " — SCAFFOLD ONLY: imports, types/props, signatures, config and route/DB/auth "
+        "wiring, with `// TODO: implement` markers where feature logic goes. Do NOT write "
+        "business logic or full markup. No license headers."
+    )
+
     if role == "fe":
         if "vue" in combined:
-            return (
-                "Write real Vue 3 component with Composition API, TypeScript, and template markup. "
-                "No license headers."
-            )
-        if "angular" in combined:
-            return "Write real Angular component with TypeScript, decorators, and template. No license headers."
-        if "svelte" in combined:
-            return "Write real Svelte component with TypeScript and reactive syntax. No license headers."
-        # Mặc định nếu không khớp Vue/Angular/Svelte: dùng React/TypeScript (phổ biến nhất).
-        return (
-            "Write real React/TypeScript component with JSX markup, hooks, and props interface. "
-            "No license headers."
-        )
+            fw = "Vue 3 component (Composition API, TypeScript, template)"
+        elif "angular" in combined:
+            fw = "Angular component (TypeScript, decorators, template)"
+        elif "svelte" in combined:
+            fw = "Svelte component (TypeScript, reactive syntax)"
+        else:
+            fw = "React/TypeScript component (JSX, hooks, typed props)"
+        return "Scaffold a " + fw + _scaffold
 
     if role == "mobile":
         if "react native" in combined or "expo" in combined:
-            return (
-                "Write real React Native component with TypeScript, JSX UI code, and StyleSheet. "
-                "No license headers."
-            )
-        if "flutter" in combined or "dart" in combined:
-            return "Write real Flutter/Dart widget with actual UI code. No license headers."
-        # Default: offer both options
-        return (
-            "Write real Flutter/Dart widget or React Native component with actual UI code. "
-            "No license headers."
-        )
+            fw = "React Native component (TypeScript, JSX, StyleSheet)"
+        elif "flutter" in combined or "dart" in combined:
+            fw = "Flutter/Dart widget"
+        else:
+            fw = "Flutter/Dart widget or React Native component"
+        return "Scaffold a " + fw + _scaffold
 
     if role == "be":
         if "fastapi" in combined or (
             "python" in combined and "django" not in combined and "flask" not in combined
         ):
-            return (
-                "Write real FastAPI route with Pydantic models and async business logic. "
-                "No license headers."
-            )
-        if "django" in combined:
-            return (
-                "Write real Django view or DRF ViewSet with serializers and business logic. "
-                "No license headers."
-            )
-        if "flask" in combined:
-            return "Write real Flask route with request parsing and business logic. No license headers."
-        if "express" in combined and "nest" not in combined:
-            return (
-                "Write real Express.js route with TypeScript types and business logic. "
-                "No license headers."
-            )
-        if "spring" in combined or "java" in combined or "kotlin" in combined:
-            return (
-                "Write real Spring Boot service and controller with annotations and business logic. "
-                "No license headers."
-            )
-        if "go" in combined or "golang" in combined:
-            return "Write real Go HTTP handler with struct types and business logic. No license headers."
-        # Default: NestJS
-        return (
-            "Write real NestJS service, controller, or DTO with actual business logic. "
-            "No license headers."
-        )
+            fw = "FastAPI router + Pydantic models (async)"
+        elif "django" in combined:
+            fw = "Django/DRF view + serializers"
+        elif "flask" in combined:
+            fw = "Flask route + request parsing"
+        elif "express" in combined and "nest" not in combined:
+            fw = "Express.js route + TypeScript types"
+        elif "spring" in combined or "java" in combined or "kotlin" in combined:
+            fw = "Spring Boot controller + service (annotated)"
+        elif "go" in combined or "golang" in combined:
+            fw = "Go HTTP handler + struct types"
+        else:
+            fw = "NestJS controller + service + DTO"
+        return "Scaffold a " + fw + _scaffold
 
     if role == "devsecops":
         return (
@@ -834,6 +841,10 @@ def _generate_one_file(
             HumanMessage(content=prompt),
         ])
         result = str(resp.content)
+        # W3: nếu coding role dùng reasoning model, loại bỏ <think>...</think>
+        # TRƯỚC khi lưu — nếu không chain-of-thought bị ghi thẳng vào file artifact.
+        if any(m in agent.model.lower() for m in _REASONING_MODELS):
+            result = _strip_thinking(result)
         result = _strip_code_fence(result, language)   # remove nested fences
         result = _deloop(result)                        # remove infinite loops
         return result

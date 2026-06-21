@@ -142,6 +142,37 @@ app = FastAPI(title="rag-agent-platform - Bộ điều phối SDLC Agent", versi
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
+@app.on_event("startup")
+def _validate_models_on_startup() -> None:
+    """A4 — cảnh báo (KHÔNG chặn khởi động) nếu model per-role chưa được pull về Ollama.
+
+    Best-effort: nếu Ollama chưa sẵn sàng (depends_on không gate health) thì bỏ qua.
+    Mục tiêu là phát hiện sớm model thiếu/sai tên thay vì để node fail giữa workflow —
+    bù lại sự bất nhất hiện tại (LOG_LEVEL fail-fast nhưng model thì im lặng fallback).
+    """
+    import requests  # local import — chỉ cần lúc startup
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+        available = {m.get("name", "") for m in resp.json().get("models", [])}
+    except Exception as exc:
+        logger.warning("A4: bỏ qua kiểm tra model Ollama lúc startup (non-fatal): %s", exc)
+        return
+
+    def _present(m: str) -> bool:
+        return m in available or f"{m}:latest" in available
+
+    wanted = {cfg.model for cfg in AGENTS.values() if cfg.model}
+    missing = sorted(m for m in wanted if not _present(m))
+    if missing:
+        logger.warning(
+            "A4: %d/%d model chưa có trên Ollama — node dùng chúng sẽ fail lúc runtime: %s",
+            len(missing), len(wanted), ", ".join(missing),
+        )
+    else:
+        logger.info("A4: tất cả %d model per-role đã sẵn sàng trên Ollama.", len(wanted))
+
+
 # ── Models Pydantic cho Request và Response của các endpoint ────────────────────────────────────────
 
 class AgentStepRequest(BaseModel):
@@ -201,6 +232,9 @@ class WorkflowRecord(BaseModel):
     tech_stack: list[str] | None = None
     step_outputs: dict[str, str] = Field(default_factory=dict)
     completed_steps: list[str] = Field(default_factory=list)
+    # W6: các bước chạy xong nhưng trả về marker [LỖI ...]. Workflow vẫn 'completed'
+    # (stream hoàn tất); đây là nơi phơi bày lỗi từng node thay vì flip cả status.
+    failed_steps: list[str] = Field(default_factory=list)
     error: str | None = None
     artifacts: dict[str, list] = Field(default_factory=dict)
     created_at: str
@@ -219,6 +253,10 @@ _MAX_STORED_WORKFLOWS = 50
 # Số vòng lặp Clarifier re-generation tối đa. 0 = tắt toàn bộ tính năng.
 # Tăng lên 2 nếu muốn nhiều vòng tinh chỉnh hơn (tốn thêm thời gian).
 _CLARIFIER_REGEN_LOOPS: int = int(os.environ.get("CLARIFIER_REGEN_LOOPS", "1"))
+# W1: ngân sách thời gian tổng cho một workflow (giây). 0 = không giới hạn.
+# Được kiểm tra giữa các node — node đang chạy không bị hủy giữa chừng, nhưng
+# stream dừng sớm sau khi node hiện tại trả về nếu đã vượt ngân sách.
+_WORKFLOW_MAX_SECONDS: int = int(os.environ.get("WORKFLOW_MAX_SECONDS", "0"))
 
 # ── Đường dẫn bộ nhớ episodic và giới hạn input ────────────────────────────
 
@@ -288,9 +326,76 @@ def _store_workflow(record: WorkflowRecord) -> None:
     """
     with _store_lock:
         if len(workflow_store) >= _MAX_STORED_WORKFLOWS:
-            oldest_key = next(iter(workflow_store))
-            del workflow_store[oldest_key]
+            # C4: chỉ evict entry đã KẾT THÚC (completed/failed) và cũ nhất.
+            # Không bao giờ xóa workflow đang pending/running để tránh mất kết quả
+            # của một run đang dở (dict giữ thứ tự chèn → phần tử đầu là cũ nhất).
+            evictable = [
+                k for k, v in workflow_store.items()
+                if v.status in (WorkflowStatus.completed, WorkflowStatus.failed)
+            ]
+            if evictable:
+                del workflow_store[evictable[0]]
+            else:
+                logger.warning(
+                    "workflow_store đạt giới hạn (%d) nhưng mọi entry đang chạy — "
+                    "tạm thời vượt giới hạn thay vì drop một run đang dở.",
+                    _MAX_STORED_WORKFLOWS,
+                )
         workflow_store[record.workflow_id] = record
+
+
+def _reconstruct_from_disk(workflow_id: str) -> WorkflowRecord | None:
+    """W2 — dựng lại WorkflowRecord từ disk khi record đã bị evict khỏi store in-memory.
+
+    Nguồn dữ liệu bền vững: episodic JSONL (metadata: status, project, completed_steps,
+    error, timestamp) + artifacts trên disk (_output.md của từng role → step_outputs).
+    Không khôi phục được output của role không sinh artifact (planning roles). Trả về
+    None nếu không có cả episodic entry lẫn artifact nào trên disk.
+    """
+    disk_arts = _list_artifacts(workflow_id)
+    meta: dict | None = None
+    try:
+        log_file = Path(MEMORY_DIR) / "episodic" / "workflow_runs.jsonl"
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if entry.get("workflow_id") == workflow_id:
+                        meta = entry  # giữ dòng cuối cùng (mới nhất) khớp id
+    except Exception as exc:
+        logger.warning("W2: đọc episodic log thất bại (non-fatal): %s", exc)
+
+    if not disk_arts and not meta:
+        return None
+
+    # Khôi phục step_outputs từ _output.md của từng role có artifact trên disk.
+    step_outputs: dict[str, str] = {}
+    for role in disk_arts:
+        res = _read_artifact(workflow_id, role, "_output.md")
+        if res:
+            step_outputs[role] = res[0]
+
+    meta = meta or {}
+    try:
+        status = WorkflowStatus(meta.get("status", "completed"))
+    except ValueError:
+        status = WorkflowStatus.completed
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return WorkflowRecord(
+        workflow_id=workflow_id,
+        status=status,
+        project=meta.get("project"),
+        user_input=meta.get("user_input", ""),
+        step_outputs=step_outputs,
+        completed_steps=meta.get("completed_steps", list(disk_arts.keys())),
+        error=meta.get("error"),
+        artifacts=disk_arts,
+        created_at=meta.get("timestamp", now_iso),
+        completed_at=meta.get("timestamp"),
+    )
 
 
 # ── Task nền chạy toàn bộ SDLC workflow ────────────────────────────────────────────────────
@@ -306,7 +411,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
       là kiểu tham chiếu — không cần re-insert vào store.
     - Các endpoint đọc (GET /workflow/{id}) chỉ đọc các trường được ghi nguyên tử.
     """
-    record = workflow_store.get(workflow_id)
+    with _store_lock:
+        record = workflow_store.get(workflow_id)
     if record is None:
         return
 
@@ -333,6 +439,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
     _start = time.monotonic()
     try:
         final_state: SDLCState = {}  # type: ignore[assignment]
+        _node_errors: list[str] = []
+        _timed_out = False
         for chunk in get_workflow().stream(initial_state, stream_mode="updates"):
             # chunk = {ten_node: partial_state_dict} với stream_mode="updates".
             # Mỗi chunk cập nhật được ngay lập tức vào record để GET /workflow/{id}
@@ -342,14 +450,15 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                     # Cập nhật real-time để GET /workflow/{id} phản ánh tiến trình
                     if "step_outputs" in node_output:
                         record.step_outputs.update(node_output["step_outputs"])
-                        # Trích xuất và lưu artifact ngay sau khi mỗi coding node hoàn thành.
-                        # Non-fatal: lỗi extraction chỉ ghi log, không dừng workflow.
                         for _role, _out in node_output["step_outputs"].items():
-                            if (
-                                _role in _ARTIFACT_ROLES
-                                and _out
-                                and not _out.startswith("[LỖI")
-                            ):
+                            # W6: node trả về marker [LỖI ...] → ghi nhận failed_steps,
+                            # KHÔNG flip cả workflow sang 'failed' và vẫn cho regen chạy.
+                            if _out and _out.startswith("[LỖI"):
+                                if _role not in record.failed_steps:
+                                    record.failed_steps.append(_role)
+                            # Trích xuất artifact ngay sau mỗi coding node thành công.
+                            # Non-fatal: lỗi extraction chỉ ghi log, không dừng workflow.
+                            elif _role in _ARTIFACT_ROLES and _out:
                                 _arts = _extract_artifacts(_role, _out, workflow_id)
                                 if _arts:
                                     record.artifacts[_role] = _arts
@@ -360,15 +469,30 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                             )
                         )
                     if node_output.get("error"):
-                        record.error = node_output["error"]
+                        _node_errors.append(str(node_output["error"]))
                     final_state.update(node_output)
-        record.status = WorkflowStatus.failed if record.error else WorkflowStatus.completed
+            # W1: kiểm tra ngân sách thời gian SAU mỗi node (không mất output node vừa xong).
+            if _WORKFLOW_MAX_SECONDS and (time.monotonic() - _start) > _WORKFLOW_MAX_SECONDS:
+                _timed_out = True
+                logger.warning(
+                    "Workflow %s vượt ngân sách %ds — dừng sớm sau %d node.",
+                    workflow_id, _WORKFLOW_MAX_SECONDS, len(record.completed_steps),
+                )
+                break
+        # Stream hoàn tất (hoặc dừng do timeout) ⇒ 'completed'. Lỗi từng node nằm trong
+        # failed_steps + record.error (tóm tắt); chỉ outer-except mới là 'failed' thật sự.
+        if _node_errors:
+            record.error = "; ".join(_node_errors[:5])
+        if _timed_out:
+            record.error = (record.error + " | " if record.error else "") + \
+                f"[Timeout: vượt {_WORKFLOW_MAX_SECONDS}s, dừng sớm]"
+        record.status = WorkflowStatus.completed
 
         # ── Clarifier Regen Loop ───────────────────────────────────────────────────────────────────
         # Chỉ chạy khi workflow hoàn thành thành công và CLARIFIER_REGEN_LOOPS > 0.
         # Clarifier phân tích §10 để lấy danh sách agent cần re-gen, re-run từng agent,
         # sau đó re-run Clarifier để đánh giá lại — lặp tối đa CLARIFIER_REGEN_LOOPS lần.
-        if record.status == WorkflowStatus.completed and _CLARIFIER_REGEN_LOOPS > 0:
+        if record.status == WorkflowStatus.completed and not _timed_out and _CLARIFIER_REGEN_LOOPS > 0:
             _live_outputs: dict[str, str] = dict(record.step_outputs)
             for _loop_idx in range(_CLARIFIER_REGEN_LOOPS):
                 regen_roles = _parse_clarifier_regen_list(
@@ -448,7 +572,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                     )
                     break
 
-            record.status = WorkflowStatus.failed if record.error else WorkflowStatus.completed
+            # W6: lỗi từng node không làm workflow 'failed' — giữ 'completed' sau regen.
+            record.status = WorkflowStatus.completed
         # ── Kết thúc Clarifier Regen Loop ─────────────────────────────────────────
 
     except Exception as exc:
@@ -578,6 +703,9 @@ def get_workflow_status(workflow_id: str) -> WorkflowRecord:
     with _store_lock:
         record = workflow_store.get(workflow_id)
     if record is None:
+        # W2: store in-memory bị evict → thử dựng lại từ disk (episodic log + artifacts).
+        record = _reconstruct_from_disk(workflow_id)
+    if record is None:
         raise HTTPException(
             status_code=404,
             detail=f"Workflow '{workflow_id}' không tìm thấy. Có thể đã bị xóa khỏi store hoặc chưa bắt đầu.",
@@ -612,14 +740,15 @@ def get_workflow_artifacts(workflow_id: str) -> dict[str, Any]:
     """Liệt kê artifacts đã lưu cho workflow (metadata only, không bao gồm nội dung file)."""
     with _store_lock:
         record = workflow_store.get(workflow_id)
-    if record is None:
+    # Merge in-memory artifacts with disk (in case container was restarted/evicted).
+    disk_arts = _list_artifacts(workflow_id)
+    if record is None and not disk_arts:
         raise HTTPException(
             status_code=404,
             detail=f"Workflow '{workflow_id}' không tìm thấy.",
         )
-    # Merge in-memory artifacts with disk (in case container was restarted)
-    disk_arts = _list_artifacts(workflow_id)
-    merged = {**disk_arts, **record.artifacts}
+    # W2: nếu record đã evict nhưng artifact còn trên disk, vẫn trả về được.
+    merged = {**disk_arts, **(record.artifacts if record else {})}
     return {"workflow_id": workflow_id, "artifacts": merged}
 
 

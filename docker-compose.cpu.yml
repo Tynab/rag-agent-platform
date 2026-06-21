@@ -1,0 +1,13 @@
+# docker-compose.cpu.yml — override cho host KHÔNG có GPU NVIDIA (D7).
+#
+# Dùng:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# Gỡ bỏ GPU reservation của ollama để `docker compose up` không fail trên máy
+# không có nvidia runtime (Windows/Mac dev, hoặc Linux chưa chạy setup.sh).
+# `!reset` là cú pháp Compose (>= v2.24) để XÓA một nhánh cấu hình của file gốc;
+# nếu bản Compose của bạn quá cũ không hỗ trợ, hãy comment khối `deploy:` trong
+# docker-compose.yml thay vì dùng file này.
+services:
+  ollama:
+    deploy: !reset {}

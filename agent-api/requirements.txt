@@ -1,8 +1,9 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.7.0
-requests>=2.32.0
-langchain>=0.3.0
-langchain-core>=0.3.0
-langchain-ollama>=0.2.0
-langgraph>=0.2.0
+# D3: thêm cận trên để rebuild image không vô tình kéo bản major mới gây vỡ API.
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
+pydantic>=2.7.0,<3.0.0
+requests>=2.32.0,<3.0.0
+langchain>=0.3.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langchain-ollama>=0.2.0,<0.4.0
+langgraph>=0.2.0,<0.4.0
