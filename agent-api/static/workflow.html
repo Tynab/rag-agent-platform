@@ -243,7 +243,10 @@
       display: flex;
       align-items: flex-start;
       overflow-x: auto;
-      padding-bottom: 4px;
+      /* overflow-x:auto buộc overflow-y cũng clip → box-shadow ring của step-circle
+         (.selected 3px, .active pulse tới 9px) bị cắt ở mép trên/dưới. Thêm padding
+         dọc để ring có chỗ hiển thị đầy đủ. */
+      padding: 12px 2px 10px;
     }
 
     .step-node {
@@ -691,6 +694,7 @@ let startTime    = null;   // Date of created_at for duration counter
 let userPickedTab = false; // true when user manually clicked a tab
 let artifactsCache = {};   // { role: [file_meta, ...] } — artifacts for current workflow
 let subTabState  = {};     // { role: 'output'|'files' } — preserves sub-tab selection per role
+let _lastBodyKey = null;   // chữ ký nội dung tab-body đã render — tránh rebuild thừa (giữ scroll)
 
 /* ────────────────────────────────────────────────────────────────────────
    INIT — pick up workflow_id from URL query string
@@ -727,6 +731,7 @@ function trackWorkflow(id) {
   lastData     = null;
   startTime    = null;
   artifactsCache = {};   // Reset cache khi bắt đầu theo dõi workflow mới
+  _lastBodyKey = null;   // buộc render lại tab-body cho workflow mới
 
   pushUrl(id);
   showView('wf');
@@ -807,10 +812,18 @@ function renderStatusBar(data) {
   };
   const s = MAP[data.status] || MAP.failed;
 
+  // Khi đã xong 15/15 nhưng status vẫn 'running' → đang chạy Clarifier Regen Loop
+  // (re-gen các engineer role + chạy lại Clarifier). Nói rõ để không hiểu nhầm là treo.
+  // Tắt vòng này bằng CLARIFIER_REGEN_LOOPS=0 trong .env.
+  const _allStepsDone = (data.completed_steps || []).length >= STEPS.length;
+  const _label = (data.status === 'running' && _allStepsDone)
+    ? 'Running — Clarifier regen…'
+    : s.label;
+
   badgeEl.innerHTML = `
     <span class="badge ${s.cls}">
       ${s.dot ? '<span class="blink-dot"></span>' : ''}
-      ${s.label}
+      ${_label}
     </span>`;
 
   // Duration
@@ -953,6 +966,23 @@ function renderTabBody(data) {
   const _hasKey      = activeTab in _stepOutputs;
   const output       = _stepOutputs[activeTab] || "";
 
+  // Tránh rebuild DOM tab-body mỗi lần poll khi nội dung KHÔNG đổi — rebuild làm
+  // reset vị trí scroll của bảng/diagram/code đang xem. Chỉ render lại khi "chữ ký"
+  // thay đổi (đổi tab, step có output mới, artifact vừa tải xong). Lưu ý: sub-tab
+  // (Output/Files) do switchSubTab tự toggle display nên KHÔNG nằm trong chữ ký →
+  // lựa chọn sub-tab của người dùng được giữ nguyên qua các lần poll.
+  const _artCount = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_')).length;
+  const _bodyKey = [
+    activeTab,
+    _hasKey ? 1 : 0,
+    output.length,
+    (running && activeTab === currentStep) ? 'cur' : (running ? 'r' : 's'),
+    completed.has(activeTab) ? 'c' : '',
+    _artCount,
+  ].join('|');
+  if (_bodyKey === _lastBodyKey) return;   // không đổi → giữ nguyên DOM + scroll
+  _lastBodyKey = _bodyKey;
+
   if (_hasKey && output && output.trim()) {
     // Hoàn thành — render markdown + panel files nếu có artifact
     const clean    = DOMPurify.sanitize(marked.parse(output));
@@ -1077,6 +1107,7 @@ function renderTabBody(data) {
 function selectTab(role) {
   userPickedTab = true;
   activeTab     = role;
+  _lastBodyKey  = null;   // người dùng đổi tab → luôn render lại body
   if (lastData) {
     renderProgress(lastData);
     renderTabs(lastData);
