@@ -77,6 +77,7 @@
 
     .search-row input {
       flex: 1;
+      min-width: 0; /* cho phép co dưới độ rộng mặc định của <input> trên màn hẹp */
       background: var(--surface2);
       border: 1px solid var(--border);
       color: var(--text);
@@ -406,6 +407,10 @@
       font-size: 13.5px;
       line-height: 1.8;
       color: var(--text);
+      /* URL / inline code dài không có khoảng trắng → xuống dòng thay vì bị
+         .content-card (overflow:hidden) cắt mất trên màn hẹp. Không ảnh hưởng <pre>
+         (white-space: pre) và bảng (th/td nowrap, đã có .table-wrap cuộn ngang). */
+      overflow-wrap: break-word;
     }
     .md h1,.md h2,.md h3,.md h4,.md h5 {
       color: var(--text);
@@ -539,10 +544,15 @@
     }
     .ft-item:hover { background: var(--surface2); }
     .ft-icon  { font-size: 14px; flex-shrink: 0; }
-    .ft-name  { flex: 1; font-size: 12px; font-family: 'SF Mono','Fira Code',monospace; color: var(--text); }
+    /* min-width:0 + overflow-wrap: tên file dài xuống dòng thay vì đẩy size / nút ⬇
+       ra ngoài khung (bị cắt) trên màn hẹp */
+    .ft-name  { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; font-family: 'SF Mono','Fira Code',monospace; color: var(--text); }
     .ft-size  { font-size: 11px; color: var(--muted); white-space: nowrap; }
     .ft-dl    { margin-left: 6px; opacity: 0; transition: opacity .15s; text-decoration: none; flex-shrink: 0; }
-    .ft-item:hover .ft-dl { opacity: 1; }
+    /* Hiện nút ⬇ khi hover, khi focus bằng bàn phím, và luôn hiện trên thiết bị
+       không có hover (cảm ứng) — trước đây opacity:0 nên trên điện thoại không thấy */
+    .ft-item:hover .ft-dl, .ft-item:focus-within .ft-dl { opacity: 1; }
+    @media (hover: none) { .ft-dl { opacity: 1; } }
 
     /* ── File content viewer ──────────────────────────────────── */
     .art-viewer {
@@ -575,6 +585,51 @@
     .md pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
     .md pre code { font-size: 12.5px; line-height: 1.45; }
     .md code { font-size: 12px; }
+
+    /* ── Responsive ──────────────────────────────────────────── */
+    /* Đặt cuối <style> để thắng các rule cùng độ ưu tiên ở trên. Mục tiêu: không có
+       cuộn ngang cả trang ở 360px; các dải dài (steps-track, tabs-nav, bảng, <pre>)
+       tự cuộn ngang bên trong khung của chúng. */
+    @media (max-width: 768px) {
+      .header       { padding: 0 16px; gap: 12px; }
+      .main         { padding: 16px; }
+      .status-bar   { padding: 14px 16px; gap: 12px 20px; }
+      .status-meta  { gap: 10px 20px; }
+      .progress-card { padding: 16px; }
+      .progress-head { margin-bottom: 12px; }
+      .tab-body     { padding: 20px 16px; min-height: 320px; }
+    }
+    @media (max-width: 640px) {
+      /* Header gập 2 hàng: [logo … Polling · Copy ID] / [ô Workflow ID · Track · Recent].
+         Một hàng 56px cố định + nowrap trước đây tràn ra ngoài và đè lên nhau. */
+      .header     { height: auto; min-height: 56px; flex-wrap: wrap; row-gap: 8px; padding-top: 10px; padding-bottom: 10px; }
+      .logo       { flex: 1 1 0; min-width: 0; max-width: none; }  /* co + ellipsis thay vì đẩy sang hàng thứ 3 */
+      .search-row { order: 1; flex: 1 1 100%; max-width: none; }
+    }
+    @media (max-width: 480px) {
+      .header       { padding-left: 12px; padding-right: 12px; column-gap: 8px; }
+      .poll-text    { display: none; }   /* chỉ giữ chấm nhấp nháy — badge Running bên dưới đã nói rõ */
+      .main         { padding: 12px; }
+      .center-state { padding: 56px 12px; }
+      .status-bar   { padding: 12px; }
+      .progress-card { padding: 14px 12px; }
+      .progress-head { flex-wrap: wrap; gap: 4px 12px; }
+      .tab-body     { padding: 16px 12px; }
+      .ft-item      { padding-left: 16px; padding-right: 10px; }
+      .toast        { left: 12px; right: 12px; bottom: 12px; }
+    }
+
+    /* ── Giảm chuyển động ────────────────────────────────────── */
+    /* prefers-reduced-motion: tắt các animation lặp (ring-pulse, blink, spin) và
+       transition. !important để thắng cả animation khai báo inline (icon loader). */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -590,7 +645,7 @@
   </div>
 
   <div id="poll-indicator" class="poll-indicator" style="display:none">
-    <span class="blink-dot"></span>Polling…
+    <span class="blink-dot"></span><span class="poll-text">Polling…</span>
   </div>
   <button id="copy-btn" class="btn btn-secondary btn-sm" style="display:none" onclick="copyId()">Copy ID</button>
 </header>
@@ -617,10 +672,33 @@
   <!-- ── Workflow view ─────────────────────────────────────────────── -->
   <div id="wf-view" class="wf-view">
 
-    <!-- Status bar -->
+    <!-- Status bar — khung tĩnh, renderStatusBar() chỉ cập nhật class/text tại chỗ -->
     <div class="status-bar" id="status-bar">
-      <div id="status-badge"></div>
-      <div class="status-meta" id="status-meta"></div>
+      <div id="status-badge">
+        <span class="badge badge-pending" id="status-pill"><span class="blink-dot" id="status-dot"></span><span id="status-label">…</span></span>
+      </div>
+      <div class="status-meta" id="status-meta">
+        <div class="meta-item">
+          <span class="lbl">Project</span>
+          <span class="val" id="meta-project">—</span>
+        </div>
+        <div class="meta-item">
+          <span class="lbl">Started</span>
+          <span class="val" id="meta-started">—</span>
+        </div>
+        <div class="meta-item">
+          <span class="lbl">Duration</span>
+          <span class="val" id="dur-val">—</span>
+        </div>
+        <div class="meta-item">
+          <span class="lbl">Steps</span>
+          <span class="val" id="meta-steps">—</span>
+        </div>
+        <div class="meta-item" id="meta-error" style="flex:1 1 100%; display:none">
+          <span class="lbl">Error</span>
+          <span class="val" id="meta-error-val" style="color:var(--err); font-size:12px"></span>
+        </div>
+      </div>
     </div>
 
     <!-- Progress tracker -->
@@ -695,6 +773,8 @@ let userPickedTab = false; // true when user manually clicked a tab
 let artifactsCache = {};   // { role: [file_meta, ...] } — artifacts for current workflow
 let subTabState  = {};     // { role: 'output'|'files' } — preserves sub-tab selection per role
 let _lastBodyKey = null;   // chữ ký nội dung tab-body đã render — tránh rebuild thừa (giữ scroll)
+let _stepEls     = null;   // [{ node, conn, circle, state }] — progress tracker dựng một lần
+let _tabEls      = null;   // [{ btn, icon }] — thanh tab dựng một lần
 
 /* ────────────────────────────────────────────────────────────────────────
    INIT — pick up workflow_id from URL query string
@@ -799,11 +879,28 @@ function renderAll(data) {
   renderTabBody(data);
 }
 
+/* Status bar / progress / tabs được dựng MỘT lần rồi chỉ đổi class/text tại chỗ khi
+   giá trị thực sự thay đổi. Rebuild bằng innerHTML mỗi lần poll (2.5s) làm restart
+   các animation (ring-pulse, blink, spin → giật), transition không bao giờ chạy
+   (phần tử mới sinh ra đã ở trạng thái cuối) và làm mất focus bàn phím trên tab. */
+function setText(el, value) {
+  const v = String(value);
+  if (el.textContent !== v) el.textContent = v;
+}
+
+// Cuộn ngang một dải (steps-track / tabs-nav) để phần tử vừa được chọn nằm trong
+// khung nhìn — trên màn hẹp tab/step được auto-chọn thường nằm ngoài vùng thấy.
+// Chỉ chỉnh scrollLeft của chính dải đó (không dùng scrollIntoView để trang không
+// bị kéo theo chiều dọc khi poll tự chuyển tab trong lúc người dùng đang đọc).
+function revealInStrip(strip, el) {
+  const s = strip.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  if (r.left >= s.left && r.right <= s.right) return;
+  strip.scrollLeft += (r.left + r.width / 2) - (s.left + s.width / 2);
+}
+
 /* ── Status bar ─────────────────────────────────────────────────────── */
 function renderStatusBar(data) {
-  const badgeEl = document.getElementById('status-badge');
-  const metaEl  = document.getElementById('status-meta');
-
   const MAP = {
     pending:   { cls: 'badge-pending',   dot: true,  label: 'Pending' },
     running:   { cls: 'badge-running',   dot: true,  label: 'Running' },
@@ -820,11 +917,12 @@ function renderStatusBar(data) {
     ? 'Running — Clarifier regen…'
     : s.label;
 
-  badgeEl.innerHTML = `
-    <span class="badge ${s.cls}">
-      ${s.dot ? '<span class="blink-dot"></span>' : ''}
-      ${_label}
-    </span>`;
+  // Cập nhật tại chỗ — giữ nguyên phần tử .blink-dot để animation không restart mỗi poll
+  const pill = document.getElementById('status-pill');
+  const pillCls = 'badge ' + s.cls;
+  if (pill.className !== pillCls) pill.className = pillCls;
+  document.getElementById('status-dot').style.display = s.dot ? '' : 'none';
+  setText(document.getElementById('status-label'), _label);
 
   // Duration
   if ((data.status === 'running' || data.status === 'pending') && !startTime) {
@@ -837,29 +935,13 @@ function renderStatusBar(data) {
     ? fmtDur(new Date(data.created_at), new Date(data.completed_at))
     : (startTime ? fmtDur(startTime, new Date()) : '—');
 
-  metaEl.innerHTML = `
-    <div class="meta-item">
-      <span class="lbl">Project</span>
-      <span class="val">${data.project || '—'}</span>
-    </div>
-    <div class="meta-item">
-      <span class="lbl">Started</span>
-      <span class="val">${fmtTime(data.created_at)}</span>
-    </div>
-    <div class="meta-item">
-      <span class="lbl">Duration</span>
-      <span class="val" id="dur-val">${dur}</span>
-    </div>
-    <div class="meta-item">
-      <span class="lbl">Steps</span>
-      <span class="val">${(data.completed_steps || []).length} / ${STEPS.length}</span>
-    </div>
-    ${data.error ? `
-    <div class="meta-item" style="flex:1 1 100%">
-      <span class="lbl">Error</span>
-      <span class="val" style="color:var(--err); font-size:12px">${esc(data.error)}</span>
-    </div>` : ''}
-  `;
+  // textContent (không phải innerHTML) → giá trị từ API không bao giờ được parse thành HTML
+  setText(document.getElementById('meta-project'), data.project || '—');
+  setText(document.getElementById('meta-started'), fmtTime(data.created_at));
+  setText(document.getElementById('dur-val'), dur);
+  setText(document.getElementById('meta-steps'), `${(data.completed_steps || []).length} / ${STEPS.length}`);
+  document.getElementById('meta-error').style.display = data.error ? '' : 'none';
+  setText(document.getElementById('meta-error-val'), data.error || '');
 }
 
 /* ── Progress tracker ───────────────────────────────────────────────── */
@@ -875,48 +957,63 @@ function renderProgress(data) {
     }
   }
 
-  document.getElementById('steps-done').textContent = completed.size;
+  setText(document.getElementById('steps-done'), completed.size);
 
   const track = document.getElementById('steps-track');
-  track.innerHTML = '';
+  if (!_stepEls) {
+    // Dựng 15 node + 14 connector một lần; các lần poll sau chỉ toggle class
+    track.innerHTML = '';
+    _stepEls = STEPS.map((step, i) => {
+      let conn = null;
+      if (i > 0) {
+        conn = document.createElement('div');
+        conn.className = 'step-connector';
+        track.appendChild(conn);
+      }
+      const node = document.createElement('div');
+      node.className = 'step-node';
+      node.onclick = () => selectTab(step.role);
+      node.innerHTML = `
+        <div class="step-circle"></div>
+        <div class="step-label">${step.label}</div>
+        <div class="step-sublabel">${step.name}</div>`;
+      track.appendChild(node);
+      return { node, conn, circle: node.querySelector('.step-circle'), state: null };
+    });
+  }
 
   STEPS.forEach((step, i) => {
+    const el         = _stepEls[i];
     const isDone     = completed.has(step.role);
     const isActive   = step.role === currentStep;
     const isSelected = step.role === activeTab;
 
-    // Connector (before step except first)
-    if (i > 0) {
+    // Connector (trước mỗi step trừ step đầu)
+    if (el.conn) {
       const prevDone = completed.has(STEPS[i - 1].role);
-      const conn = document.createElement('div');
-      conn.className = 'step-connector'
-        + (isDone && prevDone ? ' done' : '')
-        + (isActive && prevDone ? ' active' : '');
-      track.appendChild(conn);
+      el.conn.classList.toggle('done',   isDone && prevDone);
+      el.conn.classList.toggle('active', isActive && prevDone);
     }
 
-    // Step node
-    const node = document.createElement('div');
-    node.className = 'step-node'
-      + (isDone   ? ' done'     : '')
-      + (isActive ? ' active'   : '')
-      + (isSelected ? ' selected' : '');
-    node.onclick = () => selectTab(step.role);
+    // toggle(cls, bool) không đụng DOM khi class đã đúng → animation/transition giữ nguyên
+    const wasSelected = el.node.classList.contains('selected');
+    el.node.classList.toggle('done',     isDone);
+    el.node.classList.toggle('active',   isActive);
+    el.node.classList.toggle('selected', isSelected);
+    if (isSelected && !wasSelected) revealInStrip(track, el.node);
 
-    let circleContent;
-    if (isDone) {
-      circleContent = `<svg><use href="#icon-check"/></svg>`;
-    } else if (isActive) {
-      circleContent = `<svg style="animation:spin .8s linear infinite"><use href="#icon-loader"/></svg>`;
-    } else {
-      circleContent = `${i + 1}`;
+    // Chỉ thay icon trong vòng tròn khi trạng thái đổi (thay mỗi poll sẽ restart spin)
+    const state = isDone ? 'done' : isActive ? 'active' : 'todo';
+    if (el.state !== state) {
+      el.state = state;
+      if (isDone) {
+        el.circle.innerHTML = `<svg><use href="#icon-check"/></svg>`;
+      } else if (isActive) {
+        el.circle.innerHTML = `<svg style="animation:spin .8s linear infinite"><use href="#icon-loader"/></svg>`;
+      } else {
+        el.circle.textContent = `${i + 1}`;
+      }
     }
-
-    node.innerHTML = `
-      <div class="step-circle">${circleContent}</div>
-      <div class="step-label">${step.label}</div>
-      <div class="step-sublabel">${step.name}</div>`;
-    track.appendChild(node);
   });
 }
 
@@ -930,22 +1027,31 @@ function renderTabs(data) {
   }
 
   const nav = document.getElementById('tabs-nav');
-  nav.innerHTML = '';
+  if (!_tabEls) {
+    // Dựng 15 nút một lần — giữ nguyên phần tử để focus bàn phím không mất mỗi poll
+    nav.innerHTML = '';
+    _tabEls = STEPS.map(step => {
+      const btn = document.createElement('button');
+      btn.className = 'tab-btn';
+      btn.innerHTML = `<span class="tab-icon"></span>${step.label}`;
+      btn.onclick = () => selectTab(step.role);
+      nav.appendChild(btn);
+      return { btn, icon: btn.firstChild };
+    });
+  }
 
-  STEPS.forEach(step => {
+  STEPS.forEach((step, i) => {
+    const { btn, icon } = _tabEls[i];
     const isDone  = completed.has(step.role);
     const isRun   = step.role === currentStep;
     const isActv  = step.role === activeTab;
 
-    const icon = isDone ? '✓' : isRun ? '⟳' : '○';
-    const btn = document.createElement('button');
-    btn.className = 'tab-btn'
-      + (isDone ? ' t-done' : '')
-      + (isRun  ? ' t-run'  : '')
-      + (isActv ? ' active' : '');
-    btn.innerHTML = `<span class="tab-icon">${icon}</span>${step.label}`;
-    btn.onclick = () => selectTab(step.role);
-    nav.appendChild(btn);
+    setText(icon, isDone ? '✓' : isRun ? '⟳' : '○');
+    const wasActv = btn.classList.contains('active');
+    btn.classList.toggle('t-done', isDone);
+    btn.classList.toggle('t-run',  isRun);
+    btn.classList.toggle('active', isActv);
+    if (isActv && !wasActv) revealInStrip(nav, btn);
   });
 }
 
@@ -1317,7 +1423,8 @@ async function viewArtifact(role, path) {
     if (window.hljs) {
       viewer.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
     }
-    viewer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    const _reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    viewer.scrollIntoView({ behavior: _reduce ? 'auto' : 'smooth', block: 'nearest' });
   } catch (e) { /* ignore */ }
 }
 
