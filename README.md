@@ -558,7 +558,7 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 
 | Biến | Mặc định | Mô tả |
 |---|---|---|
-| `RAG_TIMEOUT` | `600` | Timeout (giây) cho mỗi lần gọi RAG `/ask` từ agent |
+| `RAG_TIMEOUT` | `600` | Timeout (giây) cho mỗi lần gọi RAG `/retrieve` từ agent (chỉ embed + search) |
 | `MAX_FILES_PER_ROLE` | `6` | Số file tối đa mỗi coding agent sinh trong 1 workflow |
 | `CLARIFIER_REGEN_LOOPS` | `1` | Số vòng lặp Clarifier re-generation (0 = tắt) |
 
@@ -881,6 +881,7 @@ curl -s http://localhost:8090/projects | jq
 ### POST /ingest
 
 Ingest tài liệu vào Qdrant (+ Neo4j nếu `GRAPH_ENABLED=true`). Idempotent — chạy lại không tạo bản sao.
+Ingest không-reset còn xóa chunk của file đã sửa/xóa khỏi Qdrant và Neo4j (`stale_removed` trong response).
 
 | Trường | Mô tả |
 |---|---|
@@ -1008,6 +1009,22 @@ curl -s -X POST http://localhost:8090/ask \
 | `relative_path` | Đường dẫn tương đối trong `data/raw/` |
 | `chunk_index` | Số thứ tự chunk trong file |
 | `preview` | 200 ký tự đầu của chunk |
+
+### POST /retrieve
+
+Chỉ truy hồi (embed → Qdrant → Neo4j), **không** gọi `CHAT_MODEL`. Body giống `/ask`.
+Trả về `context` (chunk nguyên văn theo định dạng `[SOURCE n]` / `[GRAPH CONTEXT n]`,
+đúng chuỗi mà `/ask` đưa cho LLM) và `sources`. agent-api dùng endpoint này cho mọi
+node workflow nên không phải swap sang `CHAT_MODEL` ở mỗi bước.
+
+```bash
+curl -s -X POST http://localhost:8090/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{"question": "JWT refresh token flow?", "project": "myproject", "top_k": 4}' | jq -r .context
+```
+
+> Tên `project` (mọi endpoint) phải là một tên thư mục đơn giản trong `data/raw/`: chữ, số,
+> `_`, `.`, `-`, ký tự đầu là chữ/số. Tên sai quy tắc (`.`, `..`, `/`, `a/b`...) → HTTP 400.
 
 ### Qdrant — kiểm tra trực tiếp
 

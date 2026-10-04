@@ -42,6 +42,8 @@ Idempotency
 make_point_id() sinh UUID5 tất định từ tổ hợp (đường dẫn file + hash nội dung).
 Chạy /ingest nhiều lần trên cùng một file sẽ upsert đúng point_id đã tồn tại
 — Qdrant tự cập nhật payload, không tạo bản ghi trùng lặp.
+F11: ingest không-reset còn xóa các point (và Chunk Neo4j) KHÔNG thuộc lần ingest
+hiện tại — chunk của file đã sửa/xóa/đổi tên — để index không giữ nội dung cũ.
 
 Metadata của mỗi chunk trong Qdrant
 ------------------------------------
@@ -100,7 +102,7 @@ from langchain_core.documents import Document
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.http.models import Distance, PointStruct, VectorParams
+from qdrant_client.http.models import Distance, PointIdsList, PointStruct, VectorParams
 
 
 def _require_env(name: str) -> str:
@@ -158,16 +160,68 @@ def get_collection_name(project: str) -> str:
     return f"{COLLECTION_NAME}__{project}"
 
 
+class InvalidProjectError(ValueError):
+    """F6: tên project không hợp lệ — API trả HTTP 400 thay vì chạm vào filesystem/Qdrant."""
+
+
+# F6: tên project đi thẳng vào đường dẫn filesystem (RAW_DATA_DIR/{project}) và tên
+# Qdrant collection ({COLLECTION_NAME}__{project}) → chỉ chấp nhận MỘT thành phần tên
+# đơn giản: ký tự đầu là chữ/số, sau đó chữ/số/'_'/'.'/'-', tối đa 128 ký tự.
+# Chặn "", ".", "..", "/", "~", đường dẫn tuyệt đối, dấu phân cách, khoảng trắng và
+# thư mục ẩn (".git"). \w khớp cả chữ Unicode để không làm vỡ project tên tiếng Việt.
+_PROJECT_NAME_RE = re.compile(r"[^\W_][\w.-]{0,127}")
+
+
+def validate_project_name(project: str) -> str:
+    """F6 — trả về *project* nếu hợp lệ, ngược lại raise InvalidProjectError."""
+    if not isinstance(project, str) or not _PROJECT_NAME_RE.fullmatch(project):
+        raise InvalidProjectError(
+            f"Tên project không hợp lệ: {project!r}. Chỉ chấp nhận chữ, số, '_', '.', '-' "
+            "(ký tự đầu là chữ hoặc số, tối đa 128 ký tự), không chứa dấu phân cách đường dẫn."
+        )
+    return project
+
+
+def project_dir_for(project: str, raw_data_dir: str | None = None) -> Path:
+    """F6 — kiểm tra *project* rồi trả về thư mục RAW_DATA_DIR/{project}.
+
+    Hai lớp chặn: (1) regex tên đơn thành phần; (2) resolve() (theo cả symlink) và
+    bắt buộc kết quả nằm TRONG RAW_DATA_DIR, khác chính RAW_DATA_DIR — chặn symlink
+    trỏ ra ngoài thư mục dữ liệu. Raise InvalidProjectError nếu không hợp lệ.
+    """
+    validate_project_name(project)
+    root = Path(raw_data_dir or RAW_DATA_DIR)
+    project_dir = root / project
+    real_root = root.resolve()
+    real_dir = project_dir.resolve()
+    if real_dir == real_root or not real_dir.is_relative_to(real_root):
+        raise InvalidProjectError(f"Project {project!r} trỏ ra ngoài RAW_DATA_DIR.")
+    return project_dir
+
+
 def get_projects(raw_data_dir: str = RAW_DATA_DIR) -> list[str]:
     """Trả về danh sách tên project đã sắp xếp — là các thư mục con cấp 1 trong raw_data_dir.
 
     Mỗi thư mục con tương ứng một project độc lập với collection Qdrant riêng.
     Trả về [] nếu raw_data_dir không tồn tại.
+    F6: bỏ qua thư mục có tên không hợp lệ (thư mục ẩn, có khoảng trắng...) hoặc là
+    symlink trỏ ra ngoài raw_data_dir — cùng quy tắc với project_dir_for().
     """
     root = Path(raw_data_dir)
     if not root.exists():
         return []
-    return sorted(p.name for p in root.iterdir() if p.is_dir())
+    names: list[str] = []
+    for p in root.iterdir():
+        if not p.is_dir():
+            continue
+        try:
+            project_dir_for(p.name, raw_data_dir)
+        except InvalidProjectError as exc:
+            if not p.name.startswith("."):
+                logger.warning("Bỏ qua thư mục project: %s", exc)
+            continue
+        names.append(p.name)
+    return sorted(names)
 
 
 SUPPORTED_TEXT_EXTENSIONS = {
@@ -484,12 +538,46 @@ async def _embed_and_upsert_batch_async(
         return [(c, str(p.id)) for c, p in zip(chunk_batch, points)]
 
 
+# F11: số point mỗi trang khi scroll/xóa point cũ.
+_STALE_PAGE_SIZE: int = 1000
+
+
+def _delete_stale_points(client: QdrantClient, collection_name: str, keep_ids: set[str]) -> list[str]:
+    """F11 — xóa các point KHÔNG thuộc lần ingest hiện tại (dùng cho ingest không-reset).
+
+    Point ID = UUID5(relative_path, loader_index, chunk_index, content_hash, embedding_model)
+    nên chunk đã sửa, file đã xóa/đổi tên hay vector của model cũ đều có ID nằm ngoài
+    *keep_ids* → bị xóa; chunk không đổi giữ nguyên ID → không bị động tới.
+    Gom đủ danh sách ID trước rồi mới xóa (không xóa khi đang scroll). Trả về các ID đã xóa.
+    """
+    stale: list[str] = []
+    offset = None
+    while True:
+        records, offset = client.scroll(
+            collection_name=collection_name,
+            limit=_STALE_PAGE_SIZE,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        stale.extend(str(r.id) for r in records if str(r.id) not in keep_ids)
+        if offset is None:
+            break
+    for start in range(0, len(stale), _STALE_PAGE_SIZE):
+        client.delete(
+            collection_name=collection_name,
+            points_selector=PointIdsList(points=stale[start: start + _STALE_PAGE_SIZE]),
+            wait=True,
+        )
+    return stale
+
+
 async def _run_async_pipeline(
     chunks: list[Document],
     collection_name: str,
     project: str,
     reset: bool,
-) -> tuple[list[tuple], int]:
+) -> tuple[list[tuple], int, list[str] | None]:
     """
     Async embed + upsert pipeline: INGEST_EMBED_WORKERS batch chạy đồng thời.
 
@@ -499,6 +587,9 @@ async def _run_async_pipeline(
       • Embed và upsert của mỗi batch chạy nối tiếp trong cùng coroutine,
         nhưng nhiều batch chạy song song → GPU và Qdrant luôn bận.
       • Tăng INGEST_EMBED_WORKERS = OLLAMA_NUM_PARALLEL để khai thác tối đa.
+
+    Trả về (cặp (chunk, point_id) đã upsert, số point trong collection, ID point cũ đã
+    xóa — None nếu KHÔNG chạy bước dọn: reset=True hoặc có batch lỗi).
     """
     timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as http_client:
@@ -549,8 +640,26 @@ async def _run_async_pipeline(
     all_pairs: list[tuple] = [
         pair for r in results if not isinstance(r, Exception) for pair in r
     ]
+
+    # F11: upsert không bao giờ xóa point của chunk đã sửa/file đã xóa → dọn sau khi
+    # upsert xong. Chỉ dọn khi MỌI batch thành công: nếu có batch lỗi, phiên bản mới
+    # của chunk đó chưa vào Qdrant — giữ bản cũ còn hơn làm thủng index.
+    stale_ids: list[str] | None = None
+    if not reset:
+        if failed:
+            logger.warning(
+                "Ingest project=%s: bỏ qua dọn point cũ vì có batch lỗi — chạy lại /ingest sau.",
+                project,
+            )
+        else:
+            stale_ids = _delete_stale_points(
+                sync_client, collection_name, {pid for _, pid in all_pairs})
+            if stale_ids:
+                logger.info("Ingest project=%s: đã xóa %d point cũ (chunk đã sửa/xóa).",
+                            project, len(stale_ids))
+
     count = sync_client.count(collection_name=collection_name, exact=True)
-    return all_pairs, count.count
+    return all_pairs, count.count, stale_ids
 
 
 # ── Helpers suy luận metadata chunk ──────────────────────────────────────────
@@ -665,8 +774,9 @@ def _ensure_collection(client: QdrantClient, collection_name: str, vector_size: 
 
 
 def _ingest_project(project: str, reset: bool = False) -> dict:
+    # F6: kiểm tra tên project TRƯỚC mọi thao tác filesystem/Qdrant/Neo4j.
+    project_dir = str(project_dir_for(project))
     collection_name = get_collection_name(project)
-    project_dir = str(Path(RAW_DATA_DIR) / project)
 
     logger.info("Ingesting project '%s' → collection '%s'",
                 project, collection_name)
@@ -693,7 +803,7 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
             logger.warning("Graph delete failed (non-fatal): %s", exc)
 
     # Async pipeline: embed + upsert INGEST_EMBED_WORKERS batch đồng thời
-    all_pairs, points_count = asyncio.run(
+    all_pairs, points_count, stale_ids = asyncio.run(
         _run_async_pipeline(chunks, collection_name, project, reset)
     )
     logger.info("Project '%s' done. Points: %s", project, points_count)
@@ -705,6 +815,11 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
             _graph_module.setup_schema()
             graph_chunks_saved = _graph_module.save_project_graph(
                 project, all_pairs)
+            # F11: Qdrant vừa dọn point cũ → xóa Chunk/Document/Entity tương ứng
+            # trong Neo4j để graph enrichment không trả lại nội dung đã bị xóa.
+            if stale_ids is not None:
+                _graph_module.delete_stale_chunks(
+                    project, [pid for _, pid in all_pairs])
 
             if GRAPH_ENTITY_EXTRACTION and CHAT_MODEL:
                 logger.info(
@@ -742,6 +857,8 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
         "upserted": len(all_pairs),
         "points_count": points_count,
         "graph_chunks_saved": graph_chunks_saved,
+        # F11: số point cũ (chunk đã sửa/xóa) đã bị xóa khỏi Qdrant ở lần ingest này.
+        "stale_removed": len(stale_ids or []),
         "idempotent": True,
         "reset": reset,
     }

@@ -293,6 +293,48 @@ def delete_project_graph(project: str) -> None:
     logger.info("Deleted Neo4j graph for project '%s'", project)
 
 
+def delete_stale_chunks(project: str, keep_ids: list[str]) -> int:
+    """
+    F11 — đồng bộ Neo4j với Qdrant sau ingest không-reset: xóa Chunk của project
+    có id KHÔNG nằm trong *keep_ids* (chunk đã sửa, file đã xóa/đổi tên), sau đó xóa
+    Document không còn Chunk nào và Entity mồ côi của project.
+
+    Dùng tập keep (thay vì danh sách ID vừa xóa trong Qdrant) để tự chữa cả Chunk cũ
+    còn sót từ các lần ingest trước. Trả về số Chunk đã xóa.
+    """
+    driver = get_driver()
+    with driver.session(database=NEO4J_DATABASE) as session:
+        record = session.run(
+            """
+            MATCH (c:Chunk {project: $p})
+            WHERE NOT c.id IN $keep
+            DETACH DELETE c
+            RETURN count(*) AS removed
+            """,
+            p=project,
+            keep=list(keep_ids),
+        ).single()
+        removed = int(record["removed"]) if record else 0
+        session.run(
+            """
+            MATCH (d:Document {project: $p})
+            WHERE NOT (d)-[:HAS_CHUNK]->(:Chunk)
+            DETACH DELETE d
+            """,
+            p=project,
+        )
+        session.run(
+            """
+            MATCH (e:Entity {project: $p})
+            WHERE NOT ()-[:MENTIONS]->(e)
+            DETACH DELETE e
+            """,
+            p=project,
+        )
+    logger.info("Deleted %d stale Neo4j chunks for project '%s'", removed, project)
+    return removed
+
+
 # ── Thao tác đọc / làm giàu kết quả ─────────────────────────────────────────────
 def get_graph_enrichment(qdrant_ids: list[str], limit: int = 5) -> list[dict]:
     """

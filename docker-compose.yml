@@ -183,7 +183,7 @@ services:
       - ./data/artifacts:/data/artifacts
     networks:
       - yan
-    # D2: agent-api cần rag-api healthy (mọi node gọi /ask) và Ollama healthy.
+    # D2: agent-api cần rag-api healthy (mọi node gọi /retrieve) và Ollama healthy.
     depends_on:
       ollama:
         condition: service_healthy

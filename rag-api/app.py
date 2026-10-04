@@ -41,6 +41,16 @@ POST /ask
     Quy trình xử lý:
       embed(question) → Qdrant search → Neo4j graph enrichment → LLM answer
 
+POST /retrieve
+    F10 — chỉ truy hồi, KHÔNG gọi CHAT_MODEL. Body giống /ask.
+    Trả về {"context": "...", "sources": [...]}: context là đúng chuỗi [SOURCE n] /
+    [GRAPH CONTEXT n] mà /ask đưa cho LLM (chunk nguyên văn). agent-api dùng endpoint
+    này cho mọi node workflow thay vì /ask.
+
+Tên project (body của /ingest, /reset-ingest, /ask, /retrieve và path của
+/graph/projects/{project}/entities) phải là một tên thư mục đơn giản: chữ/số, '_',
+'.', '-', ký tự đầu là chữ/số (F6). Sai quy tắc → HTTP 400.
+
 GET  /graph/status
     Trả về trạng thái kết nối Neo4j và thống kê số lượng node (Project,
     Document, Chunk, Entity).
@@ -77,7 +87,16 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from ingest import GRAPH_ENABLED, RAW_DATA_DIR, embed_texts, get_collection_name, get_projects, ingest
+from ingest import (
+    GRAPH_ENABLED,
+    RAW_DATA_DIR,
+    InvalidProjectError,
+    embed_texts,
+    get_collection_name,
+    get_projects,
+    ingest,
+    validate_project_name,
+)
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
@@ -125,8 +144,9 @@ COLLECTION_NAME = _require_env("COLLECTION_NAME")
 EMBEDDING_MODEL = _require_env("EMBEDDING_MODEL")
 CHAT_MODEL = _require_env("CHAT_MODEL")
 RAG_TOP_K = int(_require_env("RAG_TOP_K"))
-# Timeout (giây) cho mỗi lần gọi Ollama từ rag-api. Nếu đặt thấp hơn
-# RAG_TIMEOUT của agent-api có thể gây kết quả rỗng bất ngờ.
+# Timeout (giây) cho mỗi lần gọi CHAT_MODEL trong /ask. F10: agent-api không còn gọi
+# /ask (dùng /retrieve, không sinh LLM) nên giá trị này chỉ cần nhỏ hơn timeout phía
+# client của /ask (Valve timeout của Open WebUI tool).
 OLLAMA_REQUEST_TIMEOUT: float = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "600"))
 
 app = FastAPI(title="rag-agent-platform - API RAG cục bộ", version="1.0.0")
@@ -161,6 +181,27 @@ class SourceItem(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     sources: list[SourceItem]
+
+
+class RetrieveResponse(BaseModel):
+    """F10 — kết quả chỉ-truy-hồi: context thô (chunk nguyên văn) + danh sách nguồn."""
+
+    context: str
+    sources: list[SourceItem]
+
+
+def _check_project(project: str | None) -> None:
+    """F6 — trả HTTP 400 nếu tên project không hợp lệ ("", ".", "..", "/", "a/b"...).
+
+    Tên project được ghép vào đường dẫn RAW_DATA_DIR và tên Qdrant collection nên
+    phải kiểm tra trước khi chạm vào filesystem, Qdrant hay Neo4j.
+    """
+    if project is None:
+        return
+    try:
+        validate_project_name(project)
+    except InvalidProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 _qdrant_client: QdrantClient | None = None
@@ -243,8 +284,11 @@ def ingest_endpoint(req: IngestRequest = IngestRequest()) -> dict[str, Any]:
     Nếu *project* là None, ingest toàn bộ project có trong RAW_DATA_DIR.
     Bắt lỗi và trả về HTTP 500 nếu ingest thất bại để caller biết rõ nguyên nhân.
     """
+    _check_project(req.project)
     try:
         return ingest(project=req.project, reset=req.reset)
+    except InvalidProjectError as exc:  # F6: vd. symlink trỏ ra ngoài RAW_DATA_DIR
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ingest failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -257,8 +301,11 @@ def reset_ingest_endpoint(req: IngestRequest = IngestRequest()) -> dict[str, Any
     Tương đương POST /ingest với reset=True. Dùng khi cần làm sạch hoàn toàn
     sau khi đổi EMBEDDING_MODEL hoặc cấu trúc thư mục thô.
     """
+    _check_project(req.project)
     try:
         return ingest(project=req.project, reset=True)
+    except InvalidProjectError as exc:  # F6: vd. symlink trỏ ra ngoài RAW_DATA_DIR
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Reset ingest failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -280,21 +327,22 @@ def list_projects() -> dict[str, Any]:
     return {"raw_data_dir": RAW_DATA_DIR, "projects": result}
 
 
-@app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest) -> AskResponse:
+def _retrieve_context(req: AskRequest, op: str) -> tuple[str, list[SourceItem]]:
     """
-    Hỏi đáp RAG:
+    F10 — phần TRUY HỒI dùng chung cho /ask và /retrieve (không gọi LLM):
       1. Embed câu hỏi bằng EMBEDDING_MODEL.
       2. Tìm kiếm vector trong Qdrant (filter theo project + module nếu có).
       3. Tùy chọn làm giàu context qua Neo4j co-occurrence.
-      4. Sinh câu trả lời bằng CHAT_MODEL với context đã tổng hợp.
+      4. Ghép context [SOURCE n] / [GRAPH CONTEXT n] + danh sách *sources*.
 
-    Trả về *answer* cùng danh sách *sources* (kèm score, module, doc_type, chunk_type).
+    Trả về (context, sources); cả hai rỗng khi không có hit. Lỗi → HTTPException
+    (400 project sai, 404 chưa ingest, 409 lệch dim, 503 OOM, 500 còn lại).
     """
+    _check_project(req.project)
     try:
         top_k = req.top_k or RAG_TOP_K
-        logger.info("Ask started. project=%s top_k=%s question=%s",
-                    req.project, top_k, req.question)
+        logger.info("%s started. project=%s top_k=%s question=%s",
+                    op, req.project, top_k, req.question)
 
         client = get_qdrant_client()
 
@@ -401,10 +449,7 @@ def ask(req: AskRequest) -> AskResponse:
         )
 
         if not hits:
-            return AskResponse(
-                answer="Không tìm thấy context phù hợp trong vector database.",
-                sources=[],
-            )
+            return "", []
 
         context_blocks: list[str] = []
         sources: list[SourceItem] = []
@@ -485,6 +530,29 @@ def ask(req: AskRequest) -> AskResponse:
                     )
                 )
 
+        return context, sources
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s failed", op)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest) -> AskResponse:
+    """
+    Hỏi đáp RAG: truy hồi context qua _retrieve_context() (embed → Qdrant → Neo4j)
+    rồi sinh câu trả lời bằng CHAT_MODEL với context đã tổng hợp.
+
+    Trả về *answer* cùng danh sách *sources* (kèm score, module, doc_type, chunk_type).
+    """
+    context, sources = _retrieve_context(req, "Ask")
+    if not sources:
+        return AskResponse(
+            answer="Không tìm thấy context phù hợp trong vector database.",
+            sources=[],
+        )
+    try:
         messages = [
             SystemMessage(content=(
                 "You are a local RAG assistant. "
@@ -509,11 +577,25 @@ def ask(req: AskRequest) -> AskResponse:
             answer=answer,
             sources=sources,
         )
-    except HTTPException:
-        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ask failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/retrieve", response_model=RetrieveResponse)
+def retrieve(req: AskRequest) -> RetrieveResponse:
+    """
+    F10 — chỉ truy hồi, KHÔNG gọi CHAT_MODEL: cùng code path embed → Qdrant → Neo4j
+    như /ask, trả về context nguyên văn + sources.
+
+    Dành cho agent-api: mỗi node workflow trước đây gọi /ask → rag-api sinh trọn một
+    câu trả lời bằng CHAT_MODEL (swap model khi OLLAMA_MAX_LOADED_MODELS=1, chiếm slot
+    duy nhất khi OLLAMA_NUM_PARALLEL=1) chỉ để agent-api cắt còn 3000 ký tự. Chunk
+    nguyên văn cũng giữ đúng tên riêng/convention thay vì bản diễn giải của LLM.
+    """
+    context, sources = _retrieve_context(req, "Retrieve")
+    logger.info("Retrieve completed: %d source(s), %d chars", len(sources), len(context))
+    return RetrieveResponse(context=context, sources=sources)
 
 
 # ── Endpoint Graph ────────────────────────────────────────────────────────
@@ -539,6 +621,7 @@ def graph_status_endpoint() -> dict[str, Any]:
 @app.get("/graph/projects/{project}/entities")
 def graph_entities(project: str) -> dict[str, Any]:
     """Liệt kê tất cả thực thể đã trích xuất cho một project, sắp xếp theo số lần đề cập."""
+    _check_project(project)
     if not GRAPH_ENABLED or _graph_module is None:
         raise HTTPException(
             status_code=503, detail="Graph integration is not enabled")

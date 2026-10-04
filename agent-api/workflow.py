@@ -27,7 +27,8 @@ Vòng đời mỗi node — 3 giai đoạn
        - extra_context tùy chọn
 
   2. Bổ sung RAG (tùy chọn, khi rag_enabled=True)
-       _query_rag() gọi POST /ask đến rag-api với rag_query_hint của agent.
+       _query_rag() gọi POST /retrieve đến rag-api với rag_query_hint của agent
+       (chỉ truy hồi chunk nguyên văn, không sinh LLM phía rag-api).
        Kết quả được cắt ngắn và thêm vào context. Lỗi RAG không dừng workflow.
 
   3. Gọi LLM (bắt buộc)
@@ -123,7 +124,8 @@ RAG_TOP_K: int = int(os.environ.get("RAG_TOP_K", "5"))
 # Kích thước context window (token) gửi cho Ollama mỗi lần gọi LLM.
 # Tăng giá trị này nếu model hỗ trợ window lớn hơn (ví dụ: 65536).
 OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "32768"))
-# Timeout (giây) chờ rag-api trả về kết quả mỗi lần gọi POST /ask.
+# Timeout (giây) chờ rag-api trả về kết quả mỗi lần gọi POST /retrieve (F10: chỉ
+# embed + search, không sinh LLM → không còn phụ thuộc OLLAMA_REQUEST_TIMEOUT của rag-api).
 RAG_TIMEOUT: int = int(os.environ.get("RAG_TIMEOUT", "600"))
 # Timeout (giây) chờ Ollama trả về response cho mỗi lần gọi LLM.
 # Nên đặt cao hơn RAG_TIMEOUT vì LLM generation tốn thời gian hơn embed.
@@ -175,7 +177,7 @@ class SDLCState(TypedDict):
     project: str | None           # Tên project để lọc RAG collection (ví dụ: "yanlib"). Null = tìm tất cả.
     user_input: str               # Mục tiêu kinh doanh hoặc yêu cầu gốc từ người dùng — được truyền qua toàn pipeline.
     rag_enabled: bool             # True = mỗi agent gọi RAG API để lấy context từ knowledge base.
-    rag_top_k: int                # Số chunk trả về mỗi lần gọi POST /ask của rag-api.
+    rag_top_k: int                # Số chunk trả về mỗi lần gọi POST /retrieve của rag-api.
     rag_api_url: str              # URL của rag-api service (ví dụ: http://rag-api:8090).
     ollama_base_url: str          # URL của Ollama server (ví dụ: http://ollama:11434).
 
@@ -198,20 +200,26 @@ class SDLCState(TypedDict):
 
 def _query_rag(rag_api_url: str, question: str, project: str | None, top_k: int) -> str:
     """
-    Gọi endpoint /ask của rag-api và trả về văn bản trả lời.
+    Gọi endpoint /retrieve của rag-api và trả về context thô (chunk nguyên văn + nguồn).
     Trả về chuỗi rỗng nếu có lỗi (không gây dừng workflow).
+
+    F10: trước đây gọi /ask → rag-api chạy trọn một lượt CHAT_MODEL chỉ để sinh câu trả
+    lời mà node này lại cắt còn 3000 ký tự; với OLLAMA_MAX_LOADED_MODELS=1 mỗi node phải
+    swap thêm CHAT_MODEL, và khi RAG_TIMEOUT < OLLAMA_REQUEST_TIMEOUT của rag-api, lượt
+    sinh bị bỏ rơi vẫn chiếm slot Ollama duy nhất. /retrieve chỉ embed + search (không
+    gọi LLM) và giữ nguyên văn convention/tên riêng trong knowledge base.
     """
     try:
         payload: dict = {"question": question, "top_k": top_k}
         if project:
             payload["project"] = project
         resp = requests.post(
-            f"{rag_api_url}/ask",
+            f"{rag_api_url}/retrieve",
             json=payload,
             timeout=RAG_TIMEOUT,
         )
         resp.raise_for_status()
-        return resp.json().get("answer", "")
+        return resp.json().get("context", "")
     except Exception as exc:
         logger.warning("RAG query failed (non-fatal): %s", exc)
         return ""
