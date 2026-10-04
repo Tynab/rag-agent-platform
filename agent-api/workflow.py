@@ -40,7 +40,8 @@ Vòng đời mỗi node — 3 giai đoạn
            Kết thúc: _build_task_checklist() tạo bảng ✅/⏳ đối chiếu TL tasks.
        Các role còn lại:
            _call_agent() — gọi LLM một lần với toàn bộ context.
-           Nếu output < 30 ký tự → retry với context rút gọn 1.500 ký tự cuối.
+           Nếu output < 30 ký tự → retry với context rút gọn 1.500 ký tự
+           (_compact_context: giữ đề bài + tech stack ở đầu, thêm đuôi context).
 
 Quản lý State (LangGraph TypedDict + reducers)
 ----------------------------------------------
@@ -75,7 +76,7 @@ Chống vòng lặp output
 
 TL Task Tracking
 ----------------
-    _extract_tl_tasks(role, context)             → list[dict]
+    _extract_tl_tasks(role, tl_output)           → list[dict]  (parse TL output thô)
     _find_uncovered_tasks(tl_tasks, file_infos)  → list[dict]
     _build_task_checklist(tl_tasks, file_infos)  → str (markdown table)
 
@@ -227,6 +228,51 @@ def _truncate(text: str, max_chars: int = MAX_PREV_OUTPUT_CHARS) -> str:
     return text[:max_chars]
 
 
+# Tiêu đề section do _build_context_parts() sinh ra — PHẢI khớp chuỗi trong hàm đó.
+# _compact_context() dùng chúng để tách phần "đề bài" (user input + ngày + tech stack,
+# luôn nằm đầu context) khỏi phần thân (output agent phụ thuộc, context bổ sung, RAG).
+_CTX_STACK_HDR = "\n## Công nghệ bắt buộc\n"
+_CTX_BODY_HDRS: tuple[str, ...] = (
+    "\n## Kết quả ",
+    "\n## Context bổ sung\n",
+    "\n## Context từ Knowledge Base\n",
+)
+
+
+def _compact_context(context: str, max_chars: int) -> str:
+    """Rút gọn context về tối đa *max_chars* ký tự nhưng GIỮ phần đề bài ở đầu.
+
+    _build_context_parts() luôn đặt user input, ngày hiện tại và tech stack bắt buộc
+    ở đầu context; output agent phụ thuộc / RAG / gợi ý DB nằm phía sau. Cắt kiểu
+    context[-N:] làm mất đề bài và tech stack → model sinh lạc đề, sai công nghệ.
+
+    Thứ tự ưu tiên:
+      1. Block tech stack (ngắn, bắt buộc).
+      2. User input — phần đề bài chiếm tối đa ~60% ngân sách nếu có phần thân.
+      3. Đuôi phần thân (output agent gần nhất, RAG, gợi ý DB) lấp phần còn lại.
+    """
+    if len(context) <= max_chars:
+        return context
+    body_starts = [i for i in (context.find(h) for h in _CTX_BODY_HDRS) if i != -1]
+    head_end = min(body_starts) if body_starts else len(context)
+    head, body = context[:head_end], context[head_end:]
+
+    head_budget = max_chars * 3 // 5 if body else max_chars
+    if len(head) > head_budget:
+        # Đề bài quá dài: giữ nguyên block tech stack, cắt bớt phần user input phía trước.
+        stack_idx = head.find(_CTX_STACK_HDR)
+        stack = head[stack_idx:][: head_budget // 2] if stack_idx != -1 else ""
+        keep = head_budget - len(stack)
+        if stack_idx != -1:
+            keep = min(keep, stack_idx)
+        head = head[:keep] + stack
+
+    tail_budget = max_chars - len(head) - 1
+    if tail_budget <= 0 or not body:
+        return head[:max_chars]
+    return head + "\n" + body[-tail_budget:]
+
+
 # Frozenset các chuỗi con khớp tên model reasoning. Khi tên model chứa
 # một trong các chuỗi này, _strip_thinking() sẽ loại bỏ <think>...</think>
 # khỏi output trước khi lưu vào step_outputs.
@@ -336,70 +382,197 @@ _TL_ROLE_SECTIONS: dict[str, list[str]] = {
     "dba":    ["DBA Task Board", "7. DBA Task", "§7 DBA", "7. DBA"],
 }
 
+# Nhận diện dòng heading section trong TL output:
+#   - Markdown:        "## 5. Mobile Task Board", "### §6 BE Task Board", "## FE Task Board"
+#   - Số/đậm, không #: "**5. Mobile Task Board**", "5. Mobile Task Board", "§5 Mobile ..."
+#   - Cả dòng in đậm:  "**Mobile Task Board**"
+_MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*)$")
+_MD_HEADING_NUM_RE = re.compile(r"^(?:\*\*|__)?\s*(?:§\s*)?(\d{1,2})(?:[.)]|\s)")
+_NUM_HEADING_RE = re.compile(r"^\s{0,3}(?:\*\*|__)?\s*(?:§\s*(\d{1,2})[.)]?|(\d{1,2})[.)])\s+\S")
+_BOLD_HEADING_RE = re.compile(r"^\s{0,3}(?:\*\*[^*]+\*\*|__[^_]+__)\s*:?\s*$")
+# Level giả cho heading không có '#' — luôn "thấp" hơn mọi heading Markdown.
+_PLAIN_HEADING_LEVEL = 7
+
+# Giá trị priority hợp lệ trong TL task board.
+_TL_PRIORITIES: frozenset[str] = frozenset({"P0", "P1", "P2", "HIGH", "MED", "LOW", "H", "M", "L"})
+
+
+def _heading_info(line: str) -> tuple[int, int | None] | None:
+    """Phân loại một dòng có phải heading section hay không.
+
+    Trả về (level, số section): level 1-6 cho heading Markdown '#',
+    _PLAIN_HEADING_LEVEL cho heading dạng số/in đậm không có '#'.
+    Số section là None nếu tiêu đề không đánh số. Trả về None với dòng bảng,
+    văn bản thường, danh sách gạch đầu dòng...
+    """
+    # Dòng chứa '|' là dòng bảng — kể cả bảng GFM không có '|' đầu dòng ("# | Task | ...").
+    if "|" in line:
+        return None
+    m = _MD_HEADING_RE.match(line)
+    if m:
+        num = _MD_HEADING_NUM_RE.match(m.group(2))
+        return len(m.group(1)), (int(num.group(1)) if num else None)
+    m = _NUM_HEADING_RE.match(line)
+    if m:
+        return _PLAIN_HEADING_LEVEL, int(m.group(1) or m.group(2))
+    if _BOLD_HEADING_RE.match(line):
+        return _PLAIN_HEADING_LEVEL, None
+    return None
+
+
+def _ends_section(start: tuple[int, int | None], cand: tuple[int, int | None]) -> bool:
+    """True nếu heading *cand* kết thúc section bắt đầu bởi heading *start*.
+
+    - Heading Markdown kết thúc section khi cùng cấp hoặc cao hơn (số '#' <= start).
+      Heading con sâu hơn ("#### Sprint 1") vẫn thuộc section.
+    - Heading không có '#' chỉ kết thúc section cũng không có '#'. Nếu section có
+      đánh số thì chỉ dừng ở heading có số lớn hơn — tránh dừng ở danh sách đánh số
+      "1. ..." hay nhãn in đậm "**Sprint 1**" bên trong section.
+    """
+    level, num = start
+    c_level, c_num = cand
+    if c_level < _PLAIN_HEADING_LEVEL:
+        return c_level <= level
+    if level < _PLAIN_HEADING_LEVEL:
+        return False
+    if num is not None:
+        return c_num is not None and c_num > num
+    return True
+
+
+def _find_tl_section(role: str, text: str) -> str:
+    """Trả về đoạn text của TL task board cho *role* (từ heading tới heading kế tiếp).
+
+    Ưu tiên dòng HEADING chứa từ khóa của role — tránh bắt nhầm tham chiếu chéo
+    nằm trong bảng khác (ví dụ "→ see §4 FE Task Board" trong §3 Dependency Map).
+    Nếu model format lỏng (tiêu đề không phải heading) → fallback dòng đầu tiên
+    không phải dòng bảng có chứa từ khóa. Trả về "" nếu không tìm thấy.
+    """
+    patterns = _TL_ROLE_SECTIONS.get(role)
+    if not patterns:
+        return ""
+    lines = text.split("\n")
+    start = next(
+        (i for i, ln in enumerate(lines) if _heading_info(ln) and any(p in ln for p in patterns)),
+        None,
+    )
+    if start is None:
+        start = next(
+            (i for i, ln in enumerate(lines)
+             if not ln.lstrip().startswith("|") and any(p in ln for p in patterns)),
+            None,
+        )
+    if start is None:
+        return ""
+
+    start_info = _heading_info(lines[start]) or (_PLAIN_HEADING_LEVEL, None)
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        cand = _heading_info(lines[j])
+        if cand and _ends_section(start_info, cand):
+            end = j
+            break
+    return "\n".join(lines[start:end])
+
+
+def _split_md_row(line: str) -> list[str]:
+    """Tách một dòng bảng Markdown thành các cell — GIỮ cell rỗng để cột không bị lệch."""
+    row = line.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return [c.strip() for c in row.split("|")]
+
+
+def _is_md_separator(cells: list[str]) -> bool:
+    """True nếu dòng là dòng kẻ phân cách bảng Markdown (|---|:--:|)."""
+    non_empty = [c.replace(" ", "") for c in cells if c.strip()]
+    return bool(non_empty) and all(re.fullmatch(r":?-+:?", c) for c in non_empty)
+
+
+def _tl_table_columns(header: list[str]) -> tuple[int | None, int | None, int | None]:
+    """Xác định (cột id, cột tên task, cột priority) từ dòng tiêu đề bảng TL."""
+    names = [c.strip("*_ ").lower() for c in header]
+    task_col = next(
+        (names.index(n) for n in ("task", "task name", "task title", "title", "task description", "description")
+         if n in names),
+        None,
+    )
+    prio_col = next((k for k, n in enumerate(names) if n.startswith("priority")), None)
+    id_col = (
+        0 if names and task_col != 0 and names[0] in ("#", "id", "no", "no.", "stt", "task id", "task #")
+        else None
+    )
+    return id_col, task_col, prio_col
+
 
 def _extract_tl_tasks(role: str, context: str) -> list[dict]:
-    """Phân tích bảng TL task board cho *role* từ chuỗi context tổng hợp.
+    """Phân tích bảng TL task board cho *role*.
 
-    Tìm section TL tương ứng với role (dựa trên _TL_ROLE_SECTIONS),
-    sau đó quét từng dòng của bảng Markdown để lấy thông tin task.
+    *context* nên là output THÔ của TL agent (step_outputs["tl"]) — context tổng hợp
+    chỉ giữ 3.000 ký tự đầu của TL nên §5–§7 (Mobile/BE/DBA board) thường bị cắt mất.
+    Vẫn nhận context tổng hợp để tương thích ngược.
+
+    Section được cắt tại heading cùng cấp tiếp theo (xem _find_tl_section). Trong
+    section, dòng tiêu đề bảng (dòng ngay trước dòng kẻ ---) được dùng để xác định
+    cột Task / # / Priority thay vì đếm như một task.
 
     Trả về:
         list[dict]: Danh sách task, mỗi phần tử có {id, task, priority}.
         Trả về [] nếu không tìm thấy section hoặc bảng không thể parse.
     """
-    patterns = _TL_ROLE_SECTIONS.get(role)
-    if not patterns:
+    section_text = _find_tl_section(role, context)
+    if not section_text:
         return []
 
-    section_start = -1
-    for pat in patterns:
-        idx = context.find(pat)
-        if idx != -1 and (section_start == -1 or idx < section_start):
-            section_start = idx
-    if section_start == -1:
-        return []
-
-    section_text = context[section_start:]
-    # Cắt section text tại heading số tiếp theo (ví dụ: "5. Mobile", "8. Sprint")
-    # để tránh đọc nhầm task của section khác.
-    stop_match = re.search(r"\n(?:[5-9]|[1-9][0-9])\.\s+[A-Z]", section_text[50:])
-    if stop_match:
-        section_text = section_text[: 50 + stop_match.start()]
-
+    lines = section_text.split("\n")
+    # (id_col, task_col, prio_col) của bảng hiện tại — None nếu bảng không có tiêu đề.
+    columns: tuple[int | None, int | None, int | None] | None = None
     tasks: list[dict] = []
-    for line in section_text.split("\n"):
+    for i, line in enumerate(lines):
         if "|" not in line:
             continue
-        cells = [c.strip() for c in line.split("|")]
-        cells = [c for c in cells if c]
-        if len(cells) < 2:
+        row = _split_md_row(line)
+        if _is_md_separator(row):
             continue
-        # Bỏ qua dòng kẻ phân cách (---) và dòng tiêu đề bảng Markdown.
-        if all(set(c.replace("-", "").replace(":", "").replace(" ", "")) <= {"-", ":", "|"} for c in cells):
+        # Dòng ngay trước dòng kẻ --- là tiêu đề bảng: dùng để map cột, không phải task.
+        if i + 1 < len(lines) and "|" in lines[i + 1] and _is_md_separator(_split_md_row(lines[i + 1])):
+            columns = _tl_table_columns(row)
             continue
-        first = cells[0]
-        if first.lower() in ("#", "task", "id", "no") or first.startswith("-"):
-            continue
-        # Xác định cột nào chứa tên task: nếu cột đầu là số thứ tự thì tên task ở cột 2.
-        task_idx = 1 if (first.lstrip("#").strip().isdigit() or first.strip() == "#") else 0
-        if task_idx >= len(cells):
-            continue
-        task_text = cells[task_idx].strip()
+
+        if columns and columns[1] is not None:
+            id_col, task_col, prio_col = columns
+            if task_col >= len(row):
+                continue
+            task_text = row[task_col]
+            tid = row[id_col].lstrip("#").strip() if id_col is not None and row[id_col] else ""
+            prio_vals = [row[prio_col]] if prio_col is not None and prio_col < len(row) else []
+        else:
+            # Bảng không có tiêu đề nhận diện được → heuristic cũ theo vị trí cột.
+            cells = [c for c in row if c]
+            if len(cells) < 2:
+                continue
+            first = cells[0]
+            if first.lower() in ("#", "task", "id", "no") or first.startswith("-"):
+                continue
+            # Nếu cột đầu là số thứ tự thì tên task ở cột 2.
+            task_idx = 1 if first.lstrip("#").strip().isdigit() else 0
+            task_text = cells[task_idx]
+            tid = first.lstrip("#").strip() if task_idx == 1 else ""
+            # Quét các cột sau tên task để tìm P0/P1/P2/HIGH/MED/LOW.
+            prio_vals = [cells[task_idx + k] for k in (3, 4, 5) if task_idx + k < len(cells)]
+
+        task_text = task_text.strip()
         if not task_text or len(task_text) < 4 or task_text.lower() in ("task", "description"):
             continue
-        entry: dict = {
-            "id": cells[0].lstrip("#").strip() if task_idx == 1 else str(len(tasks) + 1),
-            "task": task_text,
-            "priority": "—",
-        }
-        # Lấy mức độ ưu tiên: quét các cột sau tên task để tìm P0/P1/P2/HIGH/MED/LOW.
-        for offset in (3, 4, 5):
-            if task_idx + offset < len(cells):
-                val = cells[task_idx + offset].upper()
-                if val in ("P0", "P1", "P2", "HIGH", "MED", "LOW", "H", "M", "L"):
-                    entry["priority"] = val
-                    break
-        tasks.append(entry)
+        priority = "—"
+        for val in prio_vals:
+            tokens = val.strip("*_ ").upper().split()
+            if tokens and tokens[0] in _TL_PRIORITIES:
+                priority = tokens[0]
+                break
+        tasks.append({"id": tid or str(len(tasks) + 1), "task": task_text, "priority": priority})
     return tasks
 
 
@@ -912,6 +1085,30 @@ def _compute_extra_instruction(role: str, tech_stack: list[str] | None) -> str:
     return ""
 
 
+_JSON_DECODER = _json.JSONDecoder()
+
+
+def _extract_json_array(text: str) -> list | None:
+    """Trích JSON array (danh sách object) đầu tiên hợp lệ trong output của planner.
+
+    Thử json raw_decode tại từng vị trí '[' — thay cho regex non-greedy \\[.*?\\]
+    vốn dừng ở ']' đầu tiên, kể cả ']' nằm trong chuỗi ("app/users/[id]/page.tsx"),
+    trong nhãn prose ("[Assumption] ...") hoặc trong mảng lồng của một field.
+    Bỏ qua mảng không chứa object nào (ví dụ mảng chuỗi lồng bên trong).
+    Trả về None nếu không tìm thấy.
+    """
+    idx = text.find("[")
+    while idx != -1:
+        try:
+            obj, _end = _JSON_DECODER.raw_decode(text, idx)
+        except ValueError:
+            obj = None
+        if isinstance(obj, list) and any(isinstance(item, dict) for item in obj):
+            return obj
+        idx = text.find("[", idx + 1)
+    return None
+
+
 def _plan_code_files(
     role: str,
     agent: AgentConfig,
@@ -957,10 +1154,11 @@ def _plan_code_files(
     )
     try:
         resp = planner.invoke([HumanMessage(content=prompt)])
-        content = str(resp.content)
-        m = re.search(r"\[.*?\]", content, re.DOTALL)
-        if m:
-            files = _json.loads(m.group(0))
+        # Bỏ <think>...</think> nếu CODING_PLANNER_MODEL là reasoning model — tránh
+        # bắt nhầm JSON nháp trong chain-of-thought.
+        content = _strip_thinking(str(resp.content))
+        files = _extract_json_array(content)
+        if files:
             return [
                 f for f in files
                 if isinstance(f, dict) and "filename" in f
@@ -1037,8 +1235,13 @@ def _generate_artifacts_multi_turn(
     user_input: str,
     tech_stack: list[str] | None,
     extra_instruction: str = "",
+    tl_output: str | None = None,
 ) -> str:
     """Sinh toàn bộ artifact cho một coding role theo quy trình 2 pha.
+
+    *tl_output* là output THÔ của TL agent (step_outputs["tl"]). TL task board được
+    parse từ đây thay vì từ *context* — context chỉ giữ 3.000 ký tự đầu của TL nên
+    board §5–§7 (Mobile/BE/DBA) thường đã bị cắt. None → fallback parse *context*.
 
     Pha 1 — Lập kế hoạch:
         CODING_PLANNER_MODEL nhận task, tech stack, context tóm tắt và TL task board,
@@ -1057,8 +1260,8 @@ def _generate_artifacts_multi_turn(
     """
     context_summary = context[-1200:]
 
-    # Trích xuất danh sách TL task từ context để tracking coverage và lập kế hoạch.
-    tl_tasks = _extract_tl_tasks(role, context)
+    # Trích xuất danh sách TL task (ưu tiên TL output thô) để tracking coverage và lập kế hoạch.
+    tl_tasks = _extract_tl_tasks(role, tl_output or context)
     if tl_tasks:
         logger.info("Role=%s: found %d TL tasks to cover", role, len(tl_tasks))
 
@@ -1070,7 +1273,15 @@ def _generate_artifacts_multi_turn(
 
     if not files:
         logger.warning("No files planned for %s, fallback to single call", role)
-        output = _call_agent(agent, ollama_base_url, context[-2000:])
+        # Context rút gọn nhưng GIỮ đề bài + tech stack (đầu context) và bổ sung TL task
+        # board đã parse — context[-2000:] cũ chỉ còn đuôi RAG/output agent gần nhất.
+        task_block = ""
+        if tl_tasks:
+            task_block = "\n\n## TL Task Board — bắt buộc cover\n" + "\n".join(
+                f"- {t['task'][:100]}" for t in tl_tasks[:15]
+            )
+        fallback_ctx = _compact_context(context, max(1_000, 2_000 - len(task_block))) + task_block
+        output = _call_agent(agent, ollama_base_url, fallback_ctx)
         if tl_tasks:
             output += _build_task_checklist(tl_tasks, [])
         return output
@@ -1153,7 +1364,8 @@ def _call_agent(
     tester, clarifier) — những role sinh báo cáo một lần thay vì per-file loop.
 
     Nếu model trả về output < 30 ký tự (thường do model nhỏ bị overflow context),
-    thực hiện retry với 1.500 ký tự cuối của context để giảm tải.
+    thực hiện retry với context rút gọn 1.500 ký tự (_compact_context: giữ đề bài +
+    tech stack ở đầu, lấp phần còn lại bằng đuôi context) để giảm tải.
     """
     llm = ChatOllama(
         model=agent.model,
@@ -1179,7 +1391,7 @@ def _call_agent(
             "Agent '%s' (model=%s) trả về output rất ngắn (%d chars) — retry với context rút gọn.",
             agent.name, agent.model, len(result.strip()),
         )
-        trimmed = context[-1500:] if len(context) > 1500 else context
+        trimmed = _compact_context(context, 1_500)
         response = llm.invoke([sys_msg, HumanMessage(content=trimmed)])
         result = str(response.content)
         if is_reasoning:
@@ -1345,6 +1557,7 @@ def _build_node(role: str):
                 output = _generate_artifacts_multi_turn(
                     role, agent, ollama_url, context,
                     state["user_input"], tech_stack, extra_instruction,
+                    tl_output=step_outputs.get("tl"),
                 )
             else:
                 output = _call_agent(agent, ollama_url, context)
@@ -1473,6 +1686,7 @@ def run_single_step(
             user_input,
             tech_stack,
             extra_instruction,
+            tl_output=step_outputs.get("tl"),
         )
     return _call_agent(agent, ollama_base_url, context)
 
