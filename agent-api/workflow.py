@@ -98,7 +98,6 @@ Hàm xuất khẩu công khai
     _parse_clarifier_regen_list(text) → list   → parse §10 cho regen loop
 """
 
-import functools
 import json as _json
 import logging
 import operator
@@ -110,6 +109,7 @@ from typing import Annotated, TypedDict
 
 import requests
 from agents import AGENTS, MAX_PREV_OUTPUT_CHARS, WORKFLOW_STEPS, AgentConfig
+from artifacts import fence_for, find_fenced_blocks
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
@@ -317,6 +317,7 @@ Tech stack: {tech_stack}
 
 Strict rules:
 - Respond with one triple-backtick code block containing the file content.
+  If the file itself contains ``` code blocks (e.g. a Markdown doc), wrap it in a ```` fence instead.
 - Do not include author/date/version/license/copyright metadata headers.
 - Do not repeat identical import lines or boilerplate blocks.
 - Match the depth in the guidance above: a SCAFFOLD leaves `// TODO:` markers for feature
@@ -745,44 +746,47 @@ def _detect_db_type(tech_stack: list[str] | None) -> str:
     return "unknown"
 
 
-@functools.lru_cache(maxsize=32)
-def _fence_pattern(language: str) -> re.Pattern:
-    """Compile và cache pattern regex để extract content trong code fence ngôn ngữ chỉ định.
+# Info string của fence được coi là "tài liệu markdown" (lớp bọc hợp lệ của file .md).
+_MD_FENCE_LANGS: frozenset[str] = frozenset({"markdown", "md", "mdx"})
 
-    Dùng @lru_cache để tránh compile lại regex cho cùng ngôn ngữ nhiều lần.
-    Pattern khớp cả dạng: ```typescript ... ``` và ```TypeScript ... ```.
+
+def _strip_code_fence(content: str, language: str, filename: str = "") -> str:
+    """Bóc code fence BAO NGOÀI (```lang ... ```) mà model bọc quanh nội dung file.
+
+    Chỉ bóc khi fence thực sự là lớp bọc (F3). Dùng find_fenced_blocks() — quét
+    fence-aware theo CommonMark, chịu được fence lồng nhau — thay cho regex lazy cũ
+    vốn lấy block ĐẦU TIÊN ở bất kỳ đâu và cắt ở ``` đóng đầu tiên:
+    - File markdown (language markdown/md hoặc *filename* đuôi .md): fence bên trong
+      là NỘI DUNG file → chỉ bóc khi output là MỘT block ```markdown/```md (có thể kèm
+      lời dẫn/lời kết) hoặc một block ``` trơn phủ toàn bộ output; ngược lại giữ nguyên.
+    - File code: một block duy nhất (kèm hoặc không kèm lời dẫn) → bóc; nhiều block
+      (file + ví dụ sử dụng) → ưu tiên block đúng ngôn ngữ, rồi tới block đầu tiên.
     """
-    return re.compile(
-        rf"```(?:{re.escape(language)}|{re.escape(language.lower())})\s*\n(.*?)(?:\n```\s*$|\n```\s*\Z)",
-        re.DOTALL | re.IGNORECASE | re.MULTILINE,
-    )
+    text   = content.strip()
+    blocks = find_fenced_blocks(text)
+    if not blocks:
+        return text
+    first = blocks[0]
+    lang  = language.strip().lower()
+    if lang in _MD_FENCE_LANGS or filename.lower().endswith((".md", ".mdx", ".markdown")):
+        whole = len(blocks) == 1 and first.start == 0 and first.end == len(text)
+        if len(blocks) == 1 and (first.lang in _MD_FENCE_LANGS or (whole and not first.info)):
+            return first.body.lstrip("\r\n").rstrip()
+        return text
+    chosen = first
+    if len(blocks) > 1:
+        chosen = next((b for b in blocks if b.lang == lang), first)
+    return chosen.body.lstrip("\r\n").rstrip()
 
 
-_FENCE_FALLBACK_RE = re.compile(
-    r"```\w*\s*\n(.*?)(?:\n```\s*$|\n```\s*\Z)",
-    re.DOTALL | re.IGNORECASE | re.MULTILINE,
-)
+def _file_section(filename: str, language: str, content: str) -> str:
+    """Ghép một section ### FILE: cho output markdown của coding role.
 
-
-def _strip_code_fence(content: str, language: str) -> str:
-    """Loại bỏ code fence bao ngoài (```lang...```) từ content LLM trả về.
-
-    Cần thiết vì một số model bọc toàn bộ output trong code fence, trong khi
-    output đã chứa các fence nội bộ riêng. Loại bỏ fence ngoài để tránh
-    markdown bị lồng nhau không hợp lệ khi lưu artifact.
+    Fence bọc ngoài lấy từ fence_for() — dài hơn mọi fence bên trong content — để
+    file markdown chứa ```bash không bị artifacts.py/marked.js đóng block giữa chừng (F4).
     """
-    # Thử extract content giữa ```lang ... ``` bằng pattern đã cache cho ngôn ngữ này.
-    for pat in (_fence_pattern(language), _FENCE_FALLBACK_RE):
-        m = pat.search(content)
-        if m:
-            return m.group(1).rstrip()
-    # Fallback thủ công: xóa dòng đầu (```lang) và dòng cuối (```) nếu regex không khớp.
-    lines = content.strip().splitlines()
-    if lines and lines[0].strip().startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
+    fence = fence_for(content)
+    return f"\n### FILE: {filename}\n{fence}{language}\n{content}\n{fence}\n"
 
 
 def _deloop(text: str, max_repeats: int = 8) -> str:
@@ -1017,7 +1021,7 @@ def _generate_one_file(
         # TRƯỚC khi lưu — nếu không chain-of-thought bị ghi thẳng vào file artifact.
         if any(m in agent.model.lower() for m in _REASONING_MODELS):
             result = _strip_thinking(result)
-        result = _strip_code_fence(result, language)   # remove nested fences
+        result = _strip_code_fence(result, language, filename)   # chỉ bóc fence bọc ngoài
         result = _deloop(result)                        # remove infinite loops
         return result
     except Exception as exc:
@@ -1093,7 +1097,7 @@ def _generate_artifacts_multi_turn(
             filename, description, language, agent, ollama_base_url, tech_stack,
             extra_instruction, ctx_snippet,
         )
-        parts.append(f"\n### FILE: {filename}\n```{language}\n{file_content}\n```\n")
+        parts.append(_file_section(filename, language, file_content))
 
     # Pha 2 (follow-up): nếu còn TL task chưa được cover sau pha 1,
     # lên kế hoạch thêm file mới và sinh chúng để đảm bảo coverage đầy đủ.
@@ -1127,7 +1131,7 @@ def _generate_artifacts_multi_turn(
                     fname, description, language, agent, ollama_base_url, tech_stack,
                     extra_instruction, ctx_snippet,
                 )
-                parts.append(f"\n### FILE: {fname}\n```{language}\n{file_content}\n```\n")
+                parts.append(_file_section(fname, language, file_content))
                 all_files.append(file_info)
 
     # Thêm bảng Task Completion Checklist vào cuối output để đối chiếu

@@ -26,6 +26,9 @@ Thứ tự ưu tiên nhận diện tên file trong markdown
        ...
        ```
    Agent được yêu cầu dùng định dạng này trong system prompt.
+   Ranh giới code block được xác định bằng find_fenced_blocks() (fence-aware
+   theo CommonMark): file chứa fence nội bộ (```bash trong ARCHITECTURE.md)
+   được bọc bằng fence dài hơn (````markdown) và được trích xuất nguyên vẹn.
 
 2. Dòng comment đầu tiên của code block:
        ```typescript
@@ -60,6 +63,8 @@ Hằng số xuất khẩu
 - extract_and_save(role, output, workflow_id) → list[dict] — hàm chính
 - list_artifacts(workflow_id) → dict[str, list[dict]] — liệt kê artifacts
 - read_artifact(workflow_id, role, path) → str | None — đọc nội dung file
+- find_fenced_blocks(text) → list[FencedBlock] — quét code block cấp ngoài cùng
+- fence_for(content) → str — fence đủ dài để bọc content (dùng khi ghép markdown)
 
 Lưu ý
 -----
@@ -74,6 +79,7 @@ import os
 import posixpath
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger("artifacts")
 
@@ -110,15 +116,16 @@ _LANG_EXT: dict[str, str] = {
     "env": "env",
 }
 
-# Pattern ưu tiên 1: ### FILE: path/to/file.ext rồi đến code block ngay sau.
+# Pattern ưu tiên 1: dòng "### FILE: path/to/file.ext" đứng ngay trước một code block.
 # Đây là định dạng có cấu trúc cao nhất — agent được yêu cầu dùng pattern này.
-_FILE_HDR_RE = re.compile(
-    r"###\s+FILE:\s*([^\n]+?)\s*\n```(\w*)\n(.*?)```",
-    re.DOTALL,
-)
+# Chỉ khớp trên DÒNG ngay trước fence mở; ranh giới block do find_fenced_blocks() quyết
+# định (F4: regex lazy cũ `(.*?)```` cắt file ở ``` đầu tiên — kể cả ```bash lồng bên
+# trong ARCHITECTURE.md — phần còn lại bị lưu nhầm thành text-01.txt).
+_FILE_HDR_RE = re.compile(r"###\s+FILE:\s*(.+?)\s*$")
 
-# Pattern dự phòng: khớp bất kỳ code block nào trong markdown.
-_BLOCK_RE = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
+# Dòng fence theo CommonMark: thụt lề tối đa 3 space, >= 3 backtick hoặc tilde, rồi info string.
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
+_FENCE_RUN_RE  = re.compile(r"^ {0,3}(`{3,})", re.MULTILINE)
 
 # Pattern nhận diện tên file từ dòng comment đầu tiên bên trong code block.
 # Hỗ trợ các prefix comment: //, #, *, -- và biến thể "file:", "filename:".
@@ -182,6 +189,80 @@ def _default_name(lang: str, idx: int) -> str:
     return f"{prefix}-{idx:02d}.{ext}"
 
 
+# ── Quét fenced code block (fence-aware, dùng chung với workflow.py) ────────────
+
+class FencedBlock(NamedTuple):
+    """Một fenced code block CẤP NGOÀI CÙNG trong văn bản markdown."""
+    start: int   # offset đầu dòng fence mở
+    end: int     # offset ngay sau dòng fence đóng (= len(text) nếu block chưa đóng)
+    info: str    # info string sau fence mở, ví dụ "typescript" hoặc "ts title=a.ts"
+    body: str    # nội dung giữa fence mở và fence đóng (giữ newline cuối)
+
+    @property
+    def lang(self) -> str:
+        """Từ đầu tiên của info string (chỉ ký tự word), chữ thường — ví dụ "ts"."""
+        return re.match(r"\w*", self.info).group(0).lower()
+
+
+def find_fenced_blocks(text: str) -> list[FencedBlock]:
+    """Quét *text* theo từng dòng, trả về các fenced code block cấp ngoài cùng.
+
+    Theo CommonMark: fence đóng phải CÙNG ký tự (` hoặc ~), dài >= fence mở và KHÔNG
+    có info string; block chưa đóng kéo dài tới hết văn bản. Nhờ vậy nội dung chứa
+    fence ngắn hơn (```bash bên trong ````markdown) không làm block bị cắt giữa chừng.
+
+    Nới lỏng cho output LLM (hay bọc tài liệu markdown bằng ``` cùng độ dài với fence
+    bên trong): trong một block, dòng fence cùng ký tự CÓ info string (```bash) được coi
+    là mở block lồng nhau → fence trơn kế tiếp đóng block lồng đó chứ không đóng block
+    ngoài. Fence trơn DÀI HƠN level trong cùng mà khớp đúng độ dài một level bên ngoài
+    thì đóng thẳng tới level đó (block lồng bị bỏ ngỏ).
+    """
+    blocks: list[FencedBlock] = []
+    stack: list[tuple[str, int]] = []   # (ký tự fence, độ dài) của các level đang mở
+    start = body_start = pos = 0
+    info = ""
+    for line in text.splitlines(keepends=True):
+        line_start, pos = pos, pos + len(line)
+        m = _FENCE_LINE_RE.match(line.rstrip("\r\n"))
+        if not m:
+            continue
+        fence, line_info = m.group(1), m.group(2)
+        ch, n = fence[0], len(fence)
+        if ch == "`" and "`" in line_info:
+            continue   # CommonMark: info string của fence backtick không chứa backtick
+        if not stack:
+            stack.append((ch, n))
+            start, body_start, info = line_start, pos, line_info
+            continue
+        top_ch, top_n = stack[-1]
+        if line_info:
+            if ch == top_ch:
+                stack.append((ch, n))   # block lồng nhau (nới lỏng cho LLM)
+            continue
+        if ch != top_ch or n < top_n:
+            continue   # fence ngắn hơn / khác ký tự → chỉ là nội dung
+        idx = len(stack) - 1
+        if n > top_n:
+            idx = next((i for i in range(idx, -1, -1) if stack[i] == (ch, n)), idx)
+        del stack[idx:]
+        if not stack:
+            blocks.append(FencedBlock(start, pos, info, text[body_start:line_start]))
+    if stack:
+        blocks.append(FencedBlock(start, len(text), info, text[body_start:]))
+    return blocks
+
+
+def fence_for(content: str) -> str:
+    """Trả về fence backtick đủ dài để bọc *content* an toàn khi ghép markdown.
+
+    Dài hơn mọi dãy backtick đầu dòng bên trong content (tối thiểu 3) — ví dụ
+    ARCHITECTURE.md chứa ```bash sẽ được bọc bằng ```` để fence nội bộ không thể
+    đóng block ngoài (quy tắc CommonMark, marked.js ở UI cũng render đúng).
+    """
+    longest = max((len(m.group(1)) for m in _FENCE_RUN_RE.finditer(content)), default=0)
+    return "`" * max(3, longest + 1)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_and_save(role: str, output: str, workflow_id: str) -> list[dict]:
@@ -210,28 +291,30 @@ def _do_extract(role: str, output: str, workflow_id: str) -> list[dict]:
     artifacts: list[dict] = []
     seen: set[str] = set()
 
-    # ── Pass 1: tìm và lưu các file theo directive ### FILE: (ưu tiên cao nhất) ───────────────
-    structured_spans: list[tuple[int, int]] = []
-    for m in _FILE_HDR_RE.finditer(output):
-        raw_path = m.group(1)
-        lang     = m.group(2).lower() or "text"
-        content  = m.group(3)
-        if not content.strip():
-            continue
-        rel = _sanitize_relpath(raw_path)
-        _save(base, base_resolved, role, rel, content, lang, artifacts, seen)
-        structured_spans.append((m.start(), m.end()))
+    # Chỉ xét block cấp ngoài cùng — fence lồng bên trong (```bash trong ARCHITECTURE.md)
+    # là nội dung của file, không phải file riêng.
+    blocks = find_fenced_blocks(output)
 
-    def _in_structured(start: int) -> bool:
-        return any(s <= start <= e for s, e in structured_spans)
+    # ── Pass 1: tìm và lưu các file theo directive ### FILE: (ưu tiên cao nhất) ───────────────
+    structured: set[int] = set()
+    for i, b in enumerate(blocks):
+        prev_line = output[: b.start].rstrip().rpartition("\n")[2]
+        m = _FILE_HDR_RE.search(prev_line)
+        if not m:
+            continue
+        structured.add(i)
+        if not b.body.strip():
+            continue
+        rel = _sanitize_relpath(m.group(1))
+        _save(base, base_resolved, role, rel, b.body, b.lang or "text", artifacts, seen)
 
     # ── Pass 2: code block tự do (dự phòng khi không có ### FILE: directive) ─────────────
     counter = [0]
-    for m in _BLOCK_RE.finditer(output):
-        if _in_structured(m.start()):
+    for i, b in enumerate(blocks):
+        if i in structured:
             continue
-        lang         = m.group(1) or "text"
-        content      = m.group(2)
+        lang         = b.lang or "text"
+        content      = b.body
         if not content.strip():
             continue
         lines        = content.split("\n")
@@ -247,7 +330,7 @@ def _do_extract(role: str, output: str, workflow_id: str) -> list[dict]:
 
         # Thử tên file từ bold/heading Markdown ngay trước code block.
         if not filename:
-            pre = output[: m.start()].rstrip()
+            pre = output[: b.start].rstrip()
             m3  = _PRE_FNAME_RE.search(pre)
             if m3:
                 filename = m3.group(1).strip()

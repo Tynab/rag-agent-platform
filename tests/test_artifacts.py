@@ -58,3 +58,80 @@ def test_read_artifact_path_confinement(tmp_path, monkeypatch):
     res = artifacts.read_artifact("wf3", "be", "a.ts")
     assert res is not None
     assert "const a" in res[0]
+
+
+# ── F4: ranh giới code block phải fence-aware (fence lồng nhau, fence dài hơn) ──────
+
+_ARCH_MD = "# Architecture\n\n```bash\nnpm install\n```\n\nDeploy bằng Helm.\n"
+
+
+def _saved_files(tmp_path, wf: str, role: str) -> dict[str, str]:
+    base = tmp_path / wf / role
+    return {
+        p.relative_to(base).as_posix(): p.read_text(encoding="utf-8")
+        for p in base.rglob("*")
+        if p.is_file() and p.name != "_output.md"
+    }
+
+
+def test_find_fenced_blocks_respects_fence_length():
+    # Fence mở ```` chỉ đóng bằng fence trơn >= 4 backtick → ```bash bên trong là nội dung.
+    md = "intro\n````markdown\n" + _ARCH_MD + "````\ntail\n"
+    blocks = artifacts.find_fenced_blocks(md)
+    assert len(blocks) == 1
+    assert blocks[0].lang == "markdown"
+    assert blocks[0].body == _ARCH_MD
+    assert md[blocks[0].end:] == "tail\n"
+
+
+def test_find_fenced_blocks_nested_same_length_and_unclosed():
+    # LLM hay bọc ```markdown quanh tài liệu có ```bash cùng độ dài → coi là block lồng nhau.
+    md = "```markdown\n" + _ARCH_MD + "```\n\n```ts\nconst a = 1;\n"
+    blocks = artifacts.find_fenced_blocks(md)
+    assert [b.lang for b in blocks] == ["markdown", "ts"]
+    assert blocks[0].body == _ARCH_MD
+    # Block chưa đóng (output bị cắt do num_predict) kéo dài tới hết văn bản.
+    assert blocks[1].body == "const a = 1;\n" and blocks[1].end == len(md)
+    # Fence khác ký tự không đóng block; ```js``` (info chứa backtick) không phải fence.
+    md2 = "~~~\n```\nx\n~~~\n```js```\n"
+    blocks2 = artifacts.find_fenced_blocks(md2)
+    assert len(blocks2) == 1 and blocks2[0].body == "```\nx\n"
+
+
+def test_fence_for_is_longer_than_inner_fences():
+    assert artifacts.fence_for("const a = 1;") == "```"
+    assert artifacts.fence_for(_ARCH_MD) == "````"
+    assert artifacts.fence_for("x\n  `````\n") == "``````"
+
+
+def test_extract_file_with_inner_fence(tmp_path, monkeypatch):
+    # F4: file markdown chứa ```bash không được bị cắt, phần sau không thành text-01.txt.
+    monkeypatch.setattr(artifacts, "ARTIFACT_BASE", str(tmp_path))
+    md = (
+        "## Tech Lead\n"
+        "### FILE: ARCHITECTURE.md\n````markdown\n" + _ARCH_MD + "````\n"   # fence dài hơn (workflow.py)
+        "### FILE: docs/RUNBOOK.md\n```markdown\n" + _ARCH_MD + "```\n"     # LLM tự bọc cùng độ dài
+        "### FILE: src/a.ts\n```ts\nconst a = 1;\n```\n"
+    )
+    artifacts.extract_and_save("tech_lead", md, "wf4")
+    assert _saved_files(tmp_path, "wf4", "tech_lead") == {
+        "ARCHITECTURE.md": _ARCH_MD,
+        "docs/RUNBOOK.md": _ARCH_MD,
+        "src/a.ts": "const a = 1;\n",
+    }
+
+
+def test_extract_free_blocks_still_named(tmp_path, monkeypatch):
+    # Pass 2 (không có ### FILE:) vẫn lấy tên từ comment đầu block / bold phía trước.
+    monkeypatch.setattr(artifacts, "ARTIFACT_BASE", str(tmp_path))
+    md = (
+        "```ts\n// filename: src/b.ts\nconst b = 2;\n```\n\n"
+        "**schema.sql**\n```sql\nCREATE TABLE t (id int);\n```\n\n"
+        "```yaml\nkey: v\n```\n"
+    )
+    artifacts.extract_and_save("dba", md, "wf5")
+    assert _saved_files(tmp_path, "wf5", "dba") == {
+        "src/b.ts": "const b = 2;\n",
+        "schema.sql": "CREATE TABLE t (id int);\n",
+        "yaml-01.yml": "key: v\n",
+    }
