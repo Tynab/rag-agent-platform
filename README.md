@@ -31,16 +31,18 @@
 
 ## 1. Tổng quan rag-agent-platform
 
-| Service | Image | Port (host) | Mục đích |
-|---|---|---|---|
-| `ollama` | `ollama/ollama:latest` | 11434 | LLM inference & embedding — chạy tất cả model AI |
-| `qdrant` | `qdrant/qdrant:latest` | 6333 / 6334 | Vector database — lưu và tìm kiếm embedding (REST / gRPC) |
-| `neo4j` | `neo4j:5-community` | 7474 / 7687 | Graph database — lưu quan hệ thực thể, tăng cường RAG |
-| `rag-api` | build `./rag-api` | 8090 | FastAPI RAG service — ingest tài liệu và hỏi đáp AI |
-| `agent-api` | build `./agent-api` | 8091 | FastAPI SDLC Agent Orchestrator — 15 AI agents phân tích & sinh code |
-| `open-webui` | `ghcr.io/open-webui/open-webui` | 8085 | Giao diện chat kết nối Ollama & Qdrant |
-| `watchtower` | `containrrr/watchtower` | — | Tự động pull & restart image mới nhất |
-| `deunhealth` | `qmcgaw/deunhealth` | 9999 | Khởi động lại container khi healthcheck thất bại liên tục |
+| Service | Image | Port (host) | Bind | Mục đích |
+|---|---|---|---|---|
+| `ollama` | `ollama/ollama:latest` | 11434 | `127.0.0.1` | LLM inference & embedding — chạy tất cả model AI |
+| `qdrant` | `qdrant/qdrant:latest` | 6333 / 6334 | `127.0.0.1` | Vector database — lưu và tìm kiếm embedding (REST / gRPC) |
+| `neo4j` | `neo4j:5-community` | 7474 / 7687 | `127.0.0.1` | Graph database — lưu quan hệ thực thể, tăng cường RAG |
+| `rag-api` | build `./rag-api` | 8090 | `127.0.0.1` | FastAPI RAG service — ingest tài liệu và hỏi đáp AI |
+| `agent-api` | build `./agent-api` | 8091 | `${BIND_ADDR}` | FastAPI SDLC Agent Orchestrator — 15 AI agents phân tích & sinh code |
+| `open-webui` | `ghcr.io/open-webui/open-webui` | 8085 (`OPEN_WEBUI_PORT`) | `${BIND_ADDR}` | Giao diện chat kết nối Ollama & Qdrant |
+| `watchtower` | `containrrr/watchtower` | 8080 (HTTP API) | `127.0.0.1` | Tự động pull & restart image có label `watchtower.enable=true` |
+| `deunhealth` | `qmcgaw/deunhealth` | — | — | Khởi động lại container khi healthcheck thất bại liên tục (`network_mode: none`) |
+
+> **Bảo mật cổng:** không service nào có xác thực mặc định, nên mọi cổng chỉ publish trên `127.0.0.1` (truy cập được từ chính máy chạy Docker). Riêng `agent-api` và Open WebUI bind theo `BIND_ADDR` (mặc định `127.0.0.1`) — xem [Truy cập từ máy khác (LAN)](#truy-cập-từ-máy-khác-lan). Các container gọi nhau qua network nội bộ `yan` (`http://rag-api:8090`, `http://ollama:11434`…), không qua cổng host.
 
 ### Phân nhóm model theo chức năng
 
@@ -266,6 +268,11 @@ rag-agent-platform/
 Điền các biến bắt buộc vào `.env`:
 
 ```env
+# ─── Truy cập mạng ───────────────────────────────────────────────────────────
+TZ=Asia/Ho_Chi_Minh
+# 0.0.0.0 = mở agent-api UI + Open WebUI cho LAN (khi đó cần WEBUI_AUTH=true)
+BIND_ADDR=127.0.0.1
+
 # ─── Ollama ──────────────────────────────────────────────────────────────────
 OLLAMA_HOST=0.0.0.0
 OLLAMA_ORIGINS=*
@@ -312,6 +319,7 @@ CHUNK_SIZE=1000
 CHUNK_OVERLAP=200
 UPSERT_BATCH_SIZE=64
 INGEST_EMBED_WORKERS=2
+# INGEST_EMBED_RETRIES=3
 
 # ─── Neo4j ───────────────────────────────────────────────────────────────────
 NEO4J_URI=bolt://neo4j:7687
@@ -333,11 +341,19 @@ RAG_EMBEDDING_ENGINE=ollama
 
 # ─── Watchtower ──────────────────────────────────────────────────────────────
 WATCHTOWER_HTTP_API_TOKEN=your_secure_token_here
-WATCHTOWER_SCHEDULE=0 * * * * *
+# 6 trường (giây phút giờ ngày tháng thứ), tính theo TZ ở trên → 04:00 hằng ngày
+WATCHTOWER_SCHEDULE=0 0 4 * * *
 
-# ─── Agent API ───────────────────────────────────────────────────────────────
+# ─── Agent API (tùy chọn — đã có mặc định trong docker-compose.yml) ──────────
 MAX_FILES_PER_ROLE=6
 CLARIFIER_REGEN_LOOPS=1
+# WORKFLOW_MAX_SECONDS=0
+# WORKFLOW_CONCURRENCY=1
+# WORKFLOW_DB_PATH=/data/memory/workflows.sqlite3
+# PLANNER_NUM_PREDICT=2048
+# FILEGEN_NUM_PREDICT=8192
+# REPORT_NUM_PREDICT=16384
+# FILEGEN_THINK=
 ```
 
 ### Bước 2 — Khởi động rag-agent-platform
@@ -357,6 +373,8 @@ Chờ đến khi tất cả container ở trạng thái `healthy`:
 ```bash
 docker compose ps
 ```
+
+> `ollama`, `qdrant`, `neo4j`, `rag-api`, `agent-api` đều có healthcheck. Thứ tự khởi động: `rag-api` chờ `ollama` + `qdrant` **healthy**; `agent-api` chờ thêm `rag-api` healthy; Open WebUI chờ `ollama` + `qdrant` healthy. `neo4j` cố ý chỉ là `service_started` với `rag-api` (graph là tùy chọn, rag-api degrade graceful) — lần đầu Neo4j tải plugin APOC nên có thể mất ~1 phút mới `healthy`.
 
 ### Bước 3 — Pull models Ollama
 
@@ -502,6 +520,17 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 > ```bash
 > mkdir -p ./data/raw ./data/memory/episodic ./data/artifacts
 > ```
+>
+> **Wiring biến (C1):** compose **không** dùng `env_file:` — mỗi service chỉ nhận đúng các key trong khối `environment:` của nó. Thêm biến mới vào code thì phải thêm `NAME: ${NAME:-<default>}` vào `environment:` của service tương ứng; `tests/test_config_wiring.py` quét code agent-api/rag-api và fail nếu thiếu, đồng thời kiểm tra mọi `${VAR}` không có default trong compose đều có trong `.env`.
+
+### Nhóm truy cập mạng & chung
+
+| Biến | Mặc định | Mô tả |
+|---|---|---|
+| `BIND_ADDR` | `127.0.0.1` | Địa chỉ host publish cổng của `agent-api` (8091) và Open WebUI (`OPEN_WEBUI_PORT`). `0.0.0.0` = mở cho LAN — khi đó cần `WEBUI_AUTH=true`. Hạ tầng (ollama, qdrant, neo4j, rag-api, watchtower) luôn chỉ bind `127.0.0.1` |
+| `TZ` | `Asia/Ho_Chi_Minh` | Múi giờ cho `deunhealth` và `watchtower` (quyết định giờ chạy `WATCHTOWER_SCHEDULE`; thiếu TZ = UTC) |
+| `OPEN_WEBUI_PORT` | `8085` | Cổng Open WebUI (cả trong container lẫn trên host) |
+| `WEBUI_AUTH` | `false` | Bật đăng nhập cho Open WebUI — **bắt buộc `true` nếu `BIND_ADDR=0.0.0.0`** |
 
 ### Nhóm Ollama
 
@@ -513,7 +542,7 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 | `OLLAMA_MAX_LOADED_MODELS` | `2` | Số model giữ đồng thời trong VRAM/RAM |
 | `OLLAMA_NUM_PARALLEL` | `2` | Số request Ollama xử lý song song |
 | `OLLAMA_KEEP_ALIVE` | `5m` | Thời gian giữ model trong bộ nhớ sau request cuối |
-| `OLLAMA_REQUEST_TIMEOUT` | `1200` | Timeout (giây) cho mỗi lần gọi LLM trong agent-api |
+| `OLLAMA_REQUEST_TIMEOUT` | `1200` (agent-api) / `600` (rag-api) | Timeout (giây) cho mỗi lần gọi LLM (agent-api: mọi agent step; rag-api: chat model của `/ask`) |
 | `OLLAMA_FLASH_ATTENTION` | `1` | Bật Flash Attention (tăng tốc trên GPU hỗ trợ) |
 
 ### Nhóm Models
@@ -551,16 +580,26 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 | `UPSERT_BATCH_SIZE` | `64` | Số vector upsert vào Qdrant mỗi batch |
 | `RAG_TOP_K` | `5` | Số chunk trả về mỗi query (default) |
 | `INGEST_EMBED_WORKERS` | `1` | Số request embed asyncio đồng thời khi ingest |
-| `GRAPH_ENABLED` | `false` | Bật Neo4j graph enrichment |
+| `INGEST_EMBED_RETRIES` | `3` | Số lần retry khi embed một batch lúc ingest lỗi (OOM / HTTP tạm thời) |
+| `RAG_TIMEOUT` | `600` | Ở rag-api: timeout (giây) mỗi lần gọi Ollama `/api/embed` (cùng biến với agent-api, xem bên dưới) |
+| `GRAPH_ENABLED` | `true` | Bật Neo4j graph enrichment (`false` = rag-api không chạm tới Neo4j) |
 | `GRAPH_ENTITY_EXTRACTION` | `false` | LLM extract entity khi ingest (chậm hơn nhưng tăng độ phong phú graph) |
 
 ### Nhóm Agent API
 
 | Biến | Mặc định | Mô tả |
 |---|---|---|
-| `RAG_TIMEOUT` | `600` | Timeout (giây) cho mỗi lần gọi RAG `/ask` từ agent |
+| `RAG_TIMEOUT` | `600` | Ở agent-api: timeout (giây) cho mỗi lần gọi RAG `/ask` từ agent |
 | `MAX_FILES_PER_ROLE` | `6` | Số file tối đa mỗi coding agent sinh trong 1 workflow |
 | `CLARIFIER_REGEN_LOOPS` | `1` | Số vòng lặp Clarifier re-generation (0 = tắt) |
+| `WORKFLOW_MAX_SECONDS` | `0` | Ngân sách thời gian tổng của một workflow (giây), kiểm tra giữa các node. `0` = không giới hạn |
+| `WORKFLOW_CONCURRENCY` | `1` | Số workflow chạy đồng thời; workflow khác xếp hàng. Giữ `1` khi `OLLAMA_NUM_PARALLEL=1` |
+| `WORKFLOW_DB_PATH` | `/data/memory/workflows.sqlite3` | File SQLite lưu trạng thái workflow — nằm trong volume `./data/memory` nên còn sau restart |
+| `PLANNER_NUM_PREDICT` | `2048` | Trần token sinh ra (`num_predict`) cho planner JSON danh sách file |
+| `FILEGEN_NUM_PREDICT` | `8192` | Trần token sinh ra cho mỗi file code |
+| `REPORT_NUM_PREDICT` | `16384` | Trần token sinh ra cho báo cáo Markdown của mỗi agent |
+| `FILEGEN_THINK` | *(rỗng)* | Bật/tắt thinking khi sinh file code (`true`/`false`); rỗng = theo mặc định của model |
+| `MEMORY_DIR` / `ARTIFACT_DIR` | `/data/memory` / `/data/artifacts` | Cố định trong compose, khớp volume `./data/memory` và `./data/artifacts` |
 
 ### Nhóm Neo4j
 
@@ -1466,7 +1505,22 @@ curl -s -H "Authorization: Bearer ${WATCHTOWER_HTTP_API_TOKEN}" \
   http://localhost:8080/v1/metrics
 ```
 
-> `rag-api` và `agent-api` dùng local build với `watchtower.enable=false` — Watchtower không tự cập nhật chúng. Dùng `docker compose up -d --build` khi cần cập nhật.
+> Watchtower chỉ cập nhật container có label `com.centurylinklabs.watchtower.enable=true` (`WATCHTOWER_LABEL_ENABLE=true`) — hiện là `open-webui` và `deunhealth`. Lịch `WATCHTOWER_SCHEDULE` (mặc định `0 0 4 * * *`) tính theo `TZ` truyền vào container watchtower.
+>
+> - `ollama`, `qdrant`, `neo4j` là service **stateful** → `watchtower.enable=false` để không bị recreate giữa lúc workflow/ingest đang chạy. Cập nhật thủ công khi rảnh: `docker compose pull ollama qdrant neo4j && docker compose up -d ollama qdrant neo4j`.
+> - `rag-api` và `agent-api` dùng local build với `watchtower.enable=false` — dùng `docker compose up -d --build` khi cần cập nhật.
+
+### Truy cập từ máy khác (LAN)
+
+Mặc định mọi cổng chỉ bind `127.0.0.1` — chỉ truy cập được từ chính máy chạy Docker. Để máy khác trong LAN mở **Agent API UI** (`:8091/ui`) và **Open WebUI** (`:8085`):
+
+1. Trong `.env`: đặt `BIND_ADDR=0.0.0.0` **và** `WEBUI_AUTH=true` (Open WebUI không có đăng nhập khi `WEBUI_AUTH=false` — ai vào được cổng là dùng được toàn bộ model/tool).
+2. `docker compose up -d agent-api open-webui` để áp dụng binding mới.
+3. Mở firewall host cho cổng 8091 / `OPEN_WEBUI_PORT` nếu cần, chỉ trong mạng tin cậy.
+
+> ⚠ `agent-api` **chưa có xác thực**: ai truy cập được cổng 8091 đều chạy được workflow và tải artifact. Chỉ mở `BIND_ADDR=0.0.0.0` trong LAN tin cậy, hoặc đặt sau reverse proxy có auth.
+>
+> `ollama`, `qdrant`, `neo4j`, `rag-api` và watchtower API **luôn** chỉ bind `127.0.0.1` (không theo `BIND_ADDR`). Từ máy khác hãy dùng SSH tunnel, ví dụ `ssh -L 8090:127.0.0.1:8090 user@host`. Container khác trên host cũng **không** tới được các cổng này qua `host.docker.internal` — hãy join network `rag-agent-platform_yan` và gọi bằng tên service (`http://rag-api:8090`).
 
 ### Cập nhật tài liệu RAG
 
@@ -1503,9 +1557,13 @@ curl -s -X POST http://localhost:8090/ask \
 | `user_input` bị cắt ngắn | Input > 10.000 ký tự | Chia nhỏ input |
 | `workflow_runs.jsonl` không được tạo | Volume chưa mount | Kiểm tra `./data/memory:/data/memory` trong docker-compose |
 | Artifacts không được lưu | Volume chưa mount | Kiểm tra `./data/artifacts:/data/artifacts` trong docker-compose |
-| Open WebUI không gọi được rag-api | URL dùng `localhost` thay vì hostname nội bộ | Valve `rag_api_url` = `http://rag-api:8090` |
-| Open WebUI không gọi được agent-api | URL dùng `localhost` | Valve `agent_api_url` = `http://agent-api:8091` |
-| Neo4j không kết nối | Container chưa sẵn sàng | Đợi ~30s; `docker compose logs neo4j` |
+| Open WebUI không gọi được rag-api | URL dùng `localhost` / `host.docker.internal` thay vì hostname nội bộ (rag-api chỉ bind `127.0.0.1` trên host) | Valve `rag_api_url` = `http://rag-api:8090` |
+| Open WebUI không gọi được agent-api | URL dùng `localhost` / `host.docker.internal` | Valve `agent_api_url` = `http://agent-api:8091` |
+| Máy khác trong LAN không mở được UI | Cổng chỉ bind `127.0.0.1` (mặc định) | Đặt `BIND_ADDR=0.0.0.0` + `WEBUI_AUTH=true` — xem [Truy cập từ máy khác (LAN)](#truy-cập-từ-máy-khác-lan) |
+| `curl localhost:6333` / `:8090` từ máy khác bị từ chối | Hạ tầng luôn chỉ bind `127.0.0.1` | Chạy curl trên chính host hoặc dùng SSH tunnel |
+| Neo4j không kết nối | Container chưa sẵn sàng (lần đầu tải APOC) | Chờ `docker compose ps` báo neo4j `healthy`; `docker compose logs neo4j` |
+| `dependency failed to start: container qdrant is unhealthy` | Qdrant chưa mở cổng 6333 sau ~1 phút | `docker compose logs qdrant` (thường do volume `qdrant_storage` hỏng / thiếu quyền) |
+| Biến trong `.env` không có tác dụng | Biến chưa được khai báo trong `environment:` của service | Thêm vào `docker-compose.yml`; chạy `pytest tests/test_config_wiring.py` để kiểm tra |
 | `/graph/status` → `connected: false` | Sai `NEO4J_PASSWORD` | `.env` phải khớp với lần đầu Neo4j init |
 | `graph_chunks_saved: 0` sau ingest | `GRAPH_ENABLED=false` | Đổi thành `true` + rebuild `rag-api` |
 | Workflow mất > 60 phút | Model nặng hoặc tài nguyên thiếu | Giảm song song; dùng model nhỏ hơn |
@@ -1516,6 +1574,8 @@ curl -s -X POST http://localhost:8090/ask \
 ---
 
 ## 18. Danh mục URL dịch vụ
+
+> Các URL dưới đây chỉ mở được **trên chính máy chạy Docker** (bind `127.0.0.1`). Open WebUI và Agent API mở được từ LAN khi `BIND_ADDR=0.0.0.0` — xem [Truy cập từ máy khác (LAN)](#truy-cập-từ-máy-khác-lan).
 
 | Service | URL | Mô tả |
 |---|---|---|
@@ -1532,5 +1592,5 @@ curl -s -X POST http://localhost:8090/ask \
 | **Qdrant gRPC** | localhost:6334 | Qdrant gRPC endpoint |
 | **Neo4j Browser** | http://localhost:7474 | Graph DB browser UI |
 | **Neo4j Bolt** | bolt://localhost:7687 | Neo4j driver connection |
-| **Deunhealth** | http://localhost:9999 | Health watchdog |
-| **Watchtower** | http://localhost:8080 *(nội bộ)* | Auto-update metrics |
+| **Watchtower** | http://localhost:8080 *(cần `WATCHTOWER_HTTP_API_TOKEN`)* | HTTP API: `/v1/update`, `/v1/metrics` |
+| **Deunhealth** | *(không publish cổng)* | Health watchdog — `network_mode: none`, xem `docker compose logs deunhealth` |
