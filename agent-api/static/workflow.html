@@ -775,6 +775,8 @@ let subTabState  = {};     // { role: 'output'|'files' } — preserves sub-tab s
 let _lastBodyKey = null;   // chữ ký nội dung tab-body đã render — tránh rebuild thừa (giữ scroll)
 let _stepEls     = null;   // [{ node, conn, circle, state }] — progress tracker dựng một lần
 let _tabEls      = null;   // [{ btn, icon }] — thanh tab dựng một lần
+let pollGen      = 0;      // "thế hệ" theo dõi — tăng mỗi lần stopAll(); response của thế hệ cũ bị bỏ qua
+let pollAbort    = null;   // AbortController cho các request của thế hệ hiện tại
 
 /* ────────────────────────────────────────────────────────────────────────
    INIT — pick up workflow_id from URL query string
@@ -792,6 +794,7 @@ let _tabEls      = null;   // [{ btn, icon }] — thanh tab dựng một lần
 
   // Configure marked
   marked.setOptions({ breaks: true, gfm: true });
+  marked.use({ walkTokens: promoteAsciiDiagram });
 })();
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -812,6 +815,7 @@ function trackWorkflow(id) {
   startTime    = null;
   artifactsCache = {};   // Reset cache khi bắt đầu theo dõi workflow mới
   _lastBodyKey = null;   // buộc render lại tab-body cho workflow mới
+  pollAbort    = new AbortController();   // stopAll() đã hủy request của lần theo dõi trước
 
   pushUrl(id);
   showView('wf');
@@ -824,15 +828,25 @@ function trackWorkflow(id) {
    ──────────────────────────────────────────────────────────────────────── */
 async function fetchAndUpdate() {
   if (!currentId) return;
+  // Chốt workflow + thế hệ lúc gửi request. Nếu trong lúc chờ người dùng đã đổi
+  // workflow / mở Recent (stopAll → pollGen tăng) thì bỏ response cũ: không render
+  // dữ liệu workflow A dưới id B, không đặt thêm timer → không sinh vòng poll thứ hai.
+  const gen   = pollGen;
+  const id    = currentId;
+  const stale = () => gen !== pollGen;
+  pollTimer = null;   // timer (nếu có) vừa bắn xong
   try {
-    const res = await fetch(`/workflow/${currentId}`);
+    const res = await fetch(`/workflow/${encodeURIComponent(id)}`, { signal: pollAbort?.signal });
+    if (stale()) return;
     if (!res.ok) {
       const j = await res.json().catch(() => ({ detail: res.statusText }));
+      if (stale()) return;
       showError(j.detail || `HTTP ${res.status}`);
       stopAll();
       return;
     }
     const data = await res.json();
+    if (stale()) return;
 
     // Auto-set active tab to latest completed step on first meaningful load
     if (!userPickedTab) {
@@ -851,19 +865,22 @@ async function fetchAndUpdate() {
     const live = data.status === 'running' || data.status === 'pending';
     setPollIndicator(live);
     if (live) {
+      if (pollTimer) clearTimeout(pollTimer);   // luôn chỉ tồn tại đúng 1 timer poll
       pollTimer = setTimeout(fetchAndUpdate, POLL_MS);
       // Tải artifact metadata trong khi chạy (mỗi khi có role mới hoàn thành)
       const _artifactRoles = new Set(['fe','mobile','be','dba','devsecops','tech_lead','da']);
       const _completedArt  = (data.completed_steps || []).filter(r => _artifactRoles.has(r));
       if (_completedArt.some(r => !(r in artifactsCache))) {
-        loadArtifacts(currentId);
+        loadArtifacts(id);
       }
     } else {
       stopDur();
       // Luôn tải lại artifact khi workflow kết thúc
-      loadArtifacts(currentId);
+      loadArtifacts(id);
     }
   } catch (e) {
+    // Request của lần theo dõi cũ bị hủy (AbortError) hoặc đã lỗi thời → bỏ qua im lặng.
+    if (stale() || e.name === 'AbortError') return;
     showError(e.message);
     stopAll();
   }
@@ -1090,8 +1107,14 @@ function renderTabBody(data) {
   _lastBodyKey = _bodyKey;
 
   if (_hasKey && output && output.trim()) {
-    // Hoàn thành — render markdown + panel files nếu có artifact
-    const clean    = DOMPurify.sanitize(marked.parse(output));
+    // Hoàn thành — render markdown + panel files nếu có artifact.
+    // DOMPurify đã chặn script/on*; cấm thêm id/name (HTML thô trong output agent có
+    // thể trùng id của trang như "art-viewer"/"sub-files" → getElementById trỏ nhầm)
+    // và <style>/<form> (CSS thô không bọc ``` sẽ áp lên toàn trang).
+    const clean    = DOMPurify.sanitize(marked.parse(output), {
+      FORBID_TAGS: ['style', 'form'],
+      FORBID_ATTR: ['id', 'name'],
+    });
     const roleArts = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_'));
     const filesBtn = roleArts.length
       ? `<button class="sub-tab-btn" id="stb-files" onclick="switchSubTab('files')">📁 Files <span class="art-count">${roleArts.length}</span></button>`
@@ -1123,38 +1146,9 @@ function renderTabBody(data) {
       tbl.parentNode.insertBefore(wrap, tbl);
       wrap.appendChild(tbl);
     });
-    // Promote plain-text ASCII diagrams to <pre> so they render in monospace.
-    // The LLM sometimes omits code fences around sequence/flow diagrams, causing
-    // them to render as proportional-font paragraphs and misalign.
-    (function fixAsciiDiagrams(root) {
-      // Decode a paragraph's innerHTML to plain text, converting <br> → '\n'
-      function innerText(el) {
-        return el.innerHTML
-          .replace(/<br\s*\/?>/gi, '\n')
-          .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
-          .replace(/<[^>]+>/g, '');
-      }
-      // Heuristics for ASCII art / sequence / flow diagrams:
-      //   1. Contains Unicode box-drawing characters (─│┌┐└┘├┤┬┴┼┃━…)
-      //   2. Contains ≥4 pipe '|' chars AND ≥3 consecutive dashes/arrows
-      //   3. Line looks like [Label]──── style actor boxes
-      const BOX   = /[─│┌┐└┘├┤┬┴┼┃━╌╍╎╏┄┅┆┇┈┉┊┋]/;
-      const PIPES = /\|/g;
-      const DASHES= /[-─]{3,}|[—]{2,}/;
-      const ACTOR = /\[[A-Za-z].*?\].*[-─|]/;
-      root.querySelectorAll('.md p').forEach(el => {
-        // Skip if already inside a pre/code
-        if (el.closest('pre, code')) return;
-        const text = innerText(el);
-        const pipes = (text.match(PIPES) || []).length;
-        if (BOX.test(text) || (pipes >= 4 && DASHES.test(text)) || ACTOR.test(text)) {
-          const pre = document.createElement('pre');
-          pre.className = 'ascii-art';
-          pre.textContent = text;
-          el.parentNode.replaceChild(pre, el);
-        }
-      });
-    })(body);
+    // Sơ đồ ASCII bị LLM quên bọc ``` đã được chuyển thành <pre> ngay trong lúc
+    // parse markdown (xem promoteAsciiDiagram) — dựa trên markdown NGUỒN, không phải
+    // HTML đã render.
 
   } else if (_hasKey && (!output || !output.trim())) {
     // Hoàn thành nhưng output rỗng (model quá nhỏ hoặc context overflow)
@@ -1207,6 +1201,57 @@ function renderTabBody(data) {
   }
 }
 
+/* ── Sơ đồ ASCII không bọc code fence ───────────────────────────────── */
+// LLM đôi khi quên ``` quanh sơ đồ sequence/flow/wireframe → markdown render thành
+// <p> font tỉ lệ, lệch cột. Heuristic chạy trên markdown NGUỒN của từng paragraph
+// (giữ nguyên "<---->", khoảng trắng căn cột) và cố ý CHẶT để không bắt nhầm văn xuôi
+// như "[Confirmed] Users log in via e-mail":
+//   1. ≥3 ký tự box-drawing (U+2500–U+257F), hoặc
+//   2. ≥2 dòng LIÊN TIẾP có cấu trúc sơ đồ: mũi tên/đường nối ASCII (-->, <--, ==>,
+//      ---, +--), ≥2 dấu '|', box-drawing, hoặc dòng chỉ gồm ký tự nối (|, v, ^, ↓…).
+// Dòng mở đầu bằng tag văn xuôi [Confirmed]/[Assumption]/[Proposed]/[GAP]… không bao
+// giờ được tính; inline code (`a | b`) bị bỏ qua trước khi xét.
+function looksLikeAsciiDiagram(src) {
+  const TAG  = /^\s*[*_]{0,2}\[(?:confirmed|assum\w*|open questions?|proposed|draft|estimate[\w-]*|contradiction|gap|vague|missing|resolved|requires human input|risk|note|todo|tbd)\b[^\]\n]*\]/i;
+  const BOX  = /[\u2500-\u257F]/g;
+  const LINK = /<[-=]{2,}|[-=]{2,}>|-{3,}|={3,}|\+-{2,}/;
+  const RAIL = /^[\s|+:.v^V↓↑▼▲]*[|v^V↓↑▼▲][\s|+:.v^V↓↑▼▲]*$/;
+  let boxChars = 0, run = 0, bestRun = 0;
+  for (const rawLine of String(src || '').split('\n')) {
+    const line = rawLine.replace(/`[^`\n]*`/g, '');
+    const isTag = TAG.test(line);
+    const nBox  = isTag ? 0 : (line.match(BOX) || []).length;
+    boxChars += nBox;
+    const structural = !isTag && line.trim() !== '' && (
+      nBox > 0 || LINK.test(line) || (line.match(/\|/g) || []).length >= 2 || RAIL.test(line));
+    run = structural ? run + 1 : 0;
+    bestRun = Math.max(bestRun, run);
+  }
+  return boxChars >= 3 || bestRun >= 2;
+}
+
+// walkTokens của marked: khối văn bản trông như sơ đồ → đổi thành code block "plaintext"
+// với nội dung là markdown nguồn. marked tự escape khi render (không mất "<---->"
+// như cách cũ lấy innerHTML rồi strip tag), hljs nhận "plaintext" nên không tô màu.
+function promoteAsciiDiagram(token) {
+  const toCode = (t, src) => {
+    t.type    = 'code';
+    t.lang    = 'plaintext';
+    t.text    = src.replace(/\n+$/, '');
+    t.escaped = false;
+    delete t.tokens;
+  };
+  if (token.type === 'paragraph') {
+    if (looksLikeAsciiDiagram(token.raw)) toCode(token, token.raw);
+  } else if (token.type === 'list_item') {
+    // Trong list item marked dùng token 'text' (không phải 'paragraph') cho khối văn bản;
+    // nguồn đã dedent nằm ở .text (.raw có thể bị ghép thừa '\n').
+    for (const t of token.tokens || []) {
+      if (t.type === 'text' && t.tokens && looksLikeAsciiDiagram(t.text)) toCode(t, t.text);
+    }
+  }
+}
+
 /* ────────────────────────────────────────────────────────────────────────
    TAB SELECTION
    ──────────────────────────────────────────────────────────────────────── */
@@ -1245,9 +1290,10 @@ async function showRecent() {
       const icon    = iconMap[w.status] || '?';
       const chip    = document.createElement('div');
       chip.className = 'recent-chip';
+      // Dữ liệu server (đặc biệt project do người dùng nhập) → luôn esc() (chống stored XSS).
       chip.innerHTML = `
-        <div class="rc-id">${icon} ${w.workflow_id.substring(0, 16)}…</div>
-        <div class="rc-meta">${w.project || 'no project'} · ${w.completed_steps}/${w.total_steps} steps · ${fmtTime(w.created_at)}</div>`;
+        <div class="rc-id">${icon} ${esc(String(w.workflow_id).substring(0, 16))}…</div>
+        <div class="rc-meta">${esc(w.project || 'no project')} · ${esc(w.completed_steps)}/${esc(w.total_steps)} steps · ${esc(fmtTime(w.created_at))}</div>`;
       chip.onclick = () => {
         document.getElementById('wid-input').value = w.workflow_id;
         trackWorkflow(w.workflow_id);
@@ -1277,6 +1323,9 @@ function showError(msg) {
 }
 
 function stopAll() {
+  // Tăng thế hệ + hủy request đang bay → response/timer của lần theo dõi trước tự bỏ qua.
+  pollGen++;
+  if (pollAbort) { pollAbort.abort(); pollAbort = null; }
   if (pollTimer) { clearTimeout(pollTimer);  pollTimer = null; }
   stopDur();
   setPollIndicator(false);
@@ -1311,7 +1360,7 @@ function fmtTime(iso) {
 function esc(s) {
   return String(s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;');
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function pushUrl(id) {
@@ -1335,10 +1384,13 @@ function copyId() {
 
 async function loadArtifacts(wid) {
   if (!wid) return;
+  const gen = pollGen;
   try {
-    const res = await fetch(`/workflow/${wid}/artifacts`);
-    if (!res.ok) return;
+    const res = await fetch(`/workflow/${encodeURIComponent(wid)}/artifacts`, { signal: pollAbort?.signal });
+    if (gen !== pollGen || !res.ok) return;
     const data = await res.json();
+    // Đã chuyển sang workflow khác trong lúc chờ → không ghi đè cache bằng file của workflow cũ
+    if (gen !== pollGen) return;
     artifactsCache = data.artifacts || {};
     // Re-render tab body nếu tab hiện tại có artifact mới
     if (lastData && activeTab && artifactsCache[activeTab]) renderTabBody(lastData);
@@ -1375,6 +1427,7 @@ function renderFileTree(role, files) {
     if (!byDir[dir]) byDir[dir] = [];
     byDir[dir].push(f);
   }
+  const wid = encodeURIComponent(currentId);
   let html = `<div class="art-header">
     <button class="btn btn-secondary btn-sm" onclick="downloadRoleZip('${role}')">⬇ Download All</button>
   </div><div class="file-tree">`;
@@ -1384,12 +1437,15 @@ function renderFileTree(role, files) {
       const icon  = getFileIcon(f.filename);
       const fname = f.filename.split('/').pop();
       const encPath = encodeURIComponent(f.filename);
-      html += `<div class="ft-item" onclick="viewArtifact('${role}','${esc(f.filename).replace(/'/g,"\\'")}')">
+      // Truyền role/path qua data-* (esc cho ngữ cảnh attribute) thay vì nhét vào chuỗi JS
+      // trong onclick — tên file chứa \ hoặc ' không thể thoát khỏi chuỗi JS.
+      html += `<div class="ft-item" data-role="${esc(role)}" data-path="${esc(f.filename)}"
+           onclick="viewArtifact(this.dataset.role, this.dataset.path)">
         <span class="ft-icon">${icon}</span>
         <span class="ft-name">${esc(fname)}</span>
         <span class="ft-size">${fmtSize(f.size)}</span>
         <a class="btn btn-secondary btn-sm ft-dl"
-           href="/workflow/${currentId}/artifacts/${role}/${encPath}?download=1"
+           href="/workflow/${wid}/artifacts/${role}/${encPath}?download=1"
            download="${esc(fname)}"
            onclick="event.stopPropagation()">⬇</a>
       </div>`;
@@ -1400,11 +1456,15 @@ function renderFileTree(role, files) {
 }
 
 async function viewArtifact(role, path) {
+  const gen = pollGen;
   try {
+    const wid     = encodeURIComponent(currentId);
     const encPath = encodeURIComponent(path);
-    const res = await fetch(`/workflow/${currentId}/artifacts/${role}/${encPath}`);
+    const res = await fetch(`/workflow/${wid}/artifacts/${role}/${encPath}`);
     if (!res.ok) return;
     const data = await res.json();
+    // Đã đổi workflow hoặc đổi tab trong lúc chờ → không hiện file cũ vào viewer mới
+    if (gen !== pollGen || role !== activeTab) return;
     const viewer = document.getElementById('art-viewer');
     if (!viewer) return;
     viewer.style.display = '';
@@ -1415,7 +1475,7 @@ async function viewArtifact(role, path) {
       <div class="art-viewer-header">
         <span class="art-viewer-path">📄 ${esc(path)}</span>
         <a class="btn btn-secondary btn-sm"
-           href="/workflow/${currentId}/artifacts/${role}/${encPath}?download=1"
+           href="/workflow/${wid}/artifacts/${role}/${encPath}?download=1"
            download="${esc(fname)}">⬇ Download</a>
         <button class="btn btn-secondary btn-sm" onclick="closeArtViewer()">✕</button>
       </div>
@@ -1435,6 +1495,7 @@ function closeArtViewer() {
 
 async function downloadRoleZip(role) {
   const files = (artifactsCache[role] || []).filter(f => !f.filename.startsWith('_'));
+  const wid   = encodeURIComponent(currentId);   // chốt id: đổi workflow giữa chừng không trộn file
   if (!files.length) { alert('Không có file để tải.'); return; }
   if (!window.JSZip) { alert('JSZip chưa tải xong, thử lại sau.'); return; }
 
@@ -1449,7 +1510,7 @@ async function downloadRoleZip(role) {
     const zip    = new JSZip();
     const folder = zip.folder(role);
     await Promise.all(files.map(async f => {
-      const r = await fetch(`/workflow/${currentId}/artifacts/${role}/${encodeURIComponent(f.filename)}`);
+      const r = await fetch(`/workflow/${wid}/artifacts/${role}/${encodeURIComponent(f.filename)}`);
       if (r.ok) { const d = await r.json(); folder.file(f.filename, d.content); }
     }));
     const blob = await zip.generateAsync({ type: 'blob' });
