@@ -482,87 +482,260 @@ _REGEN_ELIGIBLE_ROLES: frozenset[str] = frozenset(
 )
 
 
+# Nhận diện tên role trong §10 của Clarifier. Mỗi named group = một role thuộc
+# _REGEN_ELIGIBLE_ROLES; alias gồm role id, tên hiển thị và dạng viết đầy đủ.
+# Dùng (?<!\w)…(?!\w) thay cho \b để "tech_lead" khớp nguyên cụm và "be" không
+# khớp bên trong "devsecops"/"because".
+_REGEN_ROLE_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"(?P<tech_lead>tech[\s_-]?lead)"
+    r"|(?P<devsecops>dev[\s-]?sec[\s-]?ops|devops)"
+    r"|(?P<fe>front[\s-]?end|fe)"
+    r"|(?P<be>back[\s-]?end|be)"
+    r"|(?P<mobile>mobile)"
+    r"|(?P<dba>dba)"
+    r"|(?P<da>data[\s-]analy(?:st|sis)|da)"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+# Từ đệm hay đi kèm tên role trong cell ("BE Agent", "Backend Engineering", "FE và Mobile").
+_REGEN_FILLER_RE = re.compile(r"(?<!\w)(?:agents?|roles?|engineer(?:ing)?|team|and|or|và)(?!\w)", re.IGNORECASE)
+# Giữa hai tên role chỉ có dấu phân cách danh sách ("be and dba", "FE, BE", "FE/Mobile").
+# Bắt buộc có dấu phẩy/gạch chéo/"and"… — chỉ khoảng trắng ("should be FE-owned") không tính.
+_REGEN_LIST_SEP_RE = re.compile(r"\s*(?:[,/&+]\s*(?:(?:and|or|và)\s+)?|(?:and|or|và)\s+)", re.IGNORECASE)
+# Câu phủ định việc re-gen ("No agent needs to be regenerated", "không cần re-gen").
+_REGEN_NEGATION_RE = re.compile(
+    r"(?<!\w)(?:no|none|nothing|not|never|không)(?!\w)(?:\W+\w+){0,5}?\W+"
+    r"(?:re.?gen\w*|required|necessary|needed|cần)",
+    re.IGNORECASE,
+)
+# Dòng heading §10: tiền tố markdown (#, **, __) + số "10" tuỳ chọn, xét ở ĐẦU DÒNG.
+_SEC10_LINE_RE = re.compile(
+    r"^\s*(?P<md>#{1,6}|\*\*|__)?\s*(?:§\s*)?(?P<num>10\s*[.):\-–—](?!\d))?\s*[*_]*\s*(?P<rest>.*)$"
+)
+_REGEN_TITLE_RE = re.compile(r"(?P<rec>Recommended\s+)?Re.?generation\b", re.IGNORECASE)
+_TABLE_SEP_CELL_RE = re.compile(r":?-{2,}:?")
+
+
+def _find_regen_section(clarifier_output: str) -> str | None:
+    """Trích nội dung §10 Recommended Re-generation List (không gồm dòng heading).
+
+    Chỉ nhận heading ở ĐẦU DÒNG — trích dẫn giữa câu như "BA §10 RTM" hay
+    "→ see §10" ở các section trước bị bỏ qua. Thứ tự ưu tiên (lấy dòng cuối
+    cùng của mỗi loại vì §10 là section cuối):
+      1. heading (#/**/số 10) có tiêu đề "Re-generation";
+      2. dòng trần bắt đầu bằng "Recommended Re-generation";
+      3. heading markdown/bold đánh số "10." (model đổi/dịch tiêu đề).
+    Section kết thúc ở heading markdown cùng cấp trở lên hoặc section đánh số ≥ 11.
+    """
+    lines = clarifier_output.splitlines()
+    titled: int | None = None
+    titled_bare: int | None = None
+    numbered: int | None = None
+    for i, line in enumerate(lines):
+        m = _SEC10_LINE_RE.match(line)
+        if not m:
+            continue
+        heading_like = m.group("md") or m.group("num")
+        t = _REGEN_TITLE_RE.match(m.group("rest"))
+        if t and heading_like:
+            titled = i
+        elif t and t.group("rec"):
+            titled_bare = i
+        elif m.group("md") and m.group("num"):
+            numbered = i
+    start = next((i for i in (titled, titled_bare, numbered) if i is not None), None)
+    if start is None:
+        return None
+
+    md = _SEC10_LINE_RE.match(lines[start]).group("md") or ""
+    level = len(md) if md.startswith("#") else 6
+    stop_re = re.compile(
+        rf"^\s*(?:#{{1,{level}}}\s+\S|(?:#{{1,6}}\s*|\*\*|__)?\s*(?:§\s*)?(?:1[1-9]|[2-9]\d)\s*[.)]\s+[*_]*[A-Z])"
+    )
+    body: list[str] = []
+    for line in lines[start + 1:]:
+        if stop_re.match(line):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _regen_roles_in(text: str, *, prose: bool = False, role_only: bool = False) -> set[str]:
+    """Tìm role được phép re-gen nhắc tới trong một cell bảng hoặc một câu văn.
+
+    - Cell chỉ gồm tên role (+ từ đệm "Agent"/"Engineer", dấu phân cách) như "be",
+      "FE, Mobile, DBA", "BE (Backend)" → nhận TẤT CẢ role trong cell.
+    - Ngược lại, match "yếu" chỉ được nhận khi có ngữ cảnh role: là từ đầu tiên
+      của cell bảng ("be (critical)"), theo sau bởi "agent"/"role", nằm trong
+      `backtick`, hoặc đứng cạnh một tên role khác qua dấu phân cách danh sách
+      ("the be and dba agents"). Match yếu gồm "be"/"da" viết thường (trùng động
+      từ "to be"...) và — trong văn xuôi — dạng mô tả "frontend"/"backend"/"data analyst".
+    role_only=True: bỏ qua text không phải cell "chỉ gồm tên role" (dùng cho bảng
+    không xác định được cột "Agent Role").
+    """
+    matches = list(_REGEN_ROLE_RE.finditer(text))
+    if not matches:
+        return set()
+    rest = _REGEN_FILLER_RE.sub(" ", _REGEN_ROLE_RE.sub(" ", text))
+    if not re.search(r"[^\W_]", rest):
+        return {m.lastgroup for m in matches}
+    if role_only:
+        return set()
+
+    def _weak(m: re.Match) -> bool:
+        word = m.group(0)
+        if word.lower() in {"be", "da"}:
+            return not word.isupper()
+        return prose and m.lastgroup in {"fe", "be", "da"} and len(word) > 3
+
+    def _in_list(a: re.Match, b: re.Match) -> bool:
+        return bool(_REGEN_LIST_SEP_RE.fullmatch(text[a.end():b.start()]))
+
+    found: set[str] = set()
+    for i, m in enumerate(matches):
+        if _weak(m):
+            before, after = text[:m.start()], text[m.end():]
+            has_ctx = (
+                (not prose and not re.search(r"[^\W_]", before))
+                or re.match(r"\s*(?:agents?|roles?)(?!\w)", after, re.IGNORECASE)
+                or (before.endswith("`") and after.startswith("`"))
+                or (i > 0 and _in_list(matches[i - 1], m))
+                or (i + 1 < len(matches) and _in_list(m, matches[i + 1]))
+            )
+            if not has_ctx:
+                continue
+        found.add(m.lastgroup)
+    return found
+
+
 def _parse_clarifier_regen_list(clarifier_output: str) -> list[str]:
     """Parse §10 Recommended Re-generation List từ Clarifier output.
 
-    Tìm bảng trong §10, quét cột "Agent Role" để lấy tên role hợp lệ.
+    Tìm heading §10 thật (đầu dòng), đọc bảng và chỉ quét cột "Agent Role";
+    mỗi cell có thể chứa nhiều role ("FE, Mobile"), tất cả đều được lấy.
     Chỉ trả về các role thuộc _REGEN_ELIGIBLE_ROLES (loại trừ planning roles
     và clarifier để ngăn infinite loop).
-    Kết quả được sắp xếp theo thứ tự WORKFLOW_STEPS.
-    Trả về list rỗng nếu §10 không có trong output hoặc không có gì để re-gen.
+    Kết quả được sắp xếp theo thứ tự WORKFLOW_STEPS (tất định, không phụ thuộc hash seed).
+    Trả về list rỗng nếu §10 không có trong output, bảng rỗng, hoặc không có gì để re-gen.
     """
-    # Tìm vị trí bắt đầu của §10 trong output Clarifier bằng nhiều pattern khác nhau
-    # để xử lý cả trường hợp model viết "10.", "§10", "## 10. Recommended Re-generation".
-    section_match = re.search(
-        r"(?:10\.|§\s*10\b|#+\s*10\.?\s+Recommended\s+Re.?generation|"
-        r"Recommended\s+Re.?generation\s+List)",
-        clarifier_output,
-        re.IGNORECASE,
-    )
-    if not section_match:
+    section_text = _find_regen_section(clarifier_output)
+    if section_text is None:
         return []
 
-    section_text = clarifier_output[section_match.start():]
-    # Cắt nội dung tại section tiếp theo (11. hoặc cao hơn) để tránh
-    # đọc nhầm tên role từ các section khác trong Clarifier output.
-    stop = re.search(r"\n(?:1[1-9]|[2-9][0-9])\.\s+[A-Z]", section_text[30:])
-    if stop:
-        section_text = section_text[:30 + stop.start()]
+    # Gom các dòng bảng liên tiếp thành từng bảng; mỗi dòng → list cell (giữ cell rỗng
+    # để đúng chỉ số cột khi đối chiếu với header).
+    tables: list[list[list[str]]] = []
+    current: list[list[str]] = []
+    for line in section_text.splitlines():
+        s = line.strip()
+        if s.startswith("|") or s.count("|") >= 2:
+            if s.startswith("|"):
+                s = s[1:]
+            if s.endswith("|"):
+                s = s[:-1]
+            current.append([c.strip() for c in s.split("|")])
+        elif current:
+            tables.append(current)
+            current = []
+    if current:
+        tables.append(current)
 
     seen: set[str] = set()
+    for rows in tables:
+        # Header = dòng ngay trước dòng kẻ phân cách (|---|---|); cột role = cell
+        # header đầu tiên chứa "agent"/"role". Không có header → chỉ nhận cell
+        # "chỉ gồm tên role" để không đọc nhầm cột Reason/Sections.
+        sep_idx = next(
+            (i for i, r in enumerate(rows) if all(_TABLE_SEP_CELL_RE.fullmatch(c) or not c for c in r)),
+            None,
+        )
+        role_col: int | None = None
+        data_rows = rows
+        if sep_idx is not None:
+            data_rows = rows[sep_idx + 1:]
+            if sep_idx > 0:
+                role_col = next(
+                    (j for j, c in enumerate(rows[sep_idx - 1])
+                     if re.search(r"agent|role|vai\s*trò", c, re.IGNORECASE)),
+                    None,
+                )
+        for cells in data_rows:
+            row_roles: set[str] = set()
+            if role_col is not None and role_col < len(cells):
+                row_roles = _regen_roles_in(cells[role_col])
+            if not row_roles:
+                # Dòng lệch cột hoặc bảng không header: chỉ nhận cell thuần tên role.
+                for cell in cells:
+                    row_roles |= _regen_roles_in(cell, role_only=True)
+            seen |= row_roles
 
-    for line in section_text.split("\n"):
-        if "|" not in line:
-            continue
-        cells = [c.strip().lower() for c in line.split("|") if c.strip()]
-        if not cells:
-            continue
-        # Bỏ qua dòng kẻ phân cách Markdown (---) và dòng tiêu đề bảng.
-        if all(set(c.replace("-", "").replace(":", "").replace(" ", "")) <= {"-", ":", "|"} for c in cells):
-            continue
-        # Quét từng cell để tìm tên role hợp lệ bằng word-boundary regex,
-        # tránh khớp nhầm tên role con trong tên role khác (ví dụ: "be" trong "devsecops").
-        for cell in cells:
-            for role in _REGEN_ELIGIBLE_ROLES:
-                if role not in seen and re.search(rf"\b{re.escape(role)}\b", cell):
-                    seen.add(role)
-                    break
-
-    # W4 — fallback prose/bullet: nếu model KHÔNG format §10 thành bảng Markdown
-    # (chỉ liệt kê dạng gạch đầu dòng hoặc câu văn), vòng quét theo "|" ở trên sẽ
-    # rỗng. Quét lại toàn bộ section text để bắt tên role hợp lệ theo word-boundary,
-    # tránh để regen loop âm thầm no-op khi model nhỏ format lỏng.
-    if not seen:
-        lowered = section_text.lower()
-        for role in _REGEN_ELIGIBLE_ROLES:
-            if re.search(rf"\b{re.escape(role)}\b", lowered):
-                seen.add(role)
+    # W4 — fallback prose/bullet: CHỈ khi §10 không có bảng nào (model liệt kê dạng
+    # gạch đầu dòng/câu văn). Bảng rỗng = "không cần re-gen" theo prompt → không
+    # fallback. Quét từng câu, bỏ câu phủ định ("No agent needs to be regenerated").
+    # Không tách theo ";" để "No re-generation needed; FE, BE are fine" bị bỏ trọn câu.
+    if not tables:
+        for sentence in re.split(r"(?<=[.!?])\s+|\n", section_text):
+            if sentence.strip() and not _REGEN_NEGATION_RE.search(sentence):
+                seen |= _regen_roles_in(sentence, prose=True)
 
     # Trả về theo thứ tự WORKFLOW_STEPS để đảm bảo dependency được tôn trọng:
     # agent phụ thuộc vào agent khác sẽ được re-gen sau agent đó.
     return [r for r in WORKFLOW_STEPS if r in seen]
 
 
+def _stack_tokens(tech_stack: list[str] | None) -> set[str]:
+    """Chuẩn hoá tech_stack thành tập token để so khớp theo TỪ thay vì chuỗi con.
+
+    - Lowercase, tách mỗi mục theo khoảng trắng và dấu phân cách (, ; / + ( ) | : _ -).
+    - Bỏ hậu tố ".js"/"js" và số phiên bản: "NestJS" → "nest", "Vue3" → "vue",
+      "python3.12" → "python", "go1.22" → "go", "mysql8" → "mysql".
+    - Thêm cặp từ liền kề trong cùng một mục: "react native", "spring boot", "sql server".
+    Nhờ vậy "go" không còn khớp nhầm "mongodb"/"argocd"/"django" và "java" không
+    khớp "javascript".
+    """
+    tokens: set[str] = set()
+    for item in tech_stack or []:
+        words: list[str] = []
+        for raw in re.split(r"[\s,;/+()|:_\-]+", str(item).lower()):
+            word = re.sub(r"\.?js$", "", raw) if len(raw) > 2 else raw
+            word = re.sub(r"@?v?\d+(?:\.\d+)*$", "", word) or word
+            if word:
+                words.append(word)
+        tokens.update(words)
+        tokens.update(f"{a} {b}" for a, b in zip(words, words[1:]))
+    return tokens
+
+
+# DB chính (primary store) vs. DB phụ trợ (cache/search). Redis/Elasticsearch/Memcached
+# đi kèm một SQL DB là cache/search — KHÔNG biến project thành "both" (sinh Mongoose thừa).
+_NOSQL_PRIMARY_KW: frozenset[str] = frozenset(
+    {"mongodb", "mongo", "mongoose", "nosql", "dynamodb", "cassandra", "firestore", "couchdb"}
+)
+_NOSQL_AUX_KW: frozenset[str] = frozenset({"redis", "elasticsearch", "memcached"})
+_SQL_KW: frozenset[str] = frozenset(
+    {"postgresql", "postgres", "mysql", "sql server", "sqlite", "mssql", "oracle", "mariadb"}
+)
+
+
 def _detect_db_type(tech_stack: list[str] | None) -> str:
     """Nhận diện loại cơ sở dữ liệu từ danh sách tech_stack.
 
     Trả về:
-        'nosql'   — chỉ có NoSQL (MongoDB, DynamoDB, Cassandra, Redis...)
+        'nosql'   — chỉ có NoSQL (MongoDB, DynamoDB, Cassandra...)
         'sql'     — chỉ có SQL (PostgreSQL, MySQL, SQL Server, SQLite...)
-        'both'    — có cả SQL và NoSQL
+        'both'    — có cả SQL và NoSQL chính
         'unknown' — không nhận diện được hoặc tech_stack trống
 
+    Redis/Elasticsearch/Memcached là store phụ trợ (cache/search): chỉ tính là NoSQL
+    khi stack KHÔNG có DB chính nào khác (ví dụ stack chỉ có Redis).
     Kết quả được dùng để chọn đúng extra_instruction cho DBA và DA agent.
     """
     if not tech_stack:
         return "unknown"
-    _nosql_kw = {"mongodb", "mongo", "nosql", "dynamodb", "cassandra",
-                 "redis", "firestore", "couchdb", "elasticsearch"}
-    _sql_kw   = {"postgresql", "mysql", "postgres", "sql server",
-                 "sqlite", "mssql", "oracle", "mariadb"}
-    combined  = " ".join(t.lower() for t in tech_stack)
-    has_nosql = any(kw in combined for kw in _nosql_kw)
-    has_sql   = any(kw in combined for kw in _sql_kw)
+    tokens    = _stack_tokens(tech_stack)
+    has_sql   = bool(tokens & _SQL_KW)
+    has_nosql = bool(tokens & _NOSQL_PRIMARY_KW) or (not has_sql and bool(tokens & _NOSQL_AUX_KW))
     if has_nosql and has_sql:
         return "both"
     if has_nosql:
@@ -653,7 +826,8 @@ def _compute_extra_instruction(role: str, tech_stack: list[str] | None) -> str:
             )
         return ""
 
-    combined = " ".join(t.lower() for t in tech_stack)
+    # So khớp theo token (không theo chuỗi con) — xem _stack_tokens.
+    tokens   = _stack_tokens(tech_stack)
     db_type  = _detect_db_type(tech_stack)
 
     if role == "dba":
@@ -682,42 +856,41 @@ def _compute_extra_instruction(role: str, tech_stack: list[str] | None) -> str:
     )
 
     if role == "fe":
-        if "vue" in combined:
+        if "vue" in tokens:
             fw = "Vue 3 component (Composition API, TypeScript, template)"
-        elif "angular" in combined:
+        elif "angular" in tokens:
             fw = "Angular component (TypeScript, decorators, template)"
-        elif "svelte" in combined:
+        elif tokens & {"svelte", "sveltekit"}:
             fw = "Svelte component (TypeScript, reactive syntax)"
         else:
             fw = "React/TypeScript component (JSX, hooks, typed props)"
         return "Scaffold a " + fw + _scaffold
 
     if role == "mobile":
-        if "react native" in combined or "expo" in combined:
+        if tokens & {"react native", "expo"}:
             fw = "React Native component (TypeScript, JSX, StyleSheet)"
-        elif "flutter" in combined or "dart" in combined:
+        elif tokens & {"flutter", "dart"}:
             fw = "Flutter/Dart widget"
         else:
             fw = "Flutter/Dart widget or React Native component"
         return "Scaffold a " + fw + _scaffold
 
     if role == "be":
-        if "fastapi" in combined or (
-            "python" in combined and "django" not in combined and "flask" not in combined
-        ):
-            fw = "FastAPI router + Pydantic models (async)"
-        elif "django" in combined:
-            fw = "Django/DRF view + serializers"
-        elif "flask" in combined:
-            fw = "Flask route + request parsing"
-        elif "express" in combined and "nest" not in combined:
-            fw = "Express.js route + TypeScript types"
-        elif "spring" in combined or "java" in combined or "kotlin" in combined:
-            fw = "Spring Boot controller + service (annotated)"
-        elif "go" in combined or "golang" in combined:
-            fw = "Go HTTP handler + struct types"
-        else:
-            fw = "NestJS controller + service + DTO"
+        # Framework ghi rõ thắng ngôn ngữ trần: ["nestjs", "python"] → NestJS
+        # (python thường dành cho DA/ML); NestJS trước Express vì Nest chạy trên Express.
+        # Chỉ có ngôn ngữ → framework mặc định của ngôn ngữ đó; không gì khớp → NestJS.
+        be_rules: tuple[tuple[set[str], str], ...] = (
+            ({"fastapi"}, "FastAPI router + Pydantic models (async)"),
+            ({"django"}, "Django/DRF view + serializers"),
+            ({"flask"}, "Flask route + request parsing"),
+            ({"nest"}, "NestJS controller + service + DTO"),
+            ({"express"}, "Express.js route + TypeScript types"),
+            ({"spring", "springboot"}, "Spring Boot controller + service (annotated)"),
+            ({"python"}, "FastAPI router + Pydantic models (async)"),
+            ({"java", "kotlin"}, "Spring Boot controller + service (annotated)"),
+            ({"go", "golang"}, "Go HTTP handler + struct types"),
+        )
+        fw = next((f for kws, f in be_rules if tokens & kws), "NestJS controller + service + DTO")
         return "Scaffold a " + fw + _scaffold
 
     if role == "devsecops":
