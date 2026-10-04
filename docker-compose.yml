@@ -1,5 +1,19 @@
 name: rag-agent-platform
 
+# ── Chính sách publish cổng ra host ───────────────────────────────────────────
+# Không service nào có xác thực mặc định, nên KHÔNG publish ra mọi interface:
+#   • Hạ tầng (ollama, qdrant, neo4j, rag-api, watchtower) → chỉ 127.0.0.1. Các
+#     service khác gọi nhau qua network nội bộ `yan` (http://ollama:11434,
+#     http://rag-api:8090, ...), cổng host chỉ phục vụ curl/runbook trên chính máy chạy.
+#   • Giao diện người dùng (agent-api UI, Open WebUI) → ${BIND_ADDR:-127.0.0.1}.
+#     Đặt BIND_ADDR=0.0.0.0 trong .env để mở cho LAN (khi đó cần WEBUI_AUTH=true).
+#
+# ── Watchtower ────────────────────────────────────────────────────────────────
+# Chỉ container có label watchtower.enable=true mới được auto-update
+# (WATCHTOWER_LABEL_ENABLE=true). Service giữ dữ liệu/trạng thái (ollama, qdrant,
+# neo4j) đặt enable=false để không bị recreate giữa chừng một workflow đang chạy;
+# rag-api/agent-api là image build local nên cũng enable=false.
+
 services:
   ollama:
     image: ollama/ollama:latest
@@ -7,14 +21,16 @@ services:
     pull_policy: if_not_present
     tty: true
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      # Stateful (model đang load, request LLM dài) — cập nhật thủ công bằng
+      # `docker compose pull ollama && docker compose up -d ollama`.
+      - "com.centurylinklabs.watchtower.enable=false"
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "3"
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama:/root/.ollama
     environment:
@@ -52,12 +68,22 @@ services:
     image: qdrant/qdrant:latest
     container_name: qdrant
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      # Stateful (vector index) — không auto-recreate giữa lúc ingest/query.
+      - "com.centurylinklabs.watchtower.enable=false"
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
+    # Image qdrant (Debian slim) không có curl/wget → kiểm tra cổng REST bằng
+    # /dev/tcp của bash. Phải gọi `bash` tường minh: CMD-SHELL dùng /bin/sh (dash)
+    # vốn không hỗ trợ /dev/tcp.
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/6333"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - yan
     restart: unless-stopped
@@ -66,10 +92,11 @@ services:
     image: neo4j:5-community
     container_name: neo4j
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      # Stateful (graph DB) — không auto-recreate giữa lúc ingest/query.
+      - "com.centurylinklabs.watchtower.enable=false"
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     environment:
       NEO4J_AUTH: ${NEO4J_USERNAME}/${NEO4J_PASSWORD}
       NEO4J_PLUGINS: '["apoc"]'
@@ -79,6 +106,14 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+    # Kiểm tra cổng Bolt bằng /dev/tcp của bash (không cần curl/wget, không lộ
+    # password như cypher-shell). start_period dài vì lần đầu phải tải plugin APOC.
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/7687"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks:
       - yan
     restart: unless-stopped
@@ -98,7 +133,7 @@ services:
       retries: 3
       start_period: 20s
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     environment:
       LOG_LEVEL: ${RAG_LOG_LEVEL}
       RAW_DATA_DIR: ${RAW_DATA_DIR}
@@ -112,6 +147,8 @@ services:
       UPSERT_BATCH_SIZE: ${UPSERT_BATCH_SIZE}
       RAG_TOP_K: ${RAG_TOP_K}
       OLLAMA_REQUEST_TIMEOUT: ${OLLAMA_REQUEST_TIMEOUT:-600}
+      # Ở rag-api, RAG_TIMEOUT là timeout HTTP (giây) cho mỗi lần gọi Ollama /api/embed.
+      RAG_TIMEOUT: ${RAG_TIMEOUT:-600}
       NEO4J_URI: ${NEO4J_URI}
       NEO4J_USERNAME: ${NEO4J_USERNAME}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
@@ -119,17 +156,20 @@ services:
       GRAPH_ENABLED: ${GRAPH_ENABLED}
       GRAPH_ENTITY_EXTRACTION: ${GRAPH_ENTITY_EXTRACTION}
       INGEST_EMBED_WORKERS: ${INGEST_EMBED_WORKERS:-1}
+      INGEST_EMBED_RETRIES: ${INGEST_EMBED_RETRIES:-3}
     volumes:
       - ./data/raw:/data/raw
     networks:
       - yan
-    # D2: chờ Ollama healthy (model server đã lên) trước khi rag-api khởi động.
-    # qdrant/neo4j chỉ cần started — rag-api degrade graceful nếu Neo4j chưa sẵn sàng.
+    # D2: chờ Ollama + Qdrant healthy trước khi rag-api khởi động (Qdrant là bắt buộc
+    # cho mọi /ingest và /ask). Neo4j CỐ Ý chỉ service_started: graph là tùy chọn
+    # (GRAPH_ENABLED=false thì không dùng), rag-api degrade graceful khi Neo4j chưa
+    # sẵn sàng, và lần đầu Neo4j tải APOC khá lâu — không nên chặn cả stack vì nó.
     depends_on:
       ollama:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
       neo4j:
         condition: service_started
     restart: unless-stopped
@@ -149,7 +189,7 @@ services:
       retries: 3
       start_period: 20s
     ports:
-      - "8091:8091"
+      - "${BIND_ADDR:-127.0.0.1}:8091:8091"
     environment:
       LOG_LEVEL: ${RAG_LOG_LEVEL}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
@@ -178,6 +218,18 @@ services:
       MEMORY_DIR: /data/memory
       ARTIFACT_DIR: /data/artifacts
       MAX_FILES_PER_ROLE: ${MAX_FILES_PER_ROLE:-6}
+      # Ngân sách thời gian tổng của một workflow (giây). 0 = không giới hạn.
+      WORKFLOW_MAX_SECONDS: ${WORKFLOW_MAX_SECONDS:-0}
+      # Số workflow chạy đồng thời. Giữ 1 vì Ollama phục vụ tuần tự (NUM_PARALLEL=1).
+      WORKFLOW_CONCURRENCY: ${WORKFLOW_CONCURRENCY:-1}
+      # SQLite lưu trạng thái workflow — nằm trong volume ./data/memory để sống sót restart.
+      WORKFLOW_DB_PATH: ${WORKFLOW_DB_PATH:-/data/memory/workflows.sqlite3}
+      # Trần token sinh ra (num_predict) cho planner JSON / mỗi file code / báo cáo Markdown.
+      PLANNER_NUM_PREDICT: ${PLANNER_NUM_PREDICT:-2048}
+      FILEGEN_NUM_PREDICT: ${FILEGEN_NUM_PREDICT:-8192}
+      REPORT_NUM_PREDICT: ${REPORT_NUM_PREDICT:-16384}
+      # Bật/tắt "thinking" khi sinh file (true/false). Rỗng = theo mặc định của model.
+      FILEGEN_THINK: ${FILEGEN_THINK:-}
     volumes:
       - ./data/memory:/data/memory
       - ./data/artifacts:/data/artifacts
@@ -188,7 +240,7 @@ services:
       ollama:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
       rag-api:
         condition: service_healthy
     restart: unless-stopped
@@ -199,7 +251,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     ports:
-      - "${OPEN_WEBUI_PORT}:${OPEN_WEBUI_PORT}"
+      - "${BIND_ADDR:-127.0.0.1}:${OPEN_WEBUI_PORT}:${OPEN_WEBUI_PORT}"
     volumes:
       - open-webui:/app/backend/data
       - ./data/raw:/data/raw
@@ -231,7 +283,10 @@ services:
       ollama:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
+    # Open WebUI và các tool (Valves) gọi ollama/rag-api/agent-api qua network `yan`
+    # (http://<service>:<port>), KHÔNG qua host.docker.internal. Lưu ý: từ container,
+    # host.docker.internal không tới được các cổng host chỉ bind 127.0.0.1.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -250,12 +305,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       DOCKER_API_VERSION: "1.44"
+      # TZ quyết định múi giờ của WATCHTOWER_SCHEDULE. Thiếu TZ thì cron chạy theo UTC
+      # (0 0 4 * * * = 11:00 Asia/Ho_Chi_Minh thay vì 04:00).
+      TZ: ${TZ}
       WATCHTOWER_CLEANUP: ${WATCHTOWER_CLEANUP}
       WATCHTOWER_INCLUDE_STOPPED: ${WATCHTOWER_INCLUDE_STOPPED}
       WATCHTOWER_TIMEOUT: ${WATCHTOWER_TIMEOUT}
       WATCHTOWER_SCHEDULE: ${WATCHTOWER_SCHEDULE}
       WATCHTOWER_HTTP_API_METRICS: ${WATCHTOWER_HTTP_API_METRICS}
       WATCHTOWER_HTTP_API_TOKEN: ${WATCHTOWER_HTTP_API_TOKEN}
+      # Chỉ cập nhật container có label watchtower.enable=true (open-webui, deunhealth).
       WATCHTOWER_LABEL_ENABLE: "true"
     networks:
       - yan
@@ -268,10 +327,10 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
     # D4: deunhealth cũng cần ghi docker.sock để restart container unhealthy → cùng
     # rủi ro root-on-host như watchtower. Cân nhắc socket-proxy nếu môi trường nhạy cảm.
+    # Không publish cổng: HEALTH_SERVER_ADDRESS (127.0.0.1:9999) chỉ phục vụ healthcheck
+    # nội bộ của chính image, và network_mode: none thì publish cổng cũng vô nghĩa.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    ports:
-      - "9999:9999"
     environment:
       LOG_LEVEL: ${DEUNHEALTH_LOG_LEVEL}
       HEALTH_SERVER_ADDRESS: ${HEALTH_SERVER_ADDRESS}
