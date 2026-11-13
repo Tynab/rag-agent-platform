@@ -221,6 +221,34 @@ def test_reset_first_batch_fails_later_batch_drops_and_rebuilds(env, monkeypatch
     assert result["points_count"] == 2
 
 
+def test_reset_failed_drop_is_retried_by_next_batch(env, monkeypatch):
+    proj, store, state, write, embedded, index = env
+    monkeypatch.setattr(ingest, "UPSERT_BATCH_SIZE", 1)
+    monkeypatch.setattr(ingest, "INGEST_EMBED_WORKERS", 1)  # thứ tự batch tất định
+    _seed(write)
+    ingest.ingest(project=PROJECT)
+
+    real_delete = store.delete_collection
+    calls = {"n": 0}
+
+    def _flaky_delete(name, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant busy")
+        return real_delete(name, *a, **kw)
+
+    monkeypatch.setattr(store, "delete_collection", _flaky_delete)
+    state["dim"] = 5
+    result = ingest.ingest(project=PROJECT, reset=True)
+
+    # Batch a.md: xóa lỗi → batch lỗi; batch b.md thử xóa lại rồi tạo collection dim 5
+    # (không upsert dim 5 lẫn vào collection dim 3 cũ).
+    assert calls["n"] == 2
+    assert result["failed_batches"] == 1 and "qdrant busy" in result["batch_error"]
+    assert ingest.collection_vector_size(store, COLL) == 5
+    assert sorted(index().values()) == ["b.md", "c.md"]
+
+
 def test_reset_with_no_chunks_still_drops_collection(env):
     proj, store, state, write, embedded, index = env
     _seed(write)
@@ -253,6 +281,57 @@ def test_short_embed_response_is_a_failed_batch_and_deletes_nothing(env):
     assert "2 chunk" in result["batch_error"]
     assert result["stale_removed"] == 0
     assert index() == before  # bản cũ của a.md/b.md KHÔNG bị dọn
+
+
+# ── File nhiều chunk ─────────────────────────────────────────────────────────
+
+_PARAS = ["alpha one two three", "beta four five six", "gamma seven eight"]
+
+
+def _multi_chunk(monkeypatch, write):
+    monkeypatch.setattr(ingest, "CHUNK_SIZE", 30)
+    monkeypatch.setattr(ingest, "CHUNK_OVERLAP", 0)
+    write("long.md", "\n\n".join(_PARAS) + "\n")
+    write("other.md", "# O\nunrelated\n")
+
+
+def test_editing_last_chunk_of_multi_chunk_file_embeds_only_that_chunk(env, monkeypatch):
+    proj, store, state, write, embedded, index = env
+    _multi_chunk(monkeypatch, write)
+    ingest.ingest(project=PROJECT)
+    before = index()
+    assert sorted(before.values()) == ["long.md"] * 3 + ["other.md"]
+    embedded()
+
+    write("long.md", "\n\n".join(_PARAS[:2] + ["gamma seven NINE"]) + "\n")
+    result = ingest.ingest(project=PROJECT)
+
+    assert embedded() == ["gamma seven NINE"]  # chỉ chunk đã sửa
+    assert result["upserted"] == 1 and result["skipped_unchanged"] == 3
+    assert result["stale_removed"] == 1 and result["points_count"] == 4
+    after = index()
+    assert len(set(before) - set(after)) == 1  # đúng một point cũ bị thay
+
+
+def test_prepending_to_multi_chunk_file_reembeds_only_that_file(env, monkeypatch):
+    proj, store, state, write, embedded, index = env
+    _multi_chunk(monkeypatch, write)
+    ingest.ingest(project=PROJECT)
+    before = index()
+    other_ids = {pid for pid, rp in before.items() if rp == "other.md"}
+    embedded()
+
+    write("long.md", "\n\n".join(["zeta new first"] + _PARAS) + "\n")
+    result = ingest.ingest(project=PROJECT)
+
+    # chunk_index nằm trong point id → chèn đầu file làm dịch id mọi chunk SAU nó
+    # (thiết kế id hiện tại), nhưng KHÔNG đụng tới file khác.
+    texts = embedded()
+    assert sorted(texts) == sorted(["zeta new first"] + _PARAS)
+    assert result["skipped_unchanged"] == 1 and result["stale_removed"] == 3
+    after = index()
+    assert other_ids <= set(after)
+    assert sorted(after.values()) == ["long.md"] * 4 + ["other.md"]
 
 
 # ── Đổi tên / chuyển file ────────────────────────────────────────────────────

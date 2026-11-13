@@ -571,11 +571,13 @@ class _CollectionGate:
         """reset: xóa collection cũ (một lần) — số chiều cũ không còn ràng buộc batch sau."""
         if not self._drop_pending:
             return
-        self._drop_pending = False
-        self._vector_size = None
         if self._client.collection_exists(self._collection_name):
             logger.warning("Deleting collection before reset: %s", self._collection_name)
             self._client.delete_collection(self._collection_name)
+        # Chỉ hạ cờ SAU khi xóa xong: delete lỗi → batch này lỗi và batch thành công kế
+        # tiếp thử xóa lại, thay vì upsert lẫn vào collection cũ.
+        self._drop_pending = False
+        self._vector_size = None
 
     def ensure(self, dim: int) -> None:
         self.drop_if_pending()
