@@ -7,7 +7,7 @@ description: >
     Hỗ trợ lọc kết quả theo project và module để tăng độ chính xác retrieval.
 required_open_webui_version: 0.3.0
 requirements: requests
-version: 1.1.0
+version: 1.2.0
 
 Mô tả chi tiết
 --------------
@@ -19,11 +19,22 @@ rag-api, nhận kết quả RAG hybrid (Qdrant vector search + Neo4j graph enric
 Valves (biến cấu hình)
 ----------------------
     rag_api_url      URL của rag-api trong nội bộ Docker network.
-                     Mặc định: http://rag-api:8090
-                     Khi gọi từ ngoài container: http://localhost:8090
+                     Mặc định: http://rag-api:8090 (tên service trong compose).
+                     Cổng host của rag-api chỉ publish trên 127.0.0.1 nên từ bên
+                     trong container Open WebUI, http://localhost:8090 hay
+                     http://host.docker.internal:8090 KHÔNG tới được rag-api.
+                     Open WebUI chạy ở container/compose khác → nối container đó
+                     vào network của stack rồi vẫn dùng http://rag-api:8090:
+                         docker network connect rag-agent-platform_yan <container>
 
-    timeout          Timeout tính bằng giây cho mỗi request.
-                     Mặc định: 120 giây.
+    timeout          Timeout (giây) chờ POST /ask trả lời.
+                     Mặc định: 1260 giây = OLLAMA_REQUEST_TIMEOUT của rag-api
+                     (1200 trong .env) + ~60 giây cho embed/truy hồi.
+                     Phải >= OLLAMA_REQUEST_TIMEOUT của rag-api (xem
+                     `curl -s localhost:8090/health | jq .ollama_request_timeout`):
+                     /ask chỉ trả về khi CHAT_MODEL sinh xong, và khi tool bỏ cuộc
+                     sớm thì rag-api/Ollama VẪN sinh tiếp — chiếm slot Ollama duy
+                     nhất (OLLAMA_MAX_LOADED_MODELS=1) mà không ai nhận kết quả.
 
     top_k            Số chunk kết quả trả về. Null = dùng giá trị RAG_TOP_K
                      trong env của rag-api (mặc định 5).
@@ -70,15 +81,22 @@ class Tools:
         rag_api_url: str = Field(
             default="http://rag-api:8090",
             description=(
-                "URL của rag-api service. Mặc định hostname nội bộ Docker network "
-                "(http://rag-api:8090) — đúng khi Open WebUI chạy cùng compose `yan`. "
-                "Nếu chạy ngoài network đó: http://localhost:8090 hoặc "
-                "http://host.docker.internal:8090."
+                "URL của rag-api service. Mặc định là tên service trong compose "
+                "(http://rag-api:8090) — đúng khi Open WebUI chạy cùng network `yan` của "
+                "stack. Cổng host của rag-api chỉ bind 127.0.0.1 nên localhost / "
+                "host.docker.internal KHÔNG dùng được từ trong container. Open WebUI ở "
+                "container/compose khác: `docker network connect rag-agent-platform_yan "
+                "<container>` rồi giữ http://rag-api:8090."
             ),
         )
         timeout: int = Field(
-            default=120,
-            description="Timeout cho mỗi request (giây)",
+            default=1260,
+            description=(
+                "Timeout chờ rag-api /ask (giây). Phải >= OLLAMA_REQUEST_TIMEOUT của rag-api "
+                "(1200 trong .env, xem /health → ollama_request_timeout) + thời gian "
+                "embed/truy hồi. Tool bỏ cuộc sớm KHÔNG hủy generation: Ollama vẫn sinh tiếp "
+                "và chiếm slot duy nhất, các câu hỏi sau phải xếp hàng chờ."
+            ),
         )
         top_k: int | None = Field(
             default=None,
@@ -133,12 +151,21 @@ class Tools:
         except requests.exceptions.ConnectionError:
             return (
                 f"❌ Không kết nối được rag-api tại {self.valves.rag_api_url}. "
-                "Kiểm tra service đang chạy (`docker ps | grep rag-api`). Nếu Open WebUI "
-                "chạy ngoài Docker network `yan`, đổi Valve rag_api_url sang "
-                "http://localhost:8090 hoặc http://host.docker.internal:8090."
+                "Kiểm tra service đang chạy (`docker ps | grep rag-api`). Open WebUI phải cùng "
+                "Docker network với rag-api và gọi bằng tên service (http://rag-api:8090). "
+                "Nếu Open WebUI chạy ở container/compose khác, nối nó vào network của stack: "
+                "`docker network connect rag-agent-platform_yan <container>`. "
+                "localhost / host.docker.internal không dùng được vì cổng host của rag-api "
+                "chỉ bind 127.0.0.1."
             )
         except requests.exceptions.Timeout:
-            return f"❌ rag-api timeout sau {self.valves.timeout}s. Thử lại hoặc tăng timeout trong Valves."
+            return (
+                f"❌ rag-api chưa trả lời sau {self.valves.timeout}s nên tool đã ngừng chờ — nhưng "
+                "rag-api/Ollama có thể VẪN đang sinh câu trả lời và chiếm slot Ollama duy nhất. "
+                "Đợi vài phút trước khi hỏi lại (hỏi ngay sẽ phải xếp hàng sau lần sinh cũ). "
+                "Nếu thường xuyên xảy ra, tăng Valve timeout (>= OLLAMA_REQUEST_TIMEOUT của "
+                "rag-api, xem /health)."
+            )
         except requests.exceptions.HTTPError as exc:
             code, body = _http_error_parts(exc)
             return f"❌ rag-api trả lỗi HTTP {code}: {body}"

@@ -10,7 +10,7 @@ description: >
     được trích xuất, và Clarifier audit report.
 required_open_webui_version: 0.3.0
 requirements: requests
-version: 2.0.0
+version: 2.1.0
 
 Mô tả chi tiết
 --------------
@@ -21,7 +21,12 @@ trực tiếp từ giao diện chat mà không cần gọi API thủ công.
 Valves (biến cấu hình)
 ----------------------
     agent_api_url      URL của agent-api trong nội bộ Docker network.
-                       Mặc định: http://agent-api:8091
+                       Mặc định: http://agent-api:8091 (tên service trong compose).
+                       Từ bên trong container Open WebUI, localhost /
+                       host.docker.internal KHÔNG tới được agent-api (cổng host
+                       mặc định chỉ bind 127.0.0.1). Open WebUI chạy ở
+                       container/compose khác → nối vào network của stack:
+                           docker network connect rag-agent-platform_yan <container>
 
     timeout            Timeout (giây) cho mỗi single-step agent call.
                        Mặc định: 600 giây.
@@ -43,8 +48,9 @@ Valves (biến cấu hình)
 Hàm công khai
 --------------
     run_sdlc_workflow(user_input, project, tech_stack) → str
-        Khởi chạy full workflow 15 bước, poll đến khi hoàn tất,
-        trả về summary kết quả (status, thời gian, output mỗi bước).
+        Khởi chạy full workflow 15 bước. Mặc định trả workflow_id ngay
+        (chạy nền); Valve block_until_complete=True thì poll tới khi
+        workflow kết thúc (completed / failed / cancelled) rồi trả summary.
         Tham số:
           user_input   Mô tả yêu cầu / mục tiêu kiếnh doanh. Bắt buộc.
           project      Tên project để lọc RAG. Tùy chọn.
@@ -58,9 +64,14 @@ Hàm công khai
         Ví dụ: role="sa" để xem kiến trúc giải pháp.
 
     get_workflow_result(workflow_id, role) → str
-        Lấy output của một workflow đã chạy xong theo ID.
+        Lấy trạng thái / output của một workflow theo ID.
         role tùy chọn: nếu có thì chỉ trả output của role đó.
-        Nếu không có role: trả summary toàn bộ workflow.
+        Nếu không có role: trả summary toàn bộ workflow (status, vị trí
+        hàng đợi khi pending, các bước lỗi failed_steps, preview output).
+
+    cancel_workflow(workflow_id) → str
+        Hủy workflow đang pending/running qua POST /workflow/{id}/cancel.
+        404 = không tìm thấy; 409 = workflow đã kết thúc, không hủy được.
 
     list_agent_roles() → str
         Liệt kê tất cả 15 role theo thứ tự thực thi, kèm tên, model
@@ -71,6 +82,7 @@ Ví dụ sử dụng trong chat
     Chạy SDLC workflow: xây dựng module marketplace B2B, project=yanlib
     Chạy agent sa: thiết kế kiến trúc hệ thống authentication đa tenant
     Lấy kết quả workflow abc123, role=be
+    Hủy workflow abc123
     Liệt kê tất cả agent roles
 """
 
@@ -78,6 +90,45 @@ import time
 
 import requests
 from pydantic import BaseModel, Field
+
+# Trạng thái KẾT THÚC của workflow (agent-api WorkflowStatus): vòng poll dừng ngay khi
+# gặp một trong các giá trị này. pending/running = còn đang chờ/chạy.
+_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+
+def _status_detail_lines(wf: dict) -> list[str]:
+    """Các dòng bổ sung cho summary: vị trí hàng đợi (pending), bước lỗi, lỗi, hủy.
+
+    Mọi field đọc bằng .get() — agent-api cũ có thể chưa trả queue_position /
+    failed_steps / status cancelled.
+    """
+    lines: list[str] = []
+    status = wf.get("status")
+    if status == "pending":
+        queue_position = wf.get("queue_position")
+        if queue_position is not None:  # 0 là vị trí hợp lệ
+            lines.append(f"- **Vị trí hàng đợi:** {queue_position} (đang chờ workflow khác chạy xong)")
+        else:
+            lines.append("- **Hàng đợi:** đang chờ tới lượt chạy")
+    failed_steps = wf.get("failed_steps") or []
+    if failed_steps:
+        lines.append(f"- **⚠️ Bước lỗi ({len(failed_steps)}):** {', '.join(failed_steps)}")
+    if wf.get("error"):
+        lines.append(f"- **Error:** {wf['error']}")
+    if status == "cancelled":
+        lines.append("- **🛑 Đã bị hủy** — các bước chưa chạy sẽ không chạy nữa.")
+    return lines
+
+
+def _response_detail(resp: requests.Response) -> str:
+    """`detail` trong body lỗi JSON của FastAPI; fallback text thô."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return resp.text
+    if isinstance(body, dict) and body.get("detail"):
+        return str(body["detail"])
+    return resp.text
 
 
 def _http_error_parts(exc: requests.exceptions.HTTPError) -> tuple[int | None, str]:
@@ -132,10 +183,12 @@ class Tools:
         agent_api_url: str = Field(
             default="http://agent-api:8091",
             description=(
-                "URL của agent-api service. Mặc định là hostname nội bộ Docker network "
-                "(http://agent-api:8091) — đúng khi Open WebUI chạy CÙNG compose `yan`. "
-                "Nếu Open WebUI chạy ngoài network đó, đổi sang http://localhost:8091 "
-                "hoặc http://host.docker.internal:8091."
+                "URL của agent-api service. Mặc định là tên service trong compose "
+                "(http://agent-api:8091) — đúng khi Open WebUI chạy CÙNG network `yan` của "
+                "stack. Từ trong container, localhost / host.docker.internal KHÔNG tới được "
+                "agent-api (cổng host mặc định chỉ bind 127.0.0.1). Open WebUI ở "
+                "container/compose khác: `docker network connect rag-agent-platform_yan "
+                "<container>` rồi giữ http://agent-api:8091."
             ),
         )
         block_until_complete: bool = Field(
@@ -185,8 +238,10 @@ class Tools:
         return (
             f"❌ Không kết nối được agent-api tại {self._base_url()}.\n"
             f"Kiểm tra service có đang chạy không: `docker ps | grep agent-api`\n"
-            f"Nếu Open WebUI chạy ngoài Docker network `yan`, đổi Valve agent_api_url "
-            f"sang http://localhost:8091 hoặc http://host.docker.internal:8091.\n"
+            f"Open WebUI phải cùng Docker network với agent-api và gọi bằng tên service "
+            f"(http://agent-api:8091). Nếu Open WebUI chạy ở container/compose khác, nối nó "
+            f"vào network của stack: `docker network connect rag-agent-platform_yan <container>`. "
+            f"localhost / host.docker.internal không dùng được vì cổng host chỉ bind 127.0.0.1.\n"
             f"Chi tiết: {exc}"
         )
 
@@ -267,6 +322,8 @@ class Tools:
             f"- **Project:** {resolved_project or 'all'}",
             f"- **Steps:** {' → '.join(roles)}",
         ]
+        if data.get("queue_position") is not None:
+            result_lines.append(f"- **Vị trí hàng đợi:** {data['queue_position']}")
 
         # O1: mặc định KHÔNG block. Trả workflow_id ngay để tránh vượt timeout
         # proxy/browser; người dùng dùng get_workflow_result để theo dõi & lấy kết quả.
@@ -274,7 +331,8 @@ class Tools:
         if not self.valves.block_until_complete:
             result_lines.append(
                 f"\n⏳ Đang chạy nền (15–45 phút tùy model). "
-                f"Dùng `get_workflow_result('{workflow_id}')` để theo dõi tiến trình & lấy kết quả."
+                f"Dùng `get_workflow_result('{workflow_id}')` để theo dõi tiến trình & lấy kết quả, "
+                f"`cancel_workflow('{workflow_id}')` để hủy."
             )
             return "\n".join(result_lines)
 
@@ -299,12 +357,23 @@ class Tools:
 
             status = wf.get("status", "unknown")
             completed = wf.get("completed_steps", [])
-            result_lines.append(
-                f"📊 Attempt {attempt + 1}: status={status} | completed={completed}"
-            )
+            progress = f"📊 Attempt {attempt + 1}: status={status} | completed={completed}"
+            if status == "pending" and wf.get("queue_position") is not None:
+                progress += f" | queue_position={wf['queue_position']}"
+            result_lines.append(progress)
+
+            if status not in _TERMINAL_STATUSES:
+                continue
 
             if status == "completed":
                 result_lines.append("\n---\n## ✅ Workflow Hoàn thành\n")
+                # W6: workflow 'completed' vẫn có thể có bước trả về marker [LỖI ...].
+                failed_steps = wf.get("failed_steps") or []
+                if failed_steps:
+                    result_lines.append(
+                        f"⚠️ **{len(failed_steps)} bước lỗi:** {', '.join(failed_steps)} "
+                        "— xem output từng bước bằng get_workflow_result(..., role=...).\n"
+                    )
                 step_outputs: dict = wf.get("step_outputs", {})
                 for role in roles:
                     if role in step_outputs:
@@ -317,9 +386,21 @@ class Tools:
                 return "\n".join(result_lines)
 
             if status == "failed":
-                error = wf.get("error", "unknown error")
+                error = wf.get("error") or "unknown error"
                 result_lines.append(f"\n❌ **Workflow thất bại:** {error}")
-                return "\n".join(result_lines)
+            else:
+                # cancelled: dừng poll ngay (trước đây chỉ completed/failed mới dừng nên
+                # run đã hủy bị poll tới hết poll_max_attempts rồi báo "Timeout").
+                result_lines.append(
+                    f"\n🛑 **Workflow đã bị hủy** sau {len(completed)}/{len(roles)} bước. "
+                    f"Output các bước đã xong: `get_workflow_result('{workflow_id}')`."
+                )
+                if wf.get("error"):
+                    result_lines.append(f"Chi tiết: {wf['error']}")
+            failed_steps = wf.get("failed_steps") or []
+            if failed_steps:
+                result_lines.append(f"⚠️ Bước lỗi: {', '.join(failed_steps)}")
+            return "\n".join(result_lines)
 
         result_lines.append(
             f"\n⏰ Timeout sau {self.valves.poll_max_attempts} lần poll. "
@@ -403,7 +484,7 @@ class Tools:
         role: str | None = None,
     ) -> str:
         """
-        Lấy kết quả của một workflow đã chạy theo ID.
+        Lấy trạng thái và kết quả của một workflow theo ID (pending / running / completed / failed / cancelled).
         Có thể filter để chỉ xem output của một role cụ thể.
 
         :param workflow_id: ID của workflow (trả về từ run_sdlc_workflow)
@@ -442,6 +523,8 @@ class Tools:
                     f"Workflow status: {status} | Completed: {completed}"
                 )
             role_name = _ROLE_DESCRIPTIONS.get(role, role)
+            if role in (wf.get("failed_steps") or []):
+                return f"## {role_name} ⚠️ (bước lỗi)\n\n{step_outputs[role]}"
             return f"## {role_name}\n\n{step_outputs[role]}"
 
         # Summary of all steps
@@ -454,15 +537,16 @@ class Tools:
             f"- **Completed at:** {wf.get('completed_at', 'N/A')}",
         ]
 
-        if wf.get("error"):
-            lines.append(f"- **Error:** {wf['error']}")
+        lines.extend(_status_detail_lines(wf))
 
+        failed_steps = set(wf.get("failed_steps") or [])
         lines.append("\n---\n### Step Outputs\n")
         for r in roles:
             if r in step_outputs:
                 role_name = _ROLE_DESCRIPTIONS.get(r, r)
+                marker = " ⚠️ _(lỗi)_" if r in failed_steps else ""
                 preview = step_outputs[r][:300].replace("\n", " ")
-                lines.append(f"**{role_name}**\n{preview}...\n")
+                lines.append(f"**{role_name}**{marker}\n{preview}...\n")
             else:
                 lines.append(
                     f"**{_ROLE_DESCRIPTIONS.get(r, r)}** — _(not run)_\n")
@@ -470,7 +554,54 @@ class Tools:
         lines.append(
             f"\n💡 Dùng `get_workflow_result('{workflow_id}', role='ba')` để xem full output từng step."
         )
+        if status in ("pending", "running"):
+            lines.append(f"💡 Hủy workflow: `cancel_workflow('{workflow_id}')`.")
         return "\n".join(lines)
+
+    def cancel_workflow(self, workflow_id: str) -> str:
+        """
+        Hủy một workflow đang chờ (pending) hoặc đang chạy (running).
+        Output của các bước đã hoàn thành vẫn xem được bằng get_workflow_result.
+
+        :param workflow_id: ID của workflow cần hủy (trả về từ run_sdlc_workflow)
+        :return: Kết quả yêu cầu hủy
+        """
+        workflow_id = workflow_id.strip()
+        if not workflow_id:
+            return "❌ Thiếu workflow_id."
+        try:
+            resp = requests.post(
+                f"{self._base_url()}/workflow/{workflow_id}/cancel",
+                timeout=30,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            return self._handle_connection_error(exc)
+        except Exception as exc:
+            return f"❌ Lỗi khi hủy workflow: {exc}"
+
+        if resp.status_code == 404:
+            return f"❌ Workflow `{workflow_id}` không tìm thấy. ID có thể sai hoặc đã hết hạn."
+        if resp.status_code == 409:
+            return (
+                f"⚠️ Không hủy được workflow `{workflow_id}`: {_response_detail(resp)}\n"
+                f"(Workflow đã kết thúc — xem kết quả bằng `get_workflow_result('{workflow_id}')`.)"
+            )
+        if resp.status_code >= 400:
+            return f"❌ agent-api lỗi HTTP {resp.status_code}: {_response_detail(resp)}"
+
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        status = data.get("status", "unknown") if isinstance(data, dict) else "unknown"
+        if status == "cancelled":
+            head = f"🛑 Workflow `{workflow_id}` đã bị hủy."
+        else:
+            head = f"🛑 Đã gửi yêu cầu hủy workflow `{workflow_id}` (status hiện tại: **{status}**)."
+        return (
+            f"{head}\n"
+            f"Dùng `get_workflow_result('{workflow_id}')` để kiểm tra trạng thái và output các bước đã xong."
+        )
 
     def list_agent_roles(self) -> str:
         """
