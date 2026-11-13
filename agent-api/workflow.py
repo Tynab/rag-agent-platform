@@ -78,6 +78,15 @@ Xử lý reasoning models
     lưu vào step_outputs — chỉ giữ lại phần nội dung thực sự (kể cả block
     <think> bị cắt cụt khi chạm trần num_predict).
 
+Lỗi sinh file (artifact roles)
+-------------------------------
+    _generate_one_file() raise FileGenerationError (lỗi gọi LLM hoặc nội dung rỗng)
+    thay vì trả comment lỗi làm nội dung file. File lỗi KHÔNG được ghi thành section
+    "### FILE:" và KHÔNG tính là đã cover TL task (follow-up pass được thử lại file
+    đó một lần). Output role có thêm section FILE_GEN_ERRORS_HEADER liệt kê từng file
+    lỗi + lỗi ngắn gọn. Không file nào sinh được → output bắt đầu "[LỖI trong {role}]"
+    (app.py map tiền tố này vào failed_steps) và node ghi "error".
+
 Chống vòng lặp output
 ----------------------
     _deloop(): cắt các dòng lặp liên tiếp quá giới hạn. Phòng ngừa
@@ -985,6 +994,64 @@ def _file_section(filename: str, language: str, content: str) -> str:
     return f"\n### FILE: {filename}\n{fence}{language}\n{content}\n{fence}\n"
 
 
+class FileGenerationError(Exception):
+    """Sinh một file thất bại: lỗi gọi LLM (timeout, mất kết nối, model chưa pull...)
+    hoặc model không trả về nội dung dùng được (rỗng sau khi bóc <think>/fence).
+
+    Thay cho chuỗi "// Error generating ..." cũ — chuỗi đó từng bị lưu thành nội dung
+    file nguồn và bước vẫn được tính là thành công.
+    """
+
+    def __init__(self, filename: str, reason: str) -> None:
+        super().__init__(f"{filename}: {reason}")
+        self.filename = filename
+        self.reason = reason
+
+
+# Tiêu đề section liệt kê file sinh lỗi trong output của coding role. HỢP ĐỒNG với UI
+# (static/workflow.html) và runtime (app.py): giữ nguyên từng byte — "\u26a0\ufe0f" là
+# emoji ⚠️ (U+26A0 + variation selector U+FE0F).
+FILE_GEN_ERRORS_HEADER = "\n## \u26a0\ufe0f File generation errors\n"
+# Độ dài tối đa của mô tả lỗi mỗi file trong section trên.
+_FILE_ERR_MAX_CHARS = 200
+_FILE_DIRECTIVE_RE = re.compile(r"#+\s*FILE:", re.IGNORECASE)
+
+
+def _one_line(text: str, max_chars: int) -> str:
+    """Thu text về MỘT dòng an toàn để nhúng vào markdown của output role.
+
+    Gộp khoảng trắng/xuống dòng, thay backtick (không mở được code fence hay inline
+    code lệch cặp), vô hiệu directive "### FILE:" (artifacts.py không nhận nhầm thành
+    file), rồi cắt còn *max_chars* ký tự.
+    """
+    flat = " ".join(str(text).split()).replace("`", "'")
+    flat = _FILE_DIRECTIVE_RE.sub("FILE:", flat)
+    return flat if len(flat) <= max_chars else flat[: max_chars - 1] + "…"
+
+
+def _short_error(exc: BaseException) -> str:
+    """Mô tả lỗi ngắn gọn một dòng: "TênException: thông điệp"."""
+    msg = str(exc)
+    return _one_line(f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__, _FILE_ERR_MAX_CHARS)
+
+
+def _file_errors_section(failed: dict[str, str]) -> str:
+    """Section liệt kê file sinh lỗi (bắt đầu đúng bằng FILE_GEN_ERRORS_HEADER).
+
+    *failed*: filename → lỗi ngắn. Viết tiếng Anh vì output role là context cho
+    agent phía sau (Tech Lead, Tester, Clarifier) — Clarifier có thể đề xuất re-gen.
+    """
+    lines = [
+        "The following planned files could not be generated and were NOT saved as artifacts:",
+        "",
+    ]
+    lines += [
+        f"- `{_one_line(name, 200)}` — {_one_line(err, _FILE_ERR_MAX_CHARS)}"
+        for name, err in failed.items()
+    ]
+    return FILE_GEN_ERRORS_HEADER + "\n".join(lines) + "\n"
+
+
 def _deloop(text: str, max_repeats: int = 8) -> str:
     """Cắt ngắn các đoạn dòng lặp lại liên tiếp để giảm thiểu lỗi vòng lặp của model.
 
@@ -1213,7 +1280,8 @@ def _generate_one_file(
     để làm sạch output trước khi lưu.
 
     Trả về chuỗi nội dung file (không có code fence bao ngoài).
-    Nếu LLM call thất bại, trả về comment lỗi để không làm crash workflow.
+    Raise FileGenerationError nếu lời gọi LLM lỗi hoặc không còn nội dung dùng được
+    — caller KHÔNG được ghi file đó thành artifact.
     """
     num_ctx = _get_num_ctx(agent.model)
     # FILEGEN_THINK chỉ áp cho lời gọi sinh file; None = để model tự quyết thinking.
@@ -1245,18 +1313,26 @@ def _generate_one_file(
             )),
             HumanMessage(content=prompt),
         ])
-        _warn_if_capped(resp, agent, f"FILEGEN_NUM_PREDICT ({filename})")
-        result = str(resp.content)
-        # W3: nếu coding role dùng reasoning model, loại bỏ <think>...</think>
-        # TRƯỚC khi lưu — nếu không chain-of-thought bị ghi thẳng vào file artifact.
-        if is_reasoning_model(agent.model):
-            result = _strip_thinking(result)
-        result = _strip_code_fence(result, language, filename)   # chỉ bóc fence bọc ngoài
-        result = _deloop(result)                        # remove infinite loops
-        return result
     except Exception as exc:
         logger.warning("File gen failed for %s (%s): %s", agent.name, filename, exc)
-        return f"// Error generating {filename}: {exc}"
+        raise FileGenerationError(filename, _short_error(exc)) from exc
+    _warn_if_capped(resp, agent, f"FILEGEN_NUM_PREDICT ({filename})")
+    result = str(resp.content)
+    # W3: nếu coding role dùng reasoning model, loại bỏ <think>...</think>
+    # TRƯỚC khi lưu — nếu không chain-of-thought bị ghi thẳng vào file artifact.
+    if is_reasoning_model(agent.model):
+        result = _strip_thinking(result)
+    result = _strip_code_fence(result, language, filename)   # chỉ bóc fence bọc ngoài
+    result = _deloop(result)                        # remove infinite loops
+    if not result.strip():
+        # Rỗng: model không trả gì, hoặc chạm trần num_predict giữa lúc suy luận
+        # (_strip_thinking bỏ <think> chưa đóng) — không có gì để lưu.
+        reason = "model returned no file content"
+        if hit_token_cap(resp):
+            reason += " (hit FILEGEN_NUM_PREDICT)"
+        logger.warning("File gen empty for %s (%s): %s", agent.name, filename, reason)
+        raise FileGenerationError(filename, reason)
+    return result
 
 
 def _generate_artifacts_multi_turn(
@@ -1284,11 +1360,18 @@ def _generate_artifacts_multi_turn(
         Nếu còn TL task chưa được cover sau pha 2 → chạy follow-up pass để lên
         kế hoạch thêm file mới và sinh chúng (bỏ qua file trùng tên).
 
+    Lỗi từng file (FileGenerationError):
+        File lỗi không được ghi thành section ### FILE: và không tính là cover TL task
+        (follow-up pass có thể thử lại file đó một lần). Danh sách file còn lỗi sau cả
+        hai pha nằm trong section FILE_GEN_ERRORS_HEADER.
+
     Kết thúc:
-        Append bảng Task Completion Checklist đối chiếu mọi TL task với kết quả.
+        Append bảng Task Completion Checklist đối chiếu mọi TL task với file đã sinh.
 
     Trả về:
-        Chuỗi markdown tổng hợp với ### FILE: sections và checklist cuối.
+        Chuỗi markdown tổng hợp với ### FILE: sections, section lỗi (nếu có) và
+        checklist cuối. Nếu KHÔNG file nào sinh được: chuỗi bắt đầu
+        "[LỖI trong {role}]" kèm section lỗi.
     """
     context_summary = context[-1200:]
 
@@ -1328,24 +1411,45 @@ def _generate_artifacts_multi_turn(
     _review_roles = {"tech_lead", "devsecops"}
     ctx_snippet = context[-1500:] if role in _review_roles else ""
 
-    # Theo dõi tất cả file trên cả hai pha để dedup và tạo checklist chính xác.
-    all_files: list[dict] = list(files)
+    # generated: file sinh THÀNH CÔNG — chỉ nhóm này được tính là cover TL task
+    # (uncovered-task + checklist). failed: filename → lỗi ngắn, phản ánh trạng thái
+    # CUỐI CÙNG (file lỗi ở pha 1 mà follow-up sinh lại được thì gỡ khỏi danh sách).
+    # File lỗi không bao giờ được ghi thành section ### FILE: (artifacts.py sẽ lưu nó).
+    generated: list[dict] = []
+    failed: dict[str, str] = {}
 
-    for file_info in files:
-        filename    = file_info.get("filename", "unknown")
+    def _name(file_info: dict) -> str:
+        return str(file_info.get("filename") or "unknown")
+
+    def _generate(file_info: dict, phase: str) -> None:
+        filename    = _name(file_info)
+        # Bỏ qua file đã sinh thành công (planner liệt kê trùng tên / follow-up đề xuất
+        # lại) để tránh ghi đè và để một tên file không vừa là FILE vừa nằm trong lỗi.
+        if any(_name(f) == filename for f in generated):
+            logger.info("%s: skip duplicate file %s for role=%s", phase, filename, role)
+            return
         description = file_info.get("description", "")
         language    = file_info.get("language", "text")
-        logger.info("Generating file %s for role=%s", filename, role)
-        file_content = _generate_one_file(
-            filename, description, language, agent, ollama_base_url, tech_stack,
-            extra_instruction, ctx_snippet,
-        )
+        logger.info("%s file %s for role=%s", phase, filename, role)
+        try:
+            file_content = _generate_one_file(
+                filename, description, language, agent, ollama_base_url, tech_stack,
+                extra_instruction, ctx_snippet,
+            )
+        except FileGenerationError as exc:
+            failed[filename] = exc.reason
+            return
+        failed.pop(filename, None)
         parts.append(_file_section(filename, language, file_content))
+        generated.append(file_info)
 
-    # Pha 2 (follow-up): nếu còn TL task chưa được cover sau pha 1,
-    # lên kế hoạch thêm file mới và sinh chúng để đảm bảo coverage đầy đủ.
+    for file_info in files:
+        _generate(file_info, "Generating")
+
+    # Pha 2 (follow-up): nếu còn TL task chưa được cover sau pha 1 (kể cả task của file
+    # sinh lỗi), lên kế hoạch thêm file mới và sinh chúng để đảm bảo coverage đầy đủ.
     if tl_tasks:
-        uncovered = _find_uncovered_tasks(tl_tasks, all_files)
+        uncovered = _find_uncovered_tasks(tl_tasks, generated)
         if uncovered:
             logger.info(
                 "Role=%s: %d TL tasks uncovered after initial pass — running follow-up loop",
@@ -1361,26 +1465,38 @@ def _generate_artifacts_multi_turn(
                 role, agent, ollama_base_url, followup_input, tech_stack,
                 context_summary, extra_instruction, tl_tasks=uncovered,
             )
+            attempted: set[str] = set()
             for file_info in followup_files:
-                fname = file_info.get("filename", "")
-                # Bỏ qua file đã sinh trong pha 1 để tránh ghi đè.
-                if any(f.get("filename") == fname for f in all_files):
+                fname = _name(file_info)
+                # File LỖI ở pha 1 được thử lại đúng một lần; file đã sinh thành công
+                # bị _generate bỏ qua.
+                if fname in attempted:
                     logger.info("Follow-up skip duplicate file %s for role=%s", fname, role)
                     continue
-                description = file_info.get("description", "")
-                language    = file_info.get("language", "text")
-                logger.info("Follow-up: generating file %s for role=%s", fname, role)
-                file_content = _generate_one_file(
-                    fname, description, language, agent, ollama_base_url, tech_stack,
-                    extra_instruction, ctx_snippet,
-                )
-                parts.append(_file_section(fname, language, file_content))
-                all_files.append(file_info)
+                attempted.add(fname)
+                _generate(file_info, "Follow-up: generating")
 
-    # Thêm bảng Task Completion Checklist vào cuối output để đối chiếu
-    # mọi TL task với file đã sinh — ✅ Done, ⏳ Partial, hoặc ❌ Deferred.
+    if not generated:
+        # Không có file nào dùng được → cả bước thất bại. Tiền tố "[LỖI trong {role}]"
+        # được app.py map vào failed_steps (và không trích xuất artifact).
+        logger.error("Role=%s: tất cả %d file lên kế hoạch đều sinh lỗi", role, len(failed))
+        return (
+            f"[LỖI trong {role}] Không sinh được file nào "
+            f"({len(failed)} file lên kế hoạch đều thất bại).\n"
+            + _file_errors_section(failed)
+        )
+
+    if failed:
+        logger.warning(
+            "Role=%s: %d/%d file sinh lỗi: %s",
+            role, len(failed), len(failed) + len(generated), list(failed),
+        )
+        parts.append(_file_errors_section(failed))
+
+    # Thêm bảng Task Completion Checklist vào cuối output để đối chiếu mọi TL task
+    # với file đã sinh THÀNH CÔNG — ✅ Done, ⏳ Partial, hoặc ❌ Deferred.
     if tl_tasks:
-        parts.append(_build_task_checklist(tl_tasks, all_files))
+        parts.append(_build_task_checklist(tl_tasks, generated))
 
     return "\n".join(parts)
 
@@ -1610,6 +1726,11 @@ def _build_node(role: str):
             logger.error("Agent '%s' gặp lỗi: %s", role, exc)
             output = f"[LỖI trong {role}] {exc}"
             error_msg = f"Bước '{role}' thất bại: {exc}"
+        error_prefix = f"[LỖI trong {role}]"
+        if error_msg is None and output.startswith(error_prefix):
+            # Coding role không sinh được file nào — _generate_artifacts_multi_turn tự gắn
+            # tiền tố lỗi thay vì raise để giữ section liệt kê lỗi từng file.
+            error_msg = f"Bước '{role}' thất bại: {output.splitlines()[0][len(error_prefix):].strip()}"
 
         logger.info("Step %d | %s | output_len=%d",
                     agent.step_id, agent.name, len(output))
