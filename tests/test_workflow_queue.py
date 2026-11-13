@@ -588,3 +588,91 @@ def test_regen_loop_honours_cancel(qenv, monkeypatch):
     assert regen_calls == ["be"]
     assert ra["status"] == "cancelled" and ra["error"] == app_mod.CANCELLED_ERROR
     assert ra["step_outputs"]["be"] == "BE v2" and ra["step_outputs"]["clarifier"] == "clarifier của A"
+
+
+# ── Regen: lỗi không ghi đè output cũ; thành công gỡ khỏi failed_steps ─────────
+
+
+def test_regen_error_output_keeps_previous_output(qenv, monkeypatch):
+    qenv.use_graph(_HookGraph(("be", "clarifier")))
+    monkeypatch.setattr(app_mod, "_CLARIFIER_REGEN_LOOPS", 1)
+    monkeypatch.setattr(app_mod, "_parse_clarifier_regen_list", lambda text: ["be"])
+
+    def regen(role, **kw):
+        if role == "be":
+            return "[LỖI trong be] Không sinh được file nào (1 file lên kế hoạch đều thất bại)."
+        return "CLARIFIER v2"
+
+    monkeypatch.setattr(app_mod, "run_single_step", regen)
+    with TestClient(app_mod.app) as client:
+        A = _post(client, "A")["workflow_id"]
+        _wait_finished(A)
+        ra = _get(client, A)
+    assert ra["status"] == "completed"
+    assert ra["step_outputs"]["be"] == "be của A"          # bản cũ còn nguyên
+    assert ra["step_outputs"]["clarifier"] == "CLARIFIER v2"
+    assert "be" not in ra.get("failed_steps", [])
+
+
+def test_regen_success_clears_failed_step(qenv, monkeypatch):
+    class _FailingBe(_HookGraph):
+        def stream(self, state, stream_mode="updates"):
+            self.calls.append(state["user_input"])
+            yield {"be": {"step_outputs": {"be": "[LỖI trong be] boom"}, "completed_steps": ["be"],
+                          "error": "Bước 'be' thất bại: boom"}}
+            yield _node("clarifier", "clarifier của A")
+
+    qenv.use_graph(_FailingBe(("be", "clarifier")))
+    monkeypatch.setattr(app_mod, "_CLARIFIER_REGEN_LOOPS", 1)
+    monkeypatch.setattr(app_mod, "_parse_clarifier_regen_list", lambda text: ["be"])
+    monkeypatch.setattr(app_mod, "run_single_step", lambda role, **kw: f"{role.upper()} v2")
+    with TestClient(app_mod.app) as client:
+        A = _post(client, "A")["workflow_id"]
+        _wait_finished(A)
+        ra = _get(client, A)
+    assert ra["step_outputs"]["be"] == "BE v2"
+    assert "be" not in ra["failed_steps"]
+
+
+# ── Ghi trạng thái cuối có thử lại ─────────────────────────────────────────────
+
+
+def test_final_persist_retries_transient_store_error(qenv, monkeypatch):
+    qenv.use_graph(_HookGraph(("ba",)))
+    monkeypatch.setattr(app_mod, "_FINAL_PERSIST_DELAYS", (0.0, 0.0))
+    real_store = app_mod._store_workflow
+    failures = {"left": 0}
+
+    def flaky_store(rec):
+        if rec.status.value in ("completed", "failed", "cancelled") and failures["left"] > 0:
+            failures["left"] -= 1
+            raise RuntimeError("database is locked")
+        return real_store(rec)
+
+    monkeypatch.setattr(app_mod, "_store_workflow", flaky_store)
+    with TestClient(app_mod.app) as client:
+        failures["left"] = 2                               # 2 lần đầu lỗi, lần 3 ghi được
+        A = _post(client, "A")["workflow_id"]
+        _wait_finished(A)
+        ra = _get(client, A)
+        assert ra["status"] == "completed" and ra["completed_at"]
+        # Đã ghi xong trạng thái cuối → cancel phải 409, không đi nhánh "record mồ côi".
+        assert _cancel(client, A).status_code == 409
+    assert failures["left"] == 0
+
+
+def test_final_persist_gives_up_without_raising(qenv, monkeypatch):
+    monkeypatch.setattr(app_mod, "_FINAL_PERSIST_DELAYS", (0.0,))
+    calls = []
+
+    def always_fail(rec):
+        calls.append(rec.status.value)
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(app_mod, "_store_workflow", always_fail)
+    rec = app_mod.WorkflowRecord(
+        workflow_id="x", status="completed", project="crm", user_input="u",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    app_mod._persist_final(rec)                            # không raise
+    assert calls == ["completed", "completed"]

@@ -656,6 +656,36 @@ def _persist(record: WorkflowRecord) -> None:
         logger.warning("Ghi workflow %s vào store thất bại (non-fatal): %s", record.workflow_id, exc)
 
 
+# Ghi trạng thái cuối: thử lại vài lần (lỗi SQLite thường thoáng qua — "database is
+# locked", đĩa đầy tạm thời) trước khi bỏ cuộc. Trong lúc thử lại run vẫn ở trạng thái
+# "finishing" của hàng đợi → POST /cancel trả 409 thay vì coi record "running" cũ là mồ côi.
+_FINAL_PERSIST_DELAYS: tuple[float, ...] = (0.25, 1.0)
+
+
+def _persist_final(record: WorkflowRecord) -> None:
+    """Như _persist nhưng thử lại theo _FINAL_PERSIST_DELAYS — dùng khi chốt trạng thái cuối.
+
+    Nếu vẫn thất bại, record trong store giữ trạng thái pending/running cũ; recovery lúc
+    agent-api khởi động lại sẽ đánh dấu failed (store.INTERRUPTED_ERROR).
+    """
+    for delay in (*_FINAL_PERSIST_DELAYS, None):
+        try:
+            _store_workflow(record)
+            return
+        except Exception as exc:
+            if delay is None:
+                logger.error(
+                    "Ghi trạng thái cuối của workflow %s thất bại sau %d lần thử: %s",
+                    record.workflow_id, len(_FINAL_PERSIST_DELAYS) + 1, exc,
+                )
+                return
+            logger.warning(
+                "Ghi trạng thái cuối của workflow %s thất bại (%s) — thử lại sau %.2fs.",
+                record.workflow_id, exc, delay,
+            )
+            time.sleep(delay)
+
+
 def _load_workflow(workflow_id: str) -> WorkflowRecord | None:
     """Đọc WorkflowRecord từ SQLite store; None nếu không có hoặc dữ liệu không hợp lệ."""
     data = _get_store().get(workflow_id)
@@ -975,14 +1005,23 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
                             ollama_base_url=OLLAMA_BASE_URL,
                             rag_api_url=RAG_API_URL,
                         )
+                        if _new_output.startswith("[LỖI"):
+                            # Coding role không sinh được file nào ở lần regen → giữ output +
+                            # artifacts cũ (giống nhánh exception bên dưới) thay vì ghi đè
+                            # bản đã chạy được bằng thông báo lỗi.
+                            logger.warning(
+                                "Clarifier regen loop %d: re-gen '%s' thất bại (non-fatal), "
+                                "giữ output cũ: %s",
+                                _loop_idx + 1, _role, _new_output.splitlines()[0][:300],
+                            )
+                            continue
                         _live_outputs[_role] = _new_output
                         record.step_outputs[_role] = _new_output
+                        # Lần chạy đầu lỗi nhưng regen thành công → bước không còn là lỗi.
+                        if _role in record.failed_steps:
+                            record.failed_steps.remove(_role)
                         # Re-extract artifact nếu role này có file code — cập nhật artifacts sau re-gen.
-                        if (
-                            _role in _ARTIFACT_ROLES
-                            and _new_output
-                            and not _new_output.startswith("[LỖI")
-                        ):
+                        if _role in _ARTIFACT_ROLES and _new_output:
                             _arts = _extract_artifacts(_role, _new_output, workflow_id)
                             if _arts:
                                 record.artifacts[_role] = _arts
@@ -1051,9 +1090,9 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
                 record.status = WorkflowStatus.failed
                 record.error = ABORTED_ERROR + (f" ({type(_exc).__name__})" if _exc is not None else "")
             record.completed_at = datetime.now(timezone.utc).isoformat()
-        # Thứ tự: chốt → ghi DB → ghi log → worker trả slot. _persist không raise → không
-        # che exception gốc (nếu có).
-        _persist(record)
+        # Thứ tự: chốt → ghi DB → ghi log → worker trả slot. _persist_final không raise →
+        # không che exception gốc (nếu có).
+        _persist_final(record)
         _duration = time.monotonic() - _start
         logger.info("Workflow %s hoàn thành với status=%s",
                     workflow_id, record.status)

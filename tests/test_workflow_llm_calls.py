@@ -201,3 +201,45 @@ def test_no_cap_when_env_is_zero(monkeypatch, caps):
 ])
 def test_strip_thinking(raw, expected):
     assert workflow._strip_thinking(raw) == expected
+
+
+# ── Output rỗng sau retry → lỗi, không phải "thành công rỗng" ───────────────────
+
+
+def test_report_empty_after_retry_raises(monkeypatch, caps):
+    rec = _install(monkeypatch, "   ", "")
+    with pytest.raises(workflow.EmptyAgentOutputError, match="output rỗng"):
+        workflow._call_agent(_agent("ba", PLAIN_MODEL), "http://x", "ctx")
+    assert len(rec.prompts) == 2                     # vẫn retry một lần trước khi bỏ cuộc
+
+
+def test_report_truncated_thinking_twice_raises(monkeypatch, caps):
+    cut = SimpleNamespace(content="<think>" + "reasoning " * 50, response_metadata={"done_reason": "length"})
+    _install(monkeypatch, cut, cut)
+    with pytest.raises(workflow.EmptyAgentOutputError):
+        workflow._call_agent(_agent("ba", REASONING_MODEL), "http://x", "ctx")
+
+
+def test_report_short_but_non_empty_after_retry_is_kept(monkeypatch, caps):
+    # < 30 ký tự nhưng có nội dung → giữ nguyên (không đánh đồng với lỗi).
+    _install(monkeypatch, "", "OK")
+    assert workflow._call_agent(_agent("ba", PLAIN_MODEL), "http://x", "ctx") == "OK"
+
+
+def test_node_marks_empty_report_as_failed_step(monkeypatch, caps):
+    _install(monkeypatch, "")
+    monkeypatch.setitem(workflow.AGENTS, "ba", _agent("ba", PLAIN_MODEL))
+    result = workflow._build_node("ba")({"user_input": "Build an app", "step_outputs": {}})
+    out = result["step_outputs"]["ba"]
+    assert out.startswith("[LỖI trong ba]") and "output rỗng" in out
+    assert result["error"].startswith("Bước 'ba' thất bại:")
+    assert result["completed_steps"] == ["ba"]
+
+
+def test_artifact_fallback_empty_single_call_fails_the_step(monkeypatch, caps):
+    monkeypatch.setattr(workflow, "_plan_code_files", lambda *a, **k: [])
+    _install(monkeypatch, "")
+    with pytest.raises(workflow.EmptyAgentOutputError):
+        workflow._generate_artifacts_multi_turn(
+            "be", _agent("be", PLAIN_MODEL), "http://x", "ctx", "task", ["nestjs"],
+        )

@@ -1107,6 +1107,16 @@ class FileGenerationError(Exception):
         self.reason = reason
 
 
+class EmptyAgentOutputError(RuntimeError):
+    """Bước báo cáo (_call_agent) không nhận được nội dung nào sau cả lần gọi chính lẫn
+    lần retry — thường do chạm trần REPORT_NUM_PREDICT khi model reasoning còn đang
+    <think>, hoặc model nhỏ bị tràn context.
+
+    Raise thay vì trả "" để node LangGraph ghi "[LỖI trong {role}] ..." + error, và
+    vòng regen của Clarifier giữ nguyên output cũ thay vì ghi đè bằng chuỗi rỗng.
+    """
+
+
 # Tiêu đề section liệt kê file sinh lỗi trong output của coding role. HỢP ĐỒNG với UI
 # (static/workflow.html) và runtime (app.py): giữ nguyên từng byte — "\u26a0\ufe0f" là
 # emoji ⚠️ (U+26A0 + variation selector U+FE0F).
@@ -1685,6 +1695,9 @@ def _call_agent(
     Nếu model trả về output < 30 ký tự (thường do model nhỏ bị overflow context),
     thực hiện retry với context rút gọn 1.500 ký tự (_compact_context: giữ đề bài +
     tech stack ở đầu, lấp phần còn lại bằng đuôi context) để giảm tải.
+
+    Raise EmptyAgentOutputError nếu sau retry output vẫn rỗng (chỉ khoảng trắng) —
+    bước đó phải bị tính là lỗi, không phải "thành công với output rỗng".
     """
     num_ctx = _get_num_ctx(agent.model)
     # Trần REPORT_NUM_PREDICT áp cho cả lần gọi chính lẫn lần retry (cùng instance llm),
@@ -1720,6 +1733,11 @@ def _call_agent(
         if is_reasoning:
             result = _strip_thinking(result)
 
+    if not result.strip():
+        raise EmptyAgentOutputError(
+            f"Model {agent.model} trả về output rỗng sau 2 lần gọi "
+            "(có thể chạm trần REPORT_NUM_PREDICT khi đang suy nghĩ, hoặc tràn context)."
+        )
     return result
 
 
