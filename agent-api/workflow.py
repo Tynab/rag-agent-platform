@@ -1696,8 +1696,9 @@ def _call_agent(
     thực hiện retry với context rút gọn 1.500 ký tự (_compact_context: giữ đề bài +
     tech stack ở đầu, lấp phần còn lại bằng đuôi context) để giảm tải.
 
-    Raise EmptyAgentOutputError nếu sau retry output vẫn rỗng (chỉ khoảng trắng) —
-    bước đó phải bị tính là lỗi, không phải "thành công với output rỗng".
+    Retry rỗng mà lần đầu có nội dung (ngắn) → trả lần đầu. Raise EmptyAgentOutputError khi
+    cả hai lần đều rỗng (chỉ khoảng trắng) — bước đó phải bị tính là lỗi, không phải
+    "thành công với output rỗng".
     """
     num_ctx = _get_num_ctx(agent.model)
     # Trần REPORT_NUM_PREDICT áp cho cả lần gọi chính lẫn lần retry (cùng instance llm),
@@ -1726,12 +1727,16 @@ def _call_agent(
             "Agent '%s' (model=%s) trả về output rất ngắn (%d chars) — retry với context rút gọn.",
             agent.name, agent.model, len(result.strip()),
         )
+        first = result
         trimmed = _compact_context(context, 1_500)
         response = llm.invoke([sys_msg, HumanMessage(content=trimmed)])
         _warn_if_capped(response, agent, "REPORT_NUM_PREDICT")
         result = str(response.content)
         if is_reasoning:
             result = _strip_thinking(result)
+        # Retry rỗng nhưng lần đầu có nội dung (ngắn) → giữ lần đầu, không đánh rơi thành lỗi.
+        if not result.strip() and first.strip():
+            result = first
 
     if not result.strip():
         raise EmptyAgentOutputError(

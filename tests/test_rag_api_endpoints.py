@@ -156,8 +156,16 @@ def test_projects_lists_indexed_and_unindexed(rag, monkeypatch):
         def __init__(self, n):
             self.count = n
 
+    counted = []
+
+    def count(collection_name, exact):
+        # Qdrant thật raise khi collection không tồn tại → chỉ được gọi cho project đã ingest.
+        assert collection_name == rag_app.get_collection_name("crm"), collection_name
+        counted.append(collection_name)
+        return _Count(42)
+
     monkeypatch.setattr(rag_app, "get_projects", lambda: ["crm", "hr"])
-    rag.qdrant.count = lambda collection_name, exact: _Count(42)
+    rag.qdrant.count = count
     r = rag.client.get("/projects")
     assert r.status_code == 200
     body = r.json()
@@ -167,6 +175,7 @@ def test_projects_lists_indexed_and_unindexed(rag, monkeypatch):
     }
     # Chưa ingest → không gọi count trên collection không tồn tại.
     assert body["projects"]["hr"]["indexed"] is False and body["projects"]["hr"]["points_count"] is None
+    assert counted == [rag_app.get_collection_name("crm")]
 
 
 def test_graph_status_disabled(rag):

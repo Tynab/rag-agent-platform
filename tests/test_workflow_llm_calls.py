@@ -243,3 +243,10 @@ def test_artifact_fallback_empty_single_call_fails_the_step(monkeypatch, caps):
         workflow._generate_artifacts_multi_turn(
             "be", _agent("be", PLAIN_MODEL), "http://x", "ctx", "task", ["nestjs"],
         )
+
+
+def test_report_empty_retry_falls_back_to_short_first_reply(monkeypatch, caps):
+    rec = _install(monkeypatch, "OK done", "   ")
+    out = workflow._call_agent(_agent("ba", PLAIN_MODEL), "http://x", "ctx")
+    assert out == "OK done"                          # không đánh rơi nội dung lần đầu
+    assert len(rec.prompts) == 2

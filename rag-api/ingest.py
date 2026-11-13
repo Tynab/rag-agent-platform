@@ -746,9 +746,11 @@ class _PipelineResult:
     stale_ids: list[str] | None
     failed_batches: int = 0
     batch_error: str | None = None
-    # reset=True và collection cũ ĐÃ bị xóa/dựng lại (có batch embed thành công, hoặc project
-    # không còn chunk nào). False khi mọi batch lỗi → index cũ được giữ → graph Neo4j cũng
-    # phải giữ nguyên cho khớp.
+    # reset=True và collection cũ ĐÃ bị xóa/dựng lại (có batch EMBED thành công, hoặc project
+    # không còn chunk nào) → graph Neo4j cũng xóa/dựng lại cho khớp. False khi không batch
+    # embed nào thành công → index cũ được giữ → graph giữ nguyên. Lưu ý: gate xóa collection
+    # ngay khi embed xong, TRƯỚC upsert — embed được nhưng mọi upsert lỗi thì reset_applied
+    # vẫn True và cả hai store đều trống (failed_batches == tổng batch, points_count 0).
     reset_applied: bool = False
 
 
@@ -1011,7 +1013,8 @@ def _plan_graph_writes(
 
     - reset=True: graph của project vừa bị xóa (chỉ khi Qdrant đã dựng lại —
       _PipelineResult.reset_applied) → ghi + trích xuất toàn bộ chunk đã vào Qdrant.
-      Reset lỗi toàn bộ thì *pairs* rỗng → không ghi gì, graph cũ giữ nguyên.
+      Không batch embed nào thành công thì reset_applied=False (graph cũ không bị xóa) và
+      *pairs* rỗng → không ghi gì, graph cũ giữ nguyên.
     - Không-reset: hỏi Neo4j chunk hiện tại nào ĐÃ có node (existing_chunk_ids). Chunk
       thiếu là chunk mới/đã sửa — hoặc mọi chunk khi project chưa có graph (vd. vừa bật
       GRAPH_ENABLED) hay graph dở dang do lần ingest trước lỗi → dựng bù đủ. Chỉ chunk

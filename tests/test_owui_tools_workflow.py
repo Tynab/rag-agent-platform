@@ -250,9 +250,11 @@ def test_http_error_parts_handles_missing_response():
 
 
 def test_single_step_timeout_covers_agent_api_llm_timeout():
-    # POST /agent/{role} chỉ trả về khi bước chạy xong: ít nhất 1–2 lời gọi LLM, mỗi lời gọi
-    # tới OLLAMA_REQUEST_TIMEOUT (1200s ở profile mặc định) → Valve không được thấp hơn
-    # 2 lần giá trị đó, nếu không tool bỏ cuộc trong khi agent-api vẫn chiếm slot Ollama.
+    # POST /agent/{role} chỉ trả về khi bước chạy xong (1–2 lời gọi LLM, bước code nhiều hơn).
+    # OLLAMA_REQUEST_TIMEOUT (1200s ở profile mặc định) chỉ chặn thời gian tới token đầu /
+    # khoảng lặng giữa hai chunk, không chặn tổng thời gian → đây là SÀN tối thiểu (2 × 1200),
+    # không phải bảo đảm tool luôn chờ đủ; mô tả Valve phải nói rõ điều đó.
     field = tool_mod.Tools.Valves.model_fields["timeout"]
     assert field.default >= 2 * 1200
     assert "OLLAMA_REQUEST_TIMEOUT" in field.description
+    assert "KHÔNG chặn tổng thời gian" in field.description

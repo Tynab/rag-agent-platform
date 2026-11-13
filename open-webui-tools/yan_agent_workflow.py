@@ -29,8 +29,11 @@ Valves (biến cấu hình)
                            docker network connect rag-agent-platform_yan <container>
 
     timeout            Timeout (giây) cho mỗi single-step agent call (run_agent_step).
-                       Mặc định: 3600 giây — ≥ 2 × OLLAMA_REQUEST_TIMEOUT (1200) của
-                       agent-api, vì một bước gọi LLM ít nhất 1–2 lần.
+                       Mặc định: 3600 giây — ước lượng, không phải giới hạn trên:
+                       OLLAMA_REQUEST_TIMEOUT (1200) của agent-api chỉ chặn thời gian tới
+                       token đầu / khoảng lặng giữa hai chunk, không chặn tổng thời gian
+                       một lời gọi; một bước gọi LLM 1–2 lần (bước code nhiều hơn).
+                       Profile .env nặng hơn → nâng giá trị này.
 
     poll_interval      Khoảng cách (giây) giữa các lần poll trạng thái workflow.
                        Mặc định: 15 giây.
@@ -203,11 +206,14 @@ class Tools:
         timeout: int = Field(
             default=3600,
             description=(
-                "Timeout cho single-step request run_agent_step (giây). Full workflow dùng "
-                "polling. Một bước báo cáo gọi LLM 1–2 lần, mỗi lần tới OLLAMA_REQUEST_TIMEOUT "
-                "của agent-api (mặc định 1200s); bước code (be/fe/...) gọi planner + từng file "
-                "→ có thể lâu hơn nhiều. Bỏ cuộc sớm thì agent-api vẫn chạy tiếp và giữ slot "
-                "Ollama duy nhất. Bước code dài nên dùng run_sdlc_workflow."
+                "Timeout cho single-step request run_agent_step (giây) — mức ước lượng, không "
+                "phải giới hạn trên. Full workflow dùng polling. OLLAMA_REQUEST_TIMEOUT của "
+                "agent-api (mặc định 1200s) chỉ chặn thời gian tới token đầu và khoảng lặng giữa "
+                "hai chunk, KHÔNG chặn tổng thời gian một lời gọi; một bước báo cáo gọi LLM 1–2 "
+                "lần, bước code (be/fe/...) gọi planner + từng file → có thể lâu hơn nhiều. Profile "
+                ".env nặng hơn (OLLAMA_REQUEST_TIMEOUT 1800–3600, model reasoning) → nâng Valve. "
+                "Bỏ cuộc sớm thì agent-api vẫn chạy tiếp và giữ slot Ollama duy nhất. Bước code "
+                "dài nên dùng run_sdlc_workflow."
             ),
         )
         poll_interval: int = Field(

@@ -757,3 +757,31 @@ def test_cancel_during_final_persist_retry_is_409(qenv, monkeypatch):
         _wait_finished(A)
         ra = _get(client, A)
     assert ra["status"] == "completed"
+
+
+def test_unloadable_run_final_write_is_retried(qenv, monkeypatch):
+    qenv.use_graph(_HookGraph(("ba",)))
+    monkeypatch.setattr(app_mod, "_FINAL_PERSIST_DELAYS", (0.0, 0.0))
+    real_load, real_store = app_mod._load_workflow, app_mod._store_workflow
+    fails = {"left": 2}
+
+    def load(wid):
+        rec = real_load(wid)
+        if threading.current_thread().name.startswith("workflow-worker"):
+            return None                                    # worker không đọc được record
+        return rec
+
+    def flaky_store(rec):
+        if rec.error == app_mod.UNLOADABLE_ERROR and fails["left"] > 0:
+            fails["left"] -= 1
+            raise RuntimeError("database is locked")
+        return real_store(rec)
+
+    monkeypatch.setattr(app_mod, "_load_workflow", load)
+    monkeypatch.setattr(app_mod, "_store_workflow", flaky_store)
+    with TestClient(app_mod.app) as client:
+        A = _post(client, "A")["workflow_id"]
+        _wait_finished(A)
+        ra = _get(client, A)
+    assert fails["left"] == 0                              # 2 lần lỗi, lần 3 ghi được
+    assert ra["status"] == "failed" and ra["error"] == app_mod.UNLOADABLE_ERROR

@@ -274,7 +274,8 @@ def save_entities(chunk_id: str, entities: list[dict], project: str) -> None:
 def delete_project_graph(project: str) -> None:
     """
     Xóa tất cả Neo4j node của một project.
-    Được gọi trước reset-ingest để đồng bộ đồ thị với Qdrant.
+    Được ingest._ingest_project gọi khi reset, SAU pipeline embed/upsert và chỉ khi Qdrant đã
+    thật sự dựng lại (_PipelineResult.reset_applied) — giữ đồ thị đồng bộ với Qdrant.
     """
     driver = get_driver()
     with driver.session(database=NEO4J_DATABASE) as session:

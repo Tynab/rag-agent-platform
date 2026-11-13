@@ -728,7 +728,7 @@ Chạy đồng bộ một agent đơn lẻ. Hữu ích để test từng role ho
 | `200` | Bước chạy xong. Với coding role (`fe`, `be`, ...) không sinh được file nào, `output` bắt đầu bằng `[LỖI trong <role>]` kèm section `## ⚠️ File generation errors` liệt kê lỗi từng file — kiểm tra tiền tố này |
 | `404` | `role` không tồn tại |
 | `422` | Body không hợp lệ (vd. `user_input` rỗng) |
-| `500` | Lỗi LLM (timeout, mất kết nối, model chưa pull) hoặc agent báo cáo trả về output rỗng sau cả lần retry — `detail` chứa lý do |
+| `500` | Lỗi LLM (timeout, mất kết nối, model chưa pull), hoặc output rỗng sau cả lần retry — ở agent báo cáo, và ở coding role khi planner không lập được kế hoạch file nên rơi về một lời gọi đơn — `detail` chứa lý do |
 
 **Request body:**
 
@@ -1188,7 +1188,7 @@ Project không có file hỗ trợ trả `"status": "empty"`.
 
 ### POST /reset-ingest
 
-Embed lại và dựng lại collection từ đầu (tương đương `POST /ingest` với `"reset": true`) — cho tất cả project, hoặc một project nếu truyền `project`. Collection Qdrant cũ chỉ bị xóa khi batch embed thật đầu tiên thành công, nên chạy lúc Ollama đang lỗi không làm mất index vector. Graph Neo4j của project theo cùng quy tắc: chỉ bị xóa (rồi dựng lại từ các chunk đã có vector) khi Qdrant thật sự đã dựng lại; reset lỗi toàn bộ thì graph cũ giữ nguyên. Xem `failed_batches` / `batch_error` trong response.
+Embed lại và dựng lại collection từ đầu (tương đương `POST /ingest` với `"reset": true`) — cho tất cả project, hoặc một project nếu truyền `project`. Collection Qdrant cũ chỉ bị xóa khi batch embed thật đầu tiên thành công, nên chạy lúc Ollama đang lỗi không làm mất index vector. Graph Neo4j của project theo cùng quy tắc: chỉ bị xóa (rồi dựng lại từ các chunk đã có vector) khi Qdrant thật sự đã dựng lại; không batch embed nào thành công (Ollama down, `EMBEDDING_MODEL` chưa pull) thì cả index Qdrant lẫn graph cũ giữ nguyên. Lưu ý: nếu embed thành công nhưng **upsert** vào Qdrant lỗi ở mọi batch, collection đã bị dựng lại nên cả Qdrant lẫn graph đều trống — kiểm tra `failed_batches` / `batch_error` và `points_count` trong response.
 
 ```bash
 # Reset và ingest lại toàn bộ
@@ -1516,7 +1516,7 @@ Tìm thông tin về billing schema trong project yanlib, module billing
 |---|---|---|
 | `agent_api_url` | `http://agent-api:8091` | URL agent-api — tên service trong compose (xem lưu ý ở [Cài đặt](#cài-đặt)) |
 | `block_until_complete` | `false` | `false` = `run_sdlc_workflow` trả `workflow_id` ngay; `true` = poll đồng bộ tới khi kết thúc (có thể 30+ phút, dễ vượt timeout proxy/browser) |
-| `timeout` | `3600` | Timeout cho single-step request `run_agent_step` (giây). Một bước báo cáo gọi LLM 1–2 lần, mỗi lần tới `OLLAMA_REQUEST_TIMEOUT` của agent-api (1200); bước code gọi planner + từng file nên có thể lâu hơn — dùng `run_sdlc_workflow` cho bước code dài. Tool bỏ cuộc sớm thì agent-api vẫn chạy tiếp và giữ slot Ollama |
+| `timeout` | `3600` | Timeout cho single-step request `run_agent_step` (giây) — mức ước lượng, **không** phải giới hạn trên: `OLLAMA_REQUEST_TIMEOUT` (1200) chỉ chặn thời gian tới token đầu và khoảng lặng giữa hai chunk, không chặn tổng thời gian một lời gọi (xem [mục 7](#7-biến-môi-trường-chi-tiết)); một bước báo cáo gọi LLM 1–2 lần, bước code gọi planner + từng file nên có thể lâu hơn — dùng `run_sdlc_workflow` cho bước code dài. Với profile `.env` nặng hơn (`OLLAMA_REQUEST_TIMEOUT` 1800–3600, model reasoning), nâng Valve tương ứng. Tool bỏ cuộc sớm thì agent-api vẫn chạy tiếp và giữ slot Ollama |
 | `poll_interval` | `15` | Khoảng cách poll workflow status (giây) |
 | `poll_max_attempts` | `120` | Số poll tối đa trước khi timeout (120 × 15s = 30 phút) |
 | `rag_enabled` | `true` | Query RAG mỗi agent step |
