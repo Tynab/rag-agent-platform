@@ -379,6 +379,7 @@ function snap() {
     }
     else if (op === 'confirm') confirmAnswer = arg;
     else if (op === 'cancel') { ctx.requestCancel(); await flush(); }
+    else if (op === 'retry') { ctx.pollNow(); await flush(); }   // nút "Thử lại ngay"
     else if (op === 'tab') ctx.selectTab(arg);
     else if (op === 'eval') out.push(run(arg));
     else if (op === 'snap') out.push(snap());
@@ -572,6 +573,29 @@ def test_transient_errors_keep_view_back_off_and_recover():
     assert "HTTP 502" in e502["bannerText"] and "không kết nối được" in enet["bannerText"]
     assert ok["banner"] == "none" and ok["timers"] == [2500]
     assert "retry" not in ok["pollCls"].split() and ok["pollText"] == "Polling…"
+
+
+def test_retry_now_skips_backoff_timer():
+    res = _run_sm(
+        [["track", "wf-1"], ["tick"], ["tick"], ["snap"], ["retry"], ["snap"]],
+        [_ok(_RUNNING), {"status": 500}, {"status": 502}, _ok(_RUNNING)],
+    )
+    waiting, recovered = res["out"]
+    assert waiting["timers"] == [5000] and waiting["banner"] == ""
+    assert recovered["fetches"] == waiting["fetches"] + 1   # không chờ hết 5s
+    assert recovered["timers"] == [2500] and recovered["banner"] == "none"
+
+
+def test_render_error_is_not_treated_as_connection_loss():
+    """Lỗi render (dữ liệu lạ / bug UI) báo ở err-box, giữ view, poll nhịp thường — không banner/backoff."""
+    res = _run_sm(
+        [["track", "wf-1"], ["tick"], ["snap"], ["tick"], ["snap"]],
+        [_ok(_RUNNING), _ok({**_RUNNING, "completed_steps": 5}), _ok(_RUNNING)],
+    )
+    bad, ok = res["out"]
+    assert bad["view"] == "block" and bad["errBox"] == "block" and "Lỗi hiển thị" in bad["errText"]
+    assert bad["banner"] == "none" and bad["timers"] == [2500]
+    assert ok["errBox"] == "none"
 
 
 def test_404_is_fatal_and_visibility_does_not_resurrect_polling():

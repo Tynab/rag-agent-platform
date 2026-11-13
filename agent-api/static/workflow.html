@@ -681,6 +681,11 @@
       .header     { height: auto; min-height: 56px; flex-wrap: wrap; row-gap: 8px; padding-top: 10px; padding-bottom: 10px; }
       .logo       { flex: 1 1 0; min-width: 0; max-width: none; }  /* co + ellipsis thay vì đẩy sang hàng thứ 3 */
       .search-row { order: 1; flex: 1 1 100%; max-width: none; }
+      /* Có nút hủy: [badge … nút hủy] / [meta cả hàng] / [ghi chú] — nếu không, meta bị ép
+         thành một cột hẹp giữa badge và nút, mỗi mục một dòng */
+      .status-bar.has-actions .status-actions { order: 1; }
+      .status-bar.has-actions .status-meta    { order: 2; flex-basis: 100%; }
+      .status-bar.has-actions .status-note    { order: 3; }
     }
     @media (max-width: 480px) {
       .header       { padding-left: 12px; padding-right: 12px; column-gap: 8px; }
@@ -1029,7 +1034,9 @@ async function fetchAndUpdate() {
     schedulePoll(pollAgain ? 0 : POLL_MS);
     // Tải artifact metadata trong khi chạy (mỗi khi có role mới hoàn thành)
     const _artifactRoles = new Set(['fe','mobile','be','dba','devsecops','tech_lead','da']);
-    const _completedArt  = (data.completed_steps || []).filter(r => _artifactRoles.has(r));
+    // Array.isArray: dữ liệu lạ ở đây không được ném (ngoài try → unhandled rejection)
+    const _completedArt  = (Array.isArray(data.completed_steps) ? data.completed_steps : [])
+      .filter(r => _artifactRoles.has(r));
     if (_completedArt.some(r => !(r in artifactsCache))) {
       loadArtifacts(id);
     }
@@ -1223,6 +1230,7 @@ function renderCancelUi() {
   const st  = cancelBtnState(lastData);
   const btn = document.getElementById('cancel-btn');
   btn.style.display = st.show ? '' : 'none';
+  document.getElementById('status-bar').classList.toggle('has-actions', st.show);
   if (btn.disabled !== st.disabled) btn.disabled = st.disabled;
   setText(btn, st.label);
 
