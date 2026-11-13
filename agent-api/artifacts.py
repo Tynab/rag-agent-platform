@@ -18,6 +18,12 @@ Layout thư mục artifact
         Dockerfile
         ...
 
+Mỗi lần trích xuất (lần chạy đầu hoặc Clarifier re-gen một role) XÓA SẠCH thư mục
+{workflow_id}/{role}/ trước khi ghi — file của lần sinh trước mà lần này không còn
+sinh ra sẽ không "sống sót" trong danh sách artifact. Chỉ xóa bên trong đúng thư mục
+role đã resolve (sâu đúng 2 cấp dưới ARTIFACT_BASE, không phải symlink) — xem
+_reset_role_dir().
+
 Thứ tự ưu tiên nhận diện tên file trong markdown
 -------------------------------------------------
 1. Directive có cấu trúc (ưu tiên cao nhất):
@@ -25,7 +31,8 @@ Thứ tự ưu tiên nhận diện tên file trong markdown
        ```typescript
        ...
        ```
-   Agent được yêu cầu dùng định dạng này trong system prompt.
+   Agent được yêu cầu dùng định dạng này trong system prompt. Trang trí Markdown
+   quanh đường dẫn (### FILE: `src/a.ts`, ### FILE: **src/a.ts**) được bóc bỏ.
    Ranh giới code block được xác định bằng find_fenced_blocks() (fence-aware
    theo CommonMark): file chứa fence nội bộ (```bash trong ARCHITECTURE.md)
    được bọc bằng fence dài hơn (````markdown) và được trích xuất nguyên vẹn.
@@ -45,8 +52,10 @@ Thứ tự ưu tiên nhận diện tên file trong markdown
 
 4. Fallback — đặt tên tự động:
    Khi không tìm được tên file từ bất kỳ pattern nào, file được đặt tên
-   theo ngôn ngữ và index: typescript-01.ts, python-02.py, yaml-03.yml...
-   Dockerfile được xử lý đặc biệt (không có extension).
+   theo ngôn ngữ và index: typesc-01.ts, python-02.py, yaml-03.yml...
+   Dockerfile được xử lý đặc biệt (không có extension): block đầu tiên là
+   "Dockerfile", các block sau "Dockerfile.02", "Dockerfile.03"... Tên tự động
+   không bao giờ trùng file đã lưu (block thứ hai không bị dedupe bỏ mất).
 
 Bảo mật đường dẫn
 -----------------
@@ -69,8 +78,9 @@ Hằng số xuất khẩu
 Lưu ý
 -----
 Mọi exception trong quá trình trích xuất đều được bắt và ghi log warning
-— không làm dừng workflow chính. _output.md luôn được ghi trước, đảm bảo
-output thô không bao giờ bị mất dù trích xuất file code thất bại.
+— không làm dừng workflow chính. _output.md được ghi NGAY sau khi dọn thư mục
+role (trước mọi file code), đảm bảo output thô không bao giờ bị mất dù trích
+xuất file code thất bại; file code nào tự đặt tên "_output.md" bị bỏ qua.
 """
 from __future__ import annotations
 
@@ -78,6 +88,8 @@ import logging
 import os
 import posixpath
 import re
+import shutil
+from collections.abc import Container
 from pathlib import Path
 from typing import NamedTuple
 
@@ -122,6 +134,10 @@ _LANG_EXT: dict[str, str] = {
 # định (F4: regex lazy cũ `(.*?)```` cắt file ở ``` đầu tiên — kể cả ```bash lồng bên
 # trong ARCHITECTURE.md — phần còn lại bị lưu nhầm thành text-01.txt).
 _FILE_HDR_RE = re.compile(r"###\s+FILE:\s*(.+?)\s*$")
+
+# Ký tự trang trí Markdown LLM hay bọc quanh đường dẫn trong directive ### FILE:
+# (`src/a.ts`, **src/a.ts**, "src/a.ts"). KHÔNG gồm '_' — "__init__.py" là tên thật.
+_HDR_DECORATION = "`*\"' \t"
 
 # Dòng fence theo CommonMark: thụt lề tối đa 3 space, >= 3 backtick hoặc tilde, rồi info string.
 _FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
@@ -176,17 +192,55 @@ def _safe_segment(seg: str) -> str:
     return cleaned
 
 
+def _strip_hdr_decoration(raw: str) -> str:
+    """Bóc trang trí Markdown bao quanh đường dẫn bắt được từ directive ### FILE:.
+
+    "### FILE: `src/a.ts`" / "### FILE: **src/a.ts**" → "src/a.ts". Nếu không bóc,
+    _sanitize_relpath() biến backtick/dấu sao thành '_' → file lưu thành "_src/a.ts_".
+    Chỉ bóc ở hai đầu (backtick, dấu sao, dấu nháy, khoảng trắng) — không đụng '_'.
+    """
+    return raw.strip(_HDR_DECORATION)
+
+
 def _ext_for_lang(lang: str) -> str:
     v = _LANG_EXT.get(lang.lower(), lang.lower() or "txt")
     return "Dockerfile" if v == "__dockerfile__" else (v or "txt")
 
 
-def _default_name(lang: str, idx: int) -> str:
+def _default_name(lang: str, idx: int, taken: Container[str] = frozenset()) -> str:
+    """Tên file tự động cho code block không tìm được tên, KHÔNG trùng tên nào trong *taken*.
+
+    *taken* là tập đường dẫn đã lưu (seen của _do_extract) — _save() bỏ qua tên trùng,
+    nên tên tự động trùng nghĩa là block bị mất lặng lẽ. Dockerfile: block đầu tiên giữ
+    tên chuẩn "Dockerfile", các block sau thành "Dockerfile.{idx:02d}" (quy ước
+    Dockerfile.* mà docker build -f / BuildKit nhận ra). Ngôn ngữ khác:
+    "{lang[:6]}-{idx:02d}.{ext}"; nếu vẫn trùng thì tăng index tới khi không trùng.
+    """
     ext = _ext_for_lang(lang)
     if ext == "Dockerfile":
-        return "Dockerfile"
-    prefix = lang[:6] if lang else "file"
-    return f"{prefix}-{idx:02d}.{ext}"
+        if "Dockerfile" not in taken:
+            return "Dockerfile"
+        pattern = "Dockerfile.{:02d}"
+    else:
+        prefix = lang[:6] if lang else "file"
+        pattern = prefix + "-{:02d}." + ext
+    n = idx
+    while pattern.format(n) in taken:
+        n += 1
+    return pattern.format(n)
+
+
+def _path_language(name: str) -> str:
+    """Ngôn ngữ hiển thị của một file artifact trên disk, suy từ tên file.
+
+    Dockerfile không có extension (hoặc Dockerfile.02 do _default_name đặt) →
+    "dockerfile"; còn lại tra _LANG_EXT theo extension như trước.
+    """
+    lower = name.lower()
+    if lower == "dockerfile" or lower.startswith("dockerfile.") or lower.endswith(".dockerfile"):
+        return "dockerfile"
+    ext = posixpath.splitext(name)[1].lstrip(".")
+    return _LANG_EXT.get(ext, ext or "text")
 
 
 # ── Quét fenced code block (fence-aware, dùng chung với workflow.py) ────────────
@@ -284,13 +338,63 @@ def extract_and_save(role: str, output: str, workflow_id: str) -> list[dict]:
         return []
 
 
-def _do_extract(role: str, output: str, workflow_id: str) -> list[dict]:
-    base = Path(ARTIFACT_BASE) / workflow_id / role
-    base.mkdir(parents=True, exist_ok=True)
-    base_resolved = base.resolve()  # compute once; passed to every _save call
+def _reset_role_dir(base: Path) -> Path:
+    """Tạo (nếu chưa có) rồi XÓA SẠCH nội dung thư mục artifact của một role.
 
-    artifacts: list[dict] = []
-    seen: set[str] = set()
+    Gọi mỗi lần trích xuất: app.py gọi extract_and_save đúng một lần cho mỗi role mỗi
+    lần (re-)generate (sau node trong stream chính, và sau mỗi lần Clarifier re-gen
+    role đó) — output mới là bộ file ĐẦY ĐỦ của role, nên file cũ không còn sinh ra
+    phải biến mất thay vì tiếp tục hiện trong danh sách artifact.
+
+    An toàn khi xóa (raise ValueError → extract_and_save bắt và ghi warning, không xóa gì):
+    - *base* không được là symlink (không theo symlink ra ngoài để xóa).
+    - Đường dẫn đã resolve phải nằm sâu ĐÚNG 2 cấp dưới ARTIFACT_BASE đã resolve
+      ({workflow_id}/{role}) — không bao giờ xóa ARTIFACT_BASE hay thư mục workflow.
+    - Chỉ xóa phần tử con: file và symlink bị unlink (KHÔNG theo symlink — đích ở ngoài
+      còn nguyên), thư mục thật bị rmtree. Lỗi từng phần tử chỉ ghi warning.
+
+    Trả về đường dẫn đã resolve của thư mục role (dùng cho check confinement của _save).
+    """
+    root = Path(ARTIFACT_BASE).resolve()
+    if base.is_symlink():
+        raise ValueError(f"artifact role dir là symlink, từ chối ghi/xóa: {base}")
+    base.mkdir(parents=True, exist_ok=True)
+    resolved = base.resolve()
+    try:
+        depth = len(resolved.relative_to(root).parts)
+    except ValueError:
+        depth = -1
+    if depth != 2:
+        raise ValueError(f"artifact role dir nằm ngoài {root}/<workflow>/<role>: {resolved}")
+    for child in resolved.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError as exc:
+            logger.warning("Không xóa được artifact cũ %s: %s", child, exc)
+    return resolved
+
+
+def _do_extract(role: str, output: str, workflow_id: str) -> list[dict]:
+    # Sanitize từng segment như list_artifacts/read_artifact — cùng thư mục, và an toàn
+    # cho bước xóa của _reset_role_dir dù caller truyền workflow_id lạ.
+    base = Path(ARTIFACT_BASE) / _safe_segment(workflow_id) / _safe_segment(role)
+    base_resolved = _reset_role_dir(base)  # compute once; passed to every _save call
+
+    # Ghi output thô dưới dạng _output.md TRƯỚC mọi file code: đây là bản gốc đầy đủ
+    # không qua xử lý (app.py khôi phục step_outputs từ file này) — trích xuất file code
+    # lỗi giữa chừng cũng không làm mất nó. "_output.md" vào seen để file code nào tự
+    # đặt tên trùng không ghi đè lên.
+    (base_resolved / "_output.md").write_text(output, encoding="utf-8")
+    artifacts: list[dict] = [{
+        "path": f"{role}/_output.md",
+        "filename": "_output.md",
+        "language": "markdown",
+        "size": len(output.encode("utf-8")),
+    }]
+    seen: set[str] = {"_output.md"}
 
     # Chỉ xét block cấp ngoài cùng — fence lồng bên trong (```bash trong ARCHITECTURE.md)
     # là nội dung của file, không phải file riêng.
@@ -306,11 +410,11 @@ def _do_extract(role: str, output: str, workflow_id: str) -> list[dict]:
         structured.add(i)
         if not b.body.strip():
             continue
-        rel = _sanitize_relpath(m.group(1))
+        rel = _sanitize_relpath(_strip_hdr_decoration(m.group(1)))
         _save(base, base_resolved, role, rel, b.body, b.lang or "text", artifacts, seen)
 
     # ── Pass 2: code block tự do (dự phòng khi không có ### FILE: directive) ─────────────
-    counter = [0]
+    counter = 0
     for i, b in enumerate(blocks):
         if i in structured:
             continue
@@ -337,22 +441,13 @@ def _do_extract(role: str, output: str, workflow_id: str) -> list[dict]:
                 filename = m3.group(1).strip()
 
         if not filename:
-            counter[0] += 1
-            filename = _default_name(lang, counter[0])
+            counter += 1
+            # Tên tự động không được trùng file đã lưu (Dockerfile thứ hai, hay tên
+            # trùng file có directive) — _save() bỏ qua tên trùng, block sẽ mất lặng lẽ.
+            filename = _default_name(lang, counter, seen)
 
         rel = _sanitize_relpath(filename)
         _save(base, base_resolved, role, rel, save_content, lang, artifacts, seen)
-
-    # ── Luôn lưu toàn bộ output thô dưới dạng _output.md ──────────────────────────────
-    # Đây là bản gốc đầy đủ không qua xử lý — đảm bảo output không bao giờ bị mất.
-    md_path = base / "_output.md"
-    md_path.write_text(output, encoding="utf-8")
-    artifacts.insert(0, {
-        "path": f"{role}/_output.md",
-        "filename": "_output.md",
-        "language": "markdown",
-        "size": len(output.encode("utf-8")),
-    })
 
     logger.info(
         "Artifacts — workflow=%s role=%s: %d files", workflow_id, role, len(artifacts)
@@ -421,11 +516,10 @@ def list_artifacts(workflow_id: str) -> dict[str, list[dict]]:
             if not f.is_file():
                 continue
             rel  = f.relative_to(role_dir).as_posix()
-            ext  = f.suffix.lstrip(".")
             files.append({
                 "path": f"{role_dir.name}/{rel}",
                 "filename": rel,
-                "language": _LANG_EXT.get(ext, ext or "text"),
+                "language": _path_language(f.name),
                 "size": f.stat().st_size,
             })
         if files:
@@ -459,6 +553,4 @@ def read_artifact(workflow_id: str, role: str, rel_path: str) -> tuple[str, str]
     if not path.exists() or not path.is_file():
         return None
     content = path.read_text(encoding="utf-8", errors="replace")
-    ext  = path.suffix.lstrip(".")
-    lang = _LANG_EXT.get(ext, ext or "text")
-    return content, lang
+    return content, _path_language(path.name)
