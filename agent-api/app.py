@@ -123,6 +123,7 @@ Bộ nhớ và giới hạn
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -314,6 +315,10 @@ class WorkflowStatus(str, Enum):
 _TERMINAL_STATUSES = frozenset({WorkflowStatus.completed, WorkflowStatus.failed, WorkflowStatus.cancelled})
 # Lỗi gán cho run bị hủy (cả lúc đang chờ lẫn đang chạy).
 CANCELLED_ERROR = "Đã hủy theo yêu cầu người dùng"
+# Lỗi gán cho run mà worker không đọc được record (lỗi SQLite / dữ liệu hỏng) — không node nào chạy.
+UNLOADABLE_ERROR = "Không đọc được bản ghi workflow từ store — workflow không được chạy"
+# Lỗi gán cho run thoát bất thường (BaseException lọt qua `except Exception` của runner).
+ABORTED_ERROR = "Workflow dừng bất thường do lỗi hệ thống"
 
 
 class WorkflowRecord(BaseModel):
@@ -752,6 +757,39 @@ def _mark_cancelled(record: WorkflowRecord) -> None:
     record.completed_at = datetime.now(timezone.utc).isoformat()
 
 
+def _finish_unloadable_run(workflow_id: str, req: WorkflowRunRequest, queue: _WorkflowRunQueue) -> None:
+    """Chốt trạng thái cuối cho run mà worker không đọc được record — không node nào chạy.
+
+    Không để run kẹt "pending" mãi mãi (UI / Open WebUI poll vô hạn, yêu cầu hủy đã trả 200
+    không bao giờ thành cancelled): dựng record tối thiểu từ *req*, chốt bằng queue.decide()
+    như run thường (đã có yêu cầu hủy ⇒ cancelled, ngược lại failed với UNLOADABLE_ERROR),
+    rồi ghi best-effort vào store và JSONL.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    record = WorkflowRecord(
+        workflow_id=workflow_id,
+        status=WorkflowStatus.failed,
+        project=req.project,
+        user_input=_sanitize_input(req.user_input),
+        tech_stack=req.tech_stack,
+        error=UNLOADABLE_ERROR,
+        created_at=now,
+        completed_at=now,
+    )
+    if queue.decide(workflow_id):
+        _mark_cancelled(record)
+    _persist(record)
+    _log_workflow_run(
+        workflow_id=workflow_id,
+        project=record.project,
+        user_input=record.user_input,
+        completed_steps=record.completed_steps,
+        status=record.status.value,
+        error=record.error,
+        duration_seconds=0.0,
+    )
+
+
 def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _WorkflowRunQueue) -> None:
     """Thực thi toàn bộ SDLC LangGraph workflow và cập nhật WorkflowRecord.
 
@@ -770,14 +808,19 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
     được nên node hiện tại luôn chạy nốt. Trạng thái cuối được chốt bằng queue.decide()
     dưới lock: yêu cầu hủy đã được chấp nhận trước thời điểm đó luôn cho kết quả
     cancelled, kể cả khi nó đến lúc node cuối đang chạy.
+
+    Mọi đường thoát đều chốt một trạng thái cuối: không đọc được record ⇒ failed (không chạy
+    node nào); BaseException (không phải Exception) ⇒ failed với ABORTED_ERROR rồi vẫn được
+    ném tiếp cho worker ghi log — record không bao giờ kẹt pending/running.
     """
     try:
         record = _load_workflow(workflow_id)
     except Exception:
         logger.exception("Workflow %s: không đọc được record từ store", workflow_id)
-        return
+        record = None
     if record is None:
-        logger.warning("Workflow %s: không có record hợp lệ trong store — bỏ qua.", workflow_id)
+        logger.warning("Workflow %s: không có record hợp lệ trong store — không chạy, chốt failed.", workflow_id)
+        _finish_unloadable_run(workflow_id, req, queue)
         return
     if record.status in _TERMINAL_STATUSES:
         # Phòng thủ: record đã kết thúc (đã hủy / recovery) thì không bao giờ chạy lại.
@@ -1001,6 +1044,12 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
         if queue.decide(workflow_id):
             _mark_cancelled(record)
         else:
+            if record.status not in _TERMINAL_STATUSES:
+                # Chỉ xảy ra khi BaseException lọt qua `except Exception` ở trên (đang được ném
+                # tiếp): không ghi 'running' kèm completed_at — run sẽ không bao giờ tiếp tục.
+                _exc = sys.exc_info()[1]
+                record.status = WorkflowStatus.failed
+                record.error = ABORTED_ERROR + (f" ({type(_exc).__name__})" if _exc is not None else "")
             record.completed_at = datetime.now(timezone.utc).isoformat()
         # Thứ tự: chốt → ghi DB → ghi log → worker trả slot. _persist không raise → không
         # che exception gốc (nếu có).
