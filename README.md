@@ -26,6 +26,7 @@
 16. [Vận hành Docker](#16-vận-hành-docker)
 17. [Troubleshooting](#17-troubleshooting)
 18. [Danh mục URL dịch vụ](#18-danh-mục-url-dịch-vụ)
+19. [Phát triển, test & CI](#19-phát-triển-test--ci)
 
 ---
 
@@ -1073,6 +1074,7 @@ curl -s http://localhost:8090/health | jq
   "embedding_model": "qwen3-embedding:8b",
   "chat_model": "qwen3.6:35b",
   "rag_top_k": 5,
+  "ollama_request_timeout": 600.0,
   "graph": {
     "enabled": true,
     "neo4j_uri": "bolt://neo4j:7687",
@@ -1081,6 +1083,8 @@ curl -s http://localhost:8090/health | jq
   }
 }
 ```
+
+`ollama_request_timeout`: timeout (giây) mỗi lần gọi `CHAT_MODEL` — dùng để căn Valve `timeout` của tool [`yan_knowledge_base`](#tool-1-yan_knowledge_basepy--hỏi-đáp-tài-liệu-nội-bộ) (phải lớn hơn giá trị này).
 
 ### GET /projects
 
@@ -1110,13 +1114,18 @@ curl -s http://localhost:8090/projects | jq
 
 ### POST /ingest
 
-Ingest tài liệu vào Qdrant (+ Neo4j nếu `GRAPH_ENABLED=true`). Idempotent — chạy lại không tạo bản sao.
-Ingest không-reset còn xóa chunk của file đã sửa/xóa khỏi Qdrant và Neo4j (`stale_removed` trong response).
+Ingest tài liệu vào Qdrant (+ Neo4j nếu `GRAPH_ENABLED=true`).
+
+**Ingest tăng dần:** `point_id` tất định theo (`relative_path`, `loader_index`, `chunk_index`, `content_hash`, `embedding_model`). Ingest không-reset chỉ embed + upsert chunk **mới/đã sửa**; chunk không đổi được bỏ qua (`skipped_unchanged`) — chạy lại khi không có gì đổi thì không gọi Ollama lần nào. Chunk của file đã sửa/xóa/đổi tên bị dọn khỏi Qdrant và Neo4j (`stale_removed`). Không còn lời gọi embed "health check": vector size đọc từ collection có sẵn, hoặc lấy từ batch embed thật đầu tiên.
+
+> Payload của chunk không đổi **không** được ghi lại (doc_type/module suy luận, `created_at` giữ giá trị lần embed đầu). Sau khi đổi luật suy luận metadata hoặc `RAW_DATA_DIR`, chạy `/reset-ingest` để làm mới.
+
+**Request body:**
 
 | Trường | Mô tả |
 |---|---|
 | `project` | Chỉ ingest một project cụ thể. Bỏ trống để ingest tất cả. |
-| `reset` | `true` = xóa collection cũ trước rồi ingest lại. |
+| `reset` | `true` = embed lại toàn bộ và dựng lại collection. Collection Qdrant cũ chỉ bị xóa khi batch embed thật **đầu tiên** thành công — Ollama không phản hồi hoặc `EMBEDDING_MODEL` mới chưa pull thì index vector cũ được giữ nguyên (response có `failed_batches` + `batch_error`). |
 
 ```bash
 # Ingest tất cả projects
@@ -1133,25 +1142,44 @@ curl -s -X POST http://localhost:8090/ingest \
   -d '{"project": "myproject", "reset": true}' | jq
 ```
 
-**Response:**
+**Response — ingest một project** (trả về phẳng):
 
 ```json
 {
+  "project": "myproject",
+  "collection": "yan_raw_docs__myproject",
   "status": "ok",
-  "projects": {
-    "myproject": {
-      "upserted": 287,
-      "skipped": 0,
-      "errors": 0,
-      "graph_chunks_saved": 287
-    }
-  }
+  "documents": 24,
+  "chunks": 287,
+  "upserted": 3,
+  "skipped_unchanged": 284,
+  "failed_batches": 0,
+  "batch_error": null,
+  "points_count": 287,
+  "graph_chunks_saved": 12,
+  "stale_removed": 2,
+  "idempotent": true,
+  "reset": false
 }
 ```
 
+**Response — ingest tất cả project:** `status`, `projects_ingested`, `total_documents`, `total_chunks`, `total_upserted`, `total_skipped_unchanged`, `reset` và `details.{project}` (mỗi project có đúng các trường như trên).
+
+| Trường (mỗi project) | Mô tả |
+|---|---|
+| `documents` / `chunks` | Số tài liệu đọc được / số chunk sau khi chia |
+| `upserted` | Số chunk vừa embed + upsert ở lần này (bằng 0 khi không có gì đổi) |
+| `skipped_unchanged` | Số chunk đã có sẵn trong Qdrant, không embed lại |
+| `stale_removed` | Số point cũ (chunk của file đã sửa/xóa) đã xóa |
+| `failed_batches` / `batch_error` | Số batch embed lỗi (đã bỏ qua sau `INGEST_EMBED_RETRIES` lần thử) và lỗi đầu tiên, ví dụ Ollama không phản hồi hoặc lệch dimension ("Chạy POST /reset-ingest") |
+| `points_count` | Số point trong collection |
+| `graph_chunks_saved` | Số Chunk ghi vào Neo4j ở lần này (bằng 0 khi không có gì đổi; file có chunk mới thì cả các chunk không đổi của file đó cũng được ghi lại để giữ chuỗi `NEXT_CHUNK`) |
+
+Project không có file hỗ trợ trả `"status": "empty"`.
+
 ### POST /reset-ingest
 
-Xóa tất cả collection rồi ingest lại toàn bộ từ đầu.
+Embed lại và dựng lại collection từ đầu (tương đương `POST /ingest` với `"reset": true`) — cho tất cả project, hoặc một project nếu truyền `project`. Collection Qdrant cũ chỉ bị xóa khi batch embed thật đầu tiên thành công, nên chạy lúc Ollama đang lỗi không làm mất index vector (graph Neo4j của project vẫn bị xóa trước, và được dựng bù ở lần ingest thành công kế tiếp).
 
 ```bash
 # Reset và ingest lại toàn bộ
@@ -1299,27 +1327,33 @@ curl -s -X POST http://localhost:11434/api/chat \
 
 Sau khi mỗi coding agent hoàn thành, output markdown được tự động quét để trích xuất file code và lưu vào disk.
 
-**Roles có artifact:** `fe`, `mobile`, `be`, `dba`, `da`, `tech_lead`, `devsecops`
+**Roles có artifact:** `fe`, `mobile`, `be`, `dba`, `da`, `tech_lead`, `devsecops` (field `extract_artifacts` trong [role registry](#role-registry--cấu-hình-hành-vi-theo-role))
 
 **Layout thư mục artifact:**
 
 ```
 /data/artifacts/{workflow_id}/{role}/
-├── _output.md              ← Toàn bộ markdown output của agent (luôn có)
+├── _output.md              ← Toàn bộ markdown output của agent (luôn có, ghi đầu tiên)
 ├── src/pages/Login.tsx     ← File được trích xuất từ ### FILE: directive
 ├── src/hooks/useAuth.ts
 ├── schema.sql
 └── Dockerfile
 ```
 
+Mỗi lần trích xuất artifact của một role (lần chạy đầu hoặc khi Clarifier re-gen role đó), thư mục `/data/artifacts/{workflow_id}/{role}/` được **dọn sạch trước khi ghi**: file của lần sinh trước mà lần này không còn sinh ra sẽ không còn trong danh sách artifact. Việc xóa chỉ diễn ra bên trong đúng thư mục role — không theo symlink, và từ chối nếu thư mục role nằm ngoài `ARTIFACT_DIR/<workflow>/<role>`.
+
+File mà coding agent **không sinh được** (timeout, lỗi Ollama, nội dung rỗng…) không được lưu thành artifact — xem section `## ⚠️ File generation errors` trong `_output.md` của role ([Cơ chế sinh code](#cơ-chế-sinh-code-artifact-roles)).
+
 **Cơ chế nhận diện file trong markdown:**
 
 | Ưu tiên | Pattern nhận diện | Ví dụ |
 |---|---|---|
-| 1 (cao nhất) | `### FILE: path/to/file.ext` + code block ngay sau | `### FILE: src/auth/login.tsx` |
+| 1 (cao nhất) | `### FILE: path/to/file.ext` + code block ngay sau. Đường dẫn bọc backtick hoặc in đậm được bóc trang trí (`` ### FILE: `src/a.ts` ``, `### FILE: **src/a.ts**` → lưu `src/a.ts`) | `### FILE: src/auth/login.tsx` |
 | 2 | Dòng comment đầu code block | `// filename: src/Login.tsx` |
 | 3 | Bold/heading ngay trước code block | `**src/Login.tsx**` |
-| 4 (fallback) | Đặt tên theo ngôn ngữ + index | `typescript-01.ts` |
+| 4 (fallback) | Đặt tên theo ngôn ngữ (6 ký tự đầu) + index. Dockerfile: block đầu là `Dockerfile`, các block sau `Dockerfile.02`, `Dockerfile.03`… (`docker build -f Dockerfile.02 .`). Tên tự động không bao giờ trùng file đã lưu | `yaml-01.yml`, `python-02.py`, `typesc-03.ts` |
+
+**Chống lặp output của model nhỏ:** khi một dòng lặp quá 8 lần liên tiếp, phần lặp bị cắt và chèn một dòng marker `... (repeated pattern truncated)` viết bằng comment đúng cú pháp của file: `//` (TS/JS/Java/Go...), `#` (Python/YAML/shell/Dockerfile), `--` (SQL), `/* */` (CSS), `<!-- -->` (Markdown/HTML/XML). File JSON và định dạng không rõ cú pháp comment chỉ bị cắt, không chèn marker, nên file vẫn hợp lệ.
 
 **Truy cập artifacts qua API:**
 
@@ -1351,7 +1385,7 @@ curl -s "http://localhost:8091/workflow/{id}/artifacts/be/_output.md"
 
 ### Roles có thể được re-gen
 
-`fe`, `mobile`, `dba`, `be`, `da`, `tech_lead`, `devsecops`
+`fe`, `mobile`, `dba`, `be`, `da`, `tech_lead`, `devsecops` (field `regen_eligible` trong [role registry](#role-registry--cấu-hình-hành-vi-theo-role)). Mỗi role được re-gen thì thư mục artifact của role đó được dọn sạch và trích xuất lại.
 
 Các planning roles (`ba`, `pm`, `sa`, `ta`, `designer`, `tl`, `tester`) không nằm trong danh sách eligible để tránh thay đổi foundation của toàn pipeline.
 
@@ -1381,7 +1415,7 @@ Clarifier regen loop 1: clarifier re-run xong (12340 chars)
 
 ## 12. Episodic Memory Logging
 
-Mỗi lần workflow hoàn thành (thành công hoặc thất bại), agent-api tự động ghi log vào:
+Mỗi lần workflow kết thúc (`completed`, `failed` hoặc `cancelled` — đúng một dòng mỗi run), agent-api tự động ghi log vào:
 
 ```
 data/memory/episodic/workflow_runs.jsonl
@@ -1433,6 +1467,13 @@ cat data/memory/episodic/workflow_runs.jsonl | jq 'select(.steps_count < 15)'
 3. Dán nội dung file tool, nhấn **Save**
 4. Bật tool trong **Model Settings → Tools** cho model đang dùng
 
+> **Cập nhật tool:** tool được dán tay vào Admin Panel nên **không** tự cập nhật khi pull code mới — dán lại cả hai file (hiện là `yan_knowledge_base` **1.2.0** và `yan_agent_workflow` **2.1.0**). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) giữ nguyên tới khi sửa tay trong **Valves**.
+>
+> **URL theo tên service:** Valve URL mặc định là tên service trong compose (`http://rag-api:8090`, `http://agent-api:8091`) — đúng khi Open WebUI chạy cùng network `yan` của stack. `localhost` / `host.docker.internal` **không** dùng được từ trong container vì cổng host chỉ bind `127.0.0.1`. Open WebUI chạy ở container/compose khác thì nối vào network của stack rồi giữ nguyên URL theo tên service:
+> ```bash
+> docker network connect rag-agent-platform_yan <container>
+> ```
+
 ### Tool 1: `yan_knowledge_base.py` — Hỏi đáp tài liệu nội bộ
 
 **Mục đích:** Query RAG API từ giao diện chat Open WebUI — tìm thông tin trong PRD, spec, architecture docs đã ingest.
@@ -1441,8 +1482,8 @@ cat data/memory/episodic/workflow_runs.jsonl | jq 'select(.steps_count < 15)'
 
 | Valve | Mặc định | Mô tả |
 |---|---|---|
-| `rag_api_url` | `http://rag-api:8090` | URL rag-api trong Docker network |
-| `timeout` | `120` | Timeout request (giây) |
+| `rag_api_url` | `http://rag-api:8090` | URL rag-api — tên service trong compose. `localhost` / `host.docker.internal` không dùng được từ trong container vì cổng host chỉ bind `127.0.0.1` |
+| `timeout` | `1260` | Timeout chờ `/ask` (giây). Phải ≥ `OLLAMA_REQUEST_TIMEOUT` của rag-api (1200 trong `.env`; xem `curl -s localhost:8090/health \| jq .ollama_request_timeout`) + thời gian embed/truy hồi. Tool bỏ cuộc sớm **không** hủy generation: Ollama vẫn sinh tiếp và chiếm slot duy nhất (`OLLAMA_MAX_LOADED_MODELS=1`). Với profile `.env` nặng hơn (`OLLAMA_REQUEST_TIMEOUT` 1800–3600), nâng Valve tương ứng |
 | `top_k` | `null` | Số chunk trả về (null = dùng env `RAG_TOP_K`) |
 | `default_project` | `null` | Project mặc định (null = search tất cả) |
 | `default_module` | `null` | Module mặc định (null = toàn project) |
@@ -1458,13 +1499,14 @@ Tìm thông tin về billing schema trong project yanlib, module billing
 
 ### Tool 2: `yan_agent_workflow.py` — Chạy SDLC Workflow
 
-**Mục đích:** Khởi chạy toàn bộ SDLC workflow hoặc từng agent đơn lẻ trực tiếp từ giao diện chat.
+**Mục đích:** Khởi chạy, theo dõi và hủy SDLC workflow, hoặc chạy từng agent đơn lẻ trực tiếp từ giao diện chat.
 
 **Valves (cấu hình):**
 
 | Valve | Mặc định | Mô tả |
 |---|---|---|
-| `agent_api_url` | `http://agent-api:8091` | URL agent-api trong Docker network |
+| `agent_api_url` | `http://agent-api:8091` | URL agent-api — tên service trong compose (xem lưu ý ở [Cài đặt](#cài-đặt)) |
+| `block_until_complete` | `false` | `false` = `run_sdlc_workflow` trả `workflow_id` ngay; `true` = poll đồng bộ tới khi kết thúc (có thể 30+ phút, dễ vượt timeout proxy/browser) |
 | `timeout` | `600` | Timeout cho single-step request (giây) |
 | `poll_interval` | `15` | Khoảng cách poll workflow status (giây) |
 | `poll_max_attempts` | `120` | Số poll tối đa trước khi timeout (120 × 15s = 30 phút) |
@@ -1476,9 +1518,10 @@ Tìm thông tin về billing schema trong project yanlib, module billing
 
 | Function | Mô tả |
 |---|---|
-| `run_sdlc_workflow(user_input, project, tech_stack)` | Chạy đầy đủ 15 bước, poll đến khi xong, trả về summary |
+| `run_sdlc_workflow(user_input, project, tech_stack)` | Gửi workflow 15 bước. Mặc định trả `workflow_id` ngay (chạy nền); Valve `block_until_complete=true` thì poll tới khi kết thúc (`completed` / `failed` / `cancelled`) |
 | `run_agent_step(role, user_input, project, tech_stack)` | Chạy 1 agent đơn lẻ (sync) |
-| `get_workflow_result(workflow_id, role)` | Lấy output theo workflow ID, lọc theo role |
+| `get_workflow_result(workflow_id, role)` | Lấy output theo workflow ID, lọc theo role. Summary gồm status, vị trí hàng đợi khi `pending`, các bước lỗi (`failed_steps`), trạng thái hủy |
+| `cancel_workflow(workflow_id)` | Hủy workflow đang `pending`/`running` (`POST /workflow/{id}/cancel`). 404 = không tìm thấy, 409 = đã kết thúc |
 | `list_agent_roles()` | Liệt kê tất cả roles, models, thứ tự chạy |
 
 **Ví dụ sử dụng trong chat:**
@@ -1488,6 +1531,14 @@ Chạy SDLC workflow: xây dựng module marketplace cho ứng dụng B2B, proje
 
 ```
 Chạy agent sa với yêu cầu: thiết kế kiến trúc hệ thống authentication đa tenant
+```
+
+```
+Xem kết quả workflow abc123
+```
+
+```
+Hủy workflow abc123
 ```
 
 ---
@@ -1668,6 +1719,8 @@ docker compose up -d --build rag-api
 docker compose up -d --build agent-api rag-api
 ```
 
+> Restart/rebuild agent-api **không** mất lịch sử workflow (SQLite trong `./data/memory`), nhưng workflow đang chạy hoặc đang chờ sẽ chuyển sang `failed` ("Bị gián đoạn do agent-api khởi động lại") và phải chạy lại — kiểm tra `curl -s localhost:8091/workflows | jq '.workflows[] | select(.status == "running" or .status == "pending")'` trước khi rebuild.
+
 ### Theo dõi log
 
 ```bash
@@ -1736,10 +1789,12 @@ Mặc định mọi cổng chỉ bind `127.0.0.1` — chỉ truy cập được 
 # 1. Thêm/sửa file
 cp new-spec.md data/raw/myproject/auth/
 
-# 2. Ingest lại (idempotent — file cũ không bị duplicate)
+# 2. Ingest lại (tăng dần — chỉ embed chunk mới/đã sửa, dọn chunk của file đã sửa/xóa)
 curl -s -X POST http://localhost:8090/ingest \
   -H "Content-Type: application/json" \
-  -d '{"project": "myproject"}' | jq .projects.myproject.upserted
+  -d '{"project": "myproject"}' | jq '{upserted, skipped_unchanged, stale_removed}'
+
+#    Ingest tất cả project: jq .details.myproject.upserted
 
 # 3. Kiểm tra
 curl -s -X POST http://localhost:8090/ask \
@@ -1758,24 +1813,35 @@ curl -s -X POST http://localhost:8090/ask \
 | `/ingest` trả về `"status": "empty"` | Không có subfolder trong `data/raw/` | Tạo subfolder và đặt file vào đó |
 | `/ask` với `module` không trả kết quả | Module sai tên hoặc chưa ingest | Tên module = tên thư mục con chính xác |
 | Ingest chậm | `INGEST_EMBED_WORKERS` quá thấp | Tăng bằng giá trị `OLLAMA_NUM_PARALLEL`; restart `rag-api` |
-| Embedding timeout | Model chưa được pull | Pull lại `EMBEDDING_MODEL` |
-| SDLC workflow `status=failed` | Xem field `error` | `curl .../workflow/{id} | jq .error` |
-| Step output bắt đầu bằng `[LỖI` | LLM timeout hoặc model chưa pull | Kiểm tra model; tăng `OLLAMA_REQUEST_TIMEOUT` |
+| Embedding timeout | Model chưa được pull, hoặc embed batch lớn trên máy chậm | Pull lại `EMBEDDING_MODEL`; tăng `RAG_TIMEOUT` (rag-api) |
+| Ingest trả `failed_batches` > 0 / có `batch_error` | Ollama không phản hồi, embed lỗi sau `INGEST_EMBED_RETRIES` lần thử, hoặc lệch dimension (đổi `EMBEDDING_MODEL`) | Đọc `batch_error`; lệch dimension → `POST /reset-ingest`. Chunk lỗi chưa có vector, ingest lại sẽ embed bù |
+| SDLC workflow `status=failed` | Xem field `error` | `curl .../workflow/{id} \| jq .error` |
+| Workflow `failed` với lỗi "Bị gián đoạn do agent-api khởi động lại" | agent-api restart/rebuild khi workflow đang chạy hoặc đang chờ | Gửi lại workflow (chưa hỗ trợ chạy tiếp). Output các bước đã xong vẫn xem được |
+| Workflow đứng ở `pending` lâu | Đang có workflow khác chạy (`WORKFLOW_CONCURRENCY=1`) | Xem `queue_position`; chờ hoặc hủy workflow đang chạy (`POST /workflow/{id}/cancel`) |
+| Đã hủy nhưng workflow vẫn `running` | Bước hiện tại chạy nốt (không ngắt giữa lời gọi LLM) | Chờ bước hiện tại xong — `cancel_requested: true`, sau đó `status=cancelled` |
+| agent-api dừng ngay khi khởi động, log lỗi SQLite | Không mở được `WORKFLOW_DB_PATH` (sai quyền, file hỏng) | Sửa quyền `./data/memory`, hoặc xóa file DB (mất lịch sử trong DB; artifact vẫn còn) rồi khởi động lại |
+| Step output bắt đầu bằng `[LỖI` | LLM timeout, model chưa pull, hoặc coding agent không sinh được file nào — xem section `⚠️ File generation errors` | Kiểm tra model; tăng `OLLAMA_REQUEST_TIMEOUT`; xem `jq .failed_steps` |
+| Output có section `⚠️ File generation errors` | Một số file lỗi: timeout, lỗi Ollama, model trả rỗng hoặc chạm trần `num_predict` giữa lúc suy luận | File lỗi không được lưu; tăng `OLLAMA_REQUEST_TIMEOUT` / `FILEGEN_NUM_PREDICT`; đặt `FILEGEN_THINK=false` nếu model suy luận quá dài |
+| Bước LLM bị timeout sau khi cập nhật (trước đây chạy được) | `OLLAMA_REQUEST_TIMEOUT` nay mới thực sự được áp dụng (trước đây timeout vô hạn) | Máy chậm / chạy CPU: tăng `OLLAMA_REQUEST_TIMEOUT` (giới hạn thời gian tới token đầu tiên và khoảng lặng giữa hai chunk) |
+| Log agent-api có cảnh báo `chạm trần ...` | Output bị cắt ở trần `num_predict` | Tăng `PLANNER_NUM_PREDICT` / `FILEGEN_NUM_PREDICT` / `REPORT_NUM_PREDICT` (≤ `OLLAMA_CONTEXT_LENGTH`) |
+| UI hiện banner vàng "Mất kết nối tới agent-api…" | agent-api đang restart hoặc mạng chập chờn (5xx / không kết nối được) | UI tự thử lại (tối đa 30s một lần) và giữ dữ liệu đang xem; `docker compose ps agent-api` |
+| UI hiện "Không định dạng được markdown" | Không tải được `marked`/`DOMPurify` từ `/ui/static/vendor/` | Kiểm tra file trong `agent-api/static/vendor/` rồi rebuild agent-api; output vẫn hiện dạng văn bản thô |
 | Output chứa `<think>...</think>` thô | Model reasoning chưa nhận diện | Tên model phải chứa: `phi4-mini-reasoning`, `phi4-reasoning`, `qwq`, `deepseek-r1`, `qwen3`, `north-mini-code`, `gemma4` hoặc `mistral-medium-3.5` |
 | `user_input` bị cắt ngắn | Input > 10.000 ký tự | Chia nhỏ input |
 | `workflow_runs.jsonl` không được tạo | Volume chưa mount | Kiểm tra `./data/memory:/data/memory` trong docker-compose |
 | Artifacts không được lưu | Volume chưa mount | Kiểm tra `./data/artifacts:/data/artifacts` trong docker-compose |
-| Open WebUI không gọi được rag-api | URL dùng `localhost` / `host.docker.internal` thay vì hostname nội bộ (rag-api chỉ bind `127.0.0.1` trên host) | Valve `rag_api_url` = `http://rag-api:8090` |
-| Open WebUI không gọi được agent-api | URL dùng `localhost` / `host.docker.internal` | Valve `agent_api_url` = `http://agent-api:8091` |
+| Open WebUI không gọi được rag-api | URL dùng `localhost` / `host.docker.internal` thay vì hostname nội bộ (rag-api chỉ bind `127.0.0.1` trên host), hoặc Open WebUI không cùng network | Valve `rag_api_url` = `http://rag-api:8090`; Open WebUI ở container/compose khác: `docker network connect rag-agent-platform_yan <container>` |
+| Open WebUI không gọi được agent-api | URL dùng `localhost` / `host.docker.internal`, hoặc Open WebUI không cùng network | Valve `agent_api_url` = `http://agent-api:8091`; Open WebUI ở container/compose khác: `docker network connect rag-agent-platform_yan <container>` |
+| Tool `yan_knowledge_base` báo timeout dù rag-api vẫn đang trả lời | Valve `timeout` cũ (120) nhỏ hơn `OLLAMA_REQUEST_TIMEOUT` của rag-api — Ollama vẫn sinh tiếp và chiếm slot | Dán lại tool bản mới và đặt Valve `timeout` ≥ `curl -s localhost:8090/health \| jq .ollama_request_timeout` + thời gian truy hồi (mặc định 1260) |
 | Máy khác trong LAN không mở được UI | Cổng chỉ bind `127.0.0.1` (mặc định) | Đặt `BIND_ADDR=0.0.0.0` + `WEBUI_AUTH=true` — xem [Truy cập từ máy khác (LAN)](#truy-cập-từ-máy-khác-lan) |
 | `curl localhost:6333` / `:8090` từ máy khác bị từ chối | Hạ tầng luôn chỉ bind `127.0.0.1` | Chạy curl trên chính host hoặc dùng SSH tunnel |
 | Neo4j không kết nối | Container chưa sẵn sàng (lần đầu tải APOC) | Chờ `docker compose ps` báo neo4j `healthy`; `docker compose logs neo4j` |
 | `dependency failed to start: container qdrant is unhealthy` | Qdrant chưa mở cổng 6333 sau ~1 phút | `docker compose logs qdrant` (thường do volume `qdrant_storage` hỏng / thiếu quyền) |
 | Biến trong `.env` không có tác dụng | Biến chưa được khai báo trong `environment:` của service | Thêm vào `docker-compose.yml`; chạy `pytest tests/test_config_wiring.py` để kiểm tra |
 | `/graph/status` → `connected: false` | Sai `NEO4J_PASSWORD` | `.env` phải khớp với lần đầu Neo4j init |
-| `graph_chunks_saved: 0` sau ingest | `GRAPH_ENABLED=false` | Đổi thành `true` + rebuild `rag-api` |
-| Workflow mất > 60 phút | Model nặng hoặc tài nguyên thiếu | Giảm song song; dùng model nhỏ hơn |
-| `workflow_id` not found sau vài giờ | In-memory store bị evict (tối đa 50) | Lưu output ngay; tăng `_MAX_STORED_WORKFLOWS` trong `app.py` |
+| `graph_chunks_saved: 0` sau ingest | `GRAPH_ENABLED=false`, hoặc không có chunk nào mới/đã sửa (ingest tăng dần không ghi lại Chunk đã có trong Neo4j) | Bình thường nếu `upserted: 0` và `skipped_unchanged` > 0; nếu không, đổi `GRAPH_ENABLED=true` + rebuild `rag-api` |
+| Workflow mất > 60 phút | Model nặng hoặc tài nguyên thiếu | Giảm song song; dùng model nhỏ hơn; đặt `WORKFLOW_MAX_SECONDS` để dừng sớm |
+| `GET /workflow/{id}` trả 404 | Sai ID, hoặc workflow đã bị xóa khỏi SQLite (giữ 500 workflow mới nhất) mà không còn artifact/dòng JSONL nào trên disk | Kiểm tra ID qua `GET /workflows?limit=500`; workflow cũ có artifact vẫn xem được (dựng lại từ disk) |
 | Clarifier regen không hoạt động | `CLARIFIER_REGEN_LOOPS=0` | Kiểm tra env var; xem log `grep "Clarifier regen"` |
 | Task Completion Checklist thiếu | TL output không có bảng task board | Kiểm tra TL agent đã chạy thành công và sinh §4/§5/§6/§7 |
 
@@ -1802,3 +1868,41 @@ curl -s -X POST http://localhost:8090/ask \
 | **Neo4j Bolt** | bolt://localhost:7687 | Neo4j driver connection |
 | **Watchtower** | http://localhost:8080 *(cần `WATCHTOWER_HTTP_API_TOKEN`)* | HTTP API: `/v1/update`, `/v1/metrics` |
 | **Deunhealth** | *(không publish cổng)* | Health watchdog — `network_mode: none`, xem `docker compose logs deunhealth` |
+
+---
+
+## 19. Phát triển, test & CI
+
+Test, lint và type check chạy **không cần Docker** (Ollama/Qdrant/Neo4j đều được mock). Dùng Python 3.11 và cài dependency của cả hai service:
+
+```bash
+python -m pip install pytest ruff mypy==2.4.1
+python -m pip install -r rag-api/requirements.txt -r agent-api/requirements.txt
+```
+
+| Bước | Lệnh | Cấu hình |
+|---|---|---|
+| Unit test | `python -m pytest -q` | `[tool.pytest.ini_options]` trong `pyproject.toml` (thư mục `tests/`) |
+| Lint | `ruff check rag-api agent-api open-webui-tools tests` | `[tool.ruff]` |
+| Type check | Vòng lặp bên dưới | `[tool.mypy]` (Python 3.11, `ignore_missing_imports`, `explicit_package_bases`, `warn_unused_ignores`) |
+
+`agent-api/app.py` và `rag-api/app.py` trùng tên module `app`, nên mypy chạy **riêng từng thư mục service** (import phẳng như trong container) — CI chạy đúng lệnh này:
+
+```bash
+for d in agent-api rag-api open-webui-tools; do
+  (cd "$d" && python -m mypy --config-file ../pyproject.toml *.py)
+done
+```
+
+**CI** (`.github/workflows/ci.yml`) chạy trên mỗi push vào `main`/`develop` và mỗi pull request, với Python 3.11 và 3.12: cài tooling (`mypy==2.4.1`) + dependency của rag-api/agent-api → `ruff` → `mypy` (cả 3 thư mục, báo hết lỗi rồi mới fail) → `pytest`.
+
+Một số test đáng chú ý khi sửa code:
+
+| Test | Kiểm tra |
+|---|---|
+| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` của service trong `docker-compose.yml` |
+| `tests/test_role_registry*.py` | Bảng hành vi dẫn xuất từ `AgentConfig` và các bất biến của role registry |
+| `tests/test_workflow_queue*.py` | Hàng đợi FIFO, `WORKFLOW_CONCURRENCY`, hủy workflow và các race hủy/hoàn tất |
+| `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |
+| `tests/test_workflow_ui.py` | UI `/ui`: không CDN, file vendor + LICENSE + phiên bản, trạng thái/poll (phần chạy JS của trang cần `node`; tự skip nếu không có) |
+| `tests/test_ingest_incremental*.py` | Ingest tăng dần, `skipped_unchanged`, `stale_removed`, reset an toàn khi Ollama lỗi |
