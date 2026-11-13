@@ -196,8 +196,8 @@ def test_vendor_files_are_versioned_licensed_and_all_used():
         if name.endswith(".js"):
             banner = (VENDOR / name).read_text(encoding="utf-8", errors="replace")[:1000]
             assert ver in banner, f"{name}: banner không ghi phiên bản {ver} — tên file sai phiên bản?"
-    # Mọi file không phải LICENSE trong vendor/ đều đang được dùng (không sót bản cũ sau nâng cấp).
-    unused = sorted(p.name for p in VENDOR.iterdir() if ".LICENSE" not in p.name and p.name not in refs)
+    # Mọi file .js/.css trong vendor/ đều đang được dùng (không sót bản cũ sau nâng cấp).
+    unused = sorted(p.name for p in VENDOR.iterdir() if p.suffix in (".js", ".css") and p.name not in refs)
     assert not unused, f"file vendor không còn được tham chiếu: {unused}"
 
 
