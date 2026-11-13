@@ -962,17 +962,17 @@ curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890/arti
   "workflow_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "artifacts": {
     "fe": [
-      {"path": "fe/_output.md", "filename": "_output.md", "language": "md", "size": 18234},
-      {"path": "fe/src/pages/Login.tsx", "filename": "src/pages/Login.tsx", "language": "tsx", "size": 2341}
+      {"path": "fe/_output.md", "filename": "_output.md", "language": "markdown", "size": 18234},
+      {"path": "fe/src/pages/Login.tsx", "filename": "src/pages/Login.tsx", "language": "typescript", "size": 2341}
     ],
     "be": [
-      {"path": "be/src/auth/auth.controller.ts", "filename": "src/auth/auth.controller.ts", "language": "ts", "size": 3102}
+      {"path": "be/src/auth/auth.controller.ts", "filename": "src/auth/auth.controller.ts", "language": "typescript", "size": 3102}
     ]
   }
 }
 ```
 
-`filename` là đường dẫn tương đối trong thư mục role — dùng cho endpoint đọc file bên dưới.
+`filename` là đường dẫn tương đối trong thư mục role — dùng cho endpoint đọc file bên dưới. `language` là ngôn ngữ ghi trên code block lúc trích xuất (workflow chỉ còn trên disk thì suy từ đuôi file, vd. `md`, `tsx`).
 
 ### GET /workflow/{workflow_id}/artifacts/{role}/{path}
 
@@ -1074,7 +1074,7 @@ curl -s http://localhost:8090/health | jq
   "embedding_model": "qwen3-embedding:8b",
   "chat_model": "qwen3.6:35b",
   "rag_top_k": 5,
-  "ollama_request_timeout": 600.0,
+  "ollama_request_timeout": 1200.0,
   "graph": {
     "enabled": true,
     "neo4j_uri": "bolt://neo4j:7687",
@@ -1415,7 +1415,7 @@ Clarifier regen loop 1: clarifier re-run xong (12340 chars)
 
 ## 12. Episodic Memory Logging
 
-Mỗi lần workflow kết thúc (`completed`, `failed` hoặc `cancelled` — đúng một dòng mỗi run), agent-api tự động ghi log vào:
+Mỗi lần workflow kết thúc (`completed`, `failed` hoặc `cancelled` — đúng một dòng mỗi run), agent-api tự động ghi log vào file dưới đây. Ngoại lệ: run bị gián đoạn do agent-api khởi động lại (chuyển sang `failed` lúc startup) **không** có dòng log — xem trạng thái của chúng qua `GET /workflow/{id}` hoặc `GET /workflows`.
 
 ```
 data/memory/episodic/workflow_runs.jsonl
