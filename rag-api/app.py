@@ -287,8 +287,11 @@ def ingest_endpoint(req: IngestRequest = IngestRequest()) -> dict[str, Any]:
 
 @app.post("/reset-ingest")
 def reset_ingest_endpoint(req: IngestRequest = IngestRequest()) -> dict[str, Any]:
-    """Xóa collection Qdrant (và graph Neo4j nếu GRAPH_ENABLED) rồi ingest lại từ đầu.
+    """Embed lại toàn bộ rồi dựng lại collection Qdrant (và graph Neo4j nếu GRAPH_ENABLED).
 
+    Collection cũ chỉ bị xóa ở batch embed thành công đầu tiên, graph Neo4j chỉ bị xóa khi
+    collection đã dựng lại (reset_applied) — reset lỗi toàn bộ (Ollama down, model chưa pull)
+    giữ nguyên cả hai; xem failed_batches/batch_error trong response.
     Tương đương POST /ingest với reset=True. Dùng khi cần làm sạch hoàn toàn
     sau khi đổi EMBEDDING_MODEL hoặc cấu trúc thư mục thô.
     """

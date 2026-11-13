@@ -808,7 +808,7 @@ def _finish_unloadable_run(workflow_id: str, req: WorkflowRunRequest, queue: _Wo
     )
     if queue.decide(workflow_id):
         _mark_cancelled(record)
-    _persist(record)
+    _persist_final(record)
     _log_workflow_run(
         workflow_id=workflow_id,
         project=record.project,

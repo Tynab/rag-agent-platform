@@ -698,3 +698,62 @@ def test_final_persist_gives_up_without_raising(qenv, monkeypatch):
     )
     app_mod._persist_final(rec)                            # không raise
     assert calls == ["completed", "completed"]
+
+
+def test_failed_regen_keeps_artifacts_on_record_and_disk(qenv, monkeypatch):
+    # Không dùng stub _extract_artifacts của fixture: trích xuất thật ra tmp_path.
+    monkeypatch.setattr(app_mod, "_extract_artifacts", artifacts.extract_and_save)
+    good = "## BE\n\n### FILE: src/main.ts\n```typescript\nexport const v = 1;\n```\n"
+
+    class _BeGraph(_HookGraph):
+        def stream(self, state, stream_mode="updates"):
+            self.calls.append(state["user_input"])
+            yield {"be": {"step_outputs": {"be": good}, "completed_steps": ["be"]}}
+            yield _node("clarifier", "clarifier của A")
+
+    qenv.use_graph(_BeGraph(("be", "clarifier")))
+    monkeypatch.setattr(app_mod, "_CLARIFIER_REGEN_LOOPS", 1)
+    monkeypatch.setattr(app_mod, "_parse_clarifier_regen_list", lambda text: ["be"])
+    monkeypatch.setattr(
+        app_mod, "run_single_step",
+        lambda role, **kw: "[LỖI trong be] Không sinh được file nào (1 file lên kế hoạch đều thất bại)."
+        if role == "be" else "CLARIFIER v2",
+    )
+    with TestClient(app_mod.app) as client:
+        A = _post(client, "A")["workflow_id"]
+        _wait_finished(A)
+        ra = _get(client, A)
+    assert ra["step_outputs"]["be"] == good
+    paths = [a["path"] for a in ra["artifacts"]["be"]]
+    assert "be/src/main.ts" in paths                        # artifact của lần chạy đầu còn nguyên
+    saved = list((qenv.tmp / "artifacts").rglob("main.ts"))
+    assert len(saved) == 1 and "export const v = 1;" in saved[0].read_text(encoding="utf-8")
+
+
+def test_cancel_during_final_persist_retry_is_409(qenv, monkeypatch):
+    qenv.use_graph(_HookGraph(("ba",)))
+    entered, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(app_mod, "_FINAL_PERSIST_DELAYS", (0.0,))
+    real_store = app_mod._store_workflow
+    state = {"failed": False}
+
+    def blocking_store(rec):
+        if rec.status.value == "completed" and not state["failed"]:
+            state["failed"] = True
+            entered.set()
+            assert release.wait(WAIT_TIMEOUT)
+            raise RuntimeError("database is locked")
+        return real_store(rec)
+
+    monkeypatch.setattr(app_mod, "_store_workflow", blocking_store)
+    with TestClient(app_mod.app) as client:
+        A = _post(client, "A")["workflow_id"]
+        assert entered.wait(WAIT_TIMEOUT)
+        # Lần ghi cuối đang lỗi / chờ thử lại: run vẫn "finishing" → không bị coi là mồ côi.
+        assert app_mod._get_run_queue().state(A) == "finishing"
+        r = _cancel(client, A)
+        release.set()
+        assert r.status_code == 409
+        _wait_finished(A)
+        ra = _get(client, A)
+    assert ra["status"] == "completed"

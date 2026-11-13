@@ -28,8 +28,9 @@ Valves (biến cấu hình)
                        container/compose khác → nối vào network của stack:
                            docker network connect rag-agent-platform_yan <container>
 
-    timeout            Timeout (giây) cho mỗi single-step agent call.
-                       Mặc định: 600 giây.
+    timeout            Timeout (giây) cho mỗi single-step agent call (run_agent_step).
+                       Mặc định: 3600 giây — ≥ 2 × OLLAMA_REQUEST_TIMEOUT (1200) của
+                       agent-api, vì một bước gọi LLM ít nhất 1–2 lần.
 
     poll_interval      Khoảng cách (giây) giữa các lần poll trạng thái workflow.
                        Mặc định: 15 giây.

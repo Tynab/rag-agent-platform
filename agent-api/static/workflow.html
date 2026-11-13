@@ -513,7 +513,8 @@
       color: var(--text);
       /* URL / inline code dài không có khoảng trắng → xuống dòng thay vì bị
          .content-card (overflow:hidden) cắt mất trên màn hẹp. Không ảnh hưởng <pre>
-         (white-space: pre) và bảng (th/td tự xuống dòng trong min/max-width, .table-wrap cuộn ngang). */
+         (white-space: pre) và bảng (td tự xuống dòng trong min/max-width, th giữ một dòng;
+         .table-wrap cuộn ngang). */
       overflow-wrap: break-word;
     }
     .md h1,.md h2,.md h3,.md h4,.md h5 {
@@ -1298,9 +1299,10 @@ function currentStepOf(data) {
   return s ? s.role : null;
 }
 
-// Bước lỗi. Khi đã có output, output là nguồn sự thật: Clarifier Regen Loop có thể chạy
-// lại một bước lỗi thành công (hoặc làm hỏng một bước tốt) mà failed_steps không được
-// cập nhật. Chưa có output → dựa vào failed_steps.
+// Bước lỗi. Khi đã có output, output là nguồn sự thật (đầu "[LỖI trong role]"). Backend giữ
+// failed_steps khớp với output — regen lỗi giữ output cũ, regen thành công gỡ role khỏi
+// failed_steps — nhưng bản ghi tạo bởi phiên bản cũ có thể lệch. Chưa có output → dựa vào
+// failed_steps.
 function isStepFailed(data, role) {
   const out = (data.step_outputs || {})[role];
   if (typeof out === 'string' && out.trim()) return out.trimStart().startsWith(STEP_ERROR_PREFIX);

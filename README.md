@@ -642,7 +642,7 @@ curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567
 | `INGEST_EMBED_RETRIES` | `3` | Số lần retry khi embed một batch lúc ingest lỗi (OOM / HTTP tạm thời) |
 | `RAG_TIMEOUT` | `600` | Ở rag-api: timeout (giây) mỗi lần gọi Ollama `/api/embed` — cả embed câu hỏi (`/ask`, `/retrieve`) lẫn từng batch lúc ingest (trước đây ingest dùng cứng 600 s). Cùng biến với agent-api, xem bên dưới |
 | `GRAPH_ENABLED` | `true` | Bật Neo4j graph enrichment (`false` = rag-api không chạm tới Neo4j) |
-| `GRAPH_ENTITY_EXTRACTION` | `false` | LLM extract entity khi ingest (chậm hơn nhưng tăng độ phong phú graph) |
+| `GRAPH_ENTITY_EXTRACTION` | `false` | LLM extract entity khi ingest (chậm hơn nhưng tăng độ phong phú graph). Chỉ áp cho chunk **mới** — bật sau lần ingest đầu thì chạy `/reset-ingest` để trích xuất cho chunk đã có |
 
 ### Nhóm Agent API
 
@@ -722,6 +722,13 @@ Chi tiết tính năng: [Giao diện theo dõi workflow (/ui)](#giao-diện-theo
 ### POST /agent/{role}
 
 Chạy đồng bộ một agent đơn lẻ. Hữu ích để test từng role hoặc ghép nối thủ công.
+
+| HTTP | Khi nào |
+|---|---|
+| `200` | Bước chạy xong. Với coding role (`fe`, `be`, ...) không sinh được file nào, `output` bắt đầu bằng `[LỖI trong <role>]` kèm section `## ⚠️ File generation errors` liệt kê lỗi từng file — kiểm tra tiền tố này |
+| `404` | `role` không tồn tại |
+| `422` | Body không hợp lệ (vd. `user_input` rỗng) |
+| `500` | Lỗi LLM (timeout, mất kết nối, model chưa pull) hoặc agent báo cáo trả về output rỗng sau cả lần retry — `detail` chứa lý do |
 
 **Request body:**
 
@@ -899,7 +906,7 @@ curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq
 | `pending` | Đã xếp hàng, chưa bắt đầu (xem `queue_position`) |
 | `running` | LangGraph đang thực thi các bước (bao gồm cả Clarifier regen loop) |
 | `completed` | Hoàn tất toàn bộ + Clarifier regen loop (có thể kèm một vài bước lỗi trong `failed_steps`) |
-| `failed` | Lỗi không xử lý được — kiểm tra trường `error`. Các thông báo cố định: `Bị gián đoạn do agent-api khởi động lại` (run đang chạy/xếp hàng lúc restart), `Không đọc được bản ghi workflow từ store — workflow không được chạy` (record trong SQLite hỏng/không đọc được lúc worker nhận slot — không node nào chạy), `Workflow dừng bất thường do lỗi hệ thống` (worker thoát bất thường) |
+| `failed` | Lỗi không xử lý được — kiểm tra trường `error`. Các thông báo cố định: `Bị gián đoạn do agent-api khởi động lại` (run đang chạy/xếp hàng lúc restart), `Không đọc được bản ghi workflow từ store — workflow không được chạy` (record trong SQLite hỏng/không đọc được lúc worker nhận slot — không node nào chạy), `Workflow dừng bất thường do lỗi hệ thống (<ExceptionType>)` (worker thoát bất thường; hậu tố là tên loại exception nếu có) |
 | `cancelled` | Bị hủy qua `POST /workflow/{id}/cancel` — `error = "Đã hủy theo yêu cầu người dùng"`; output các bước đã xong vẫn giữ nguyên |
 
 > Nếu một bước gặp lỗi LLM (timeout, model chưa pull, coding agent không sinh được file nào, agent báo cáo trả về output **rỗng** sau cả lần retry...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs`, thêm role vào `failed_steps` và tóm tắt vào trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp. Trong Clarifier regen loop: bước regen lỗi **giữ nguyên** output + artifact của lần chạy trước; bước từng lỗi mà regen thành công được gỡ khỏi `failed_steps` và khỏi tóm tắt trong `error`.
@@ -1387,7 +1394,7 @@ curl -s "http://localhost:8091/workflow/{id}/artifacts/be/_output.md"
 
 ### Roles có thể được re-gen
 
-`fe`, `mobile`, `dba`, `be`, `da`, `tech_lead`, `devsecops` (field `regen_eligible` trong [role registry](#role-registry--cấu-hình-hành-vi-theo-role)). Mỗi role được re-gen thì thư mục artifact của role đó được dọn sạch và trích xuất lại.
+`fe`, `mobile`, `dba`, `be`, `da`, `tech_lead`, `devsecops` (field `regen_eligible` trong [role registry](#role-registry--cấu-hình-hành-vi-theo-role)). Role re-gen **thành công** thì thư mục artifact của role đó được dọn sạch và trích xuất lại (và role được gỡ khỏi `failed_steps` / `error` nếu lần đầu lỗi); re-gen lỗi (exception hoặc output `[LỖI trong <role>]`) giữ nguyên output và artifact cũ.
 
 Các planning roles (`ba`, `pm`, `sa`, `ta`, `designer`, `tl`, `tester`) không nằm trong danh sách eligible để tránh thay đổi foundation của toàn pipeline.
 
@@ -1557,6 +1564,8 @@ GRAPH_ENTITY_EXTRACTION=false
 ```bash
 docker compose restart rag-api
 ```
+
+> Vừa bật `GRAPH_ENABLED`: lần `POST /ingest` kế tiếp tự dựng graph cho mọi chunk chưa có trong Neo4j (không embed lại). Vừa bật `GRAPH_ENTITY_EXTRACTION` sau khi đã ingest: trích xuất thực thể chỉ chạy cho chunk **mới**, nên chạy `POST /reset-ingest` để trích xuất cho toàn bộ chunk hiện có.
 
 ### Kiểm tra trạng thái
 

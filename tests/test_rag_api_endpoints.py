@@ -198,3 +198,19 @@ def test_graph_status_connected_and_down(rag, monkeypatch, connected):
     # Neo4j không phản hồi → không truy vấn thống kê.
     assert body["stats"] == ({"chunks": 7} if connected else {})
     assert stats_calls == ([1] if connected else [])
+
+
+def test_graph_entities_lists_project_entities(rag, monkeypatch):
+    seen = []
+    ents = [{"name": "TenantGuard", "type": "class", "mentions": 3}, {"name": "JWT", "type": "tech", "mentions": 1}]
+    fake = types.SimpleNamespace(get_entities_for_project=lambda p: seen.append(p) or ents)
+    monkeypatch.setattr(rag_app, "GRAPH_ENABLED", True)
+    monkeypatch.setattr(rag_app, "_graph_module", fake)
+    r = rag.client.get("/graph/projects/crm/entities")
+    assert r.status_code == 200
+    assert r.json() == {"project": "crm", "total": 2, "entities": ents}
+    assert seen == ["crm"]
+
+
+def test_graph_entities_disabled_is_503(rag):
+    assert rag.client.get("/graph/projects/crm/entities").status_code == 503
