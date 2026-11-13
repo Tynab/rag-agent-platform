@@ -20,6 +20,9 @@ GET  /agents
 GET  /ui
     Phục vụ giao diện web SDLC Workflow (file static/workflow.html).
 
+GET  /ui/static/{path}
+    File tĩnh của UI (thư mục static/, gồm cả thư viện JS vendor trong static/vendor/).
+
 POST /agent/{role}
     Chạy đồng bộ một agent đơn lẻ theo role chỉ định.
     Nhận AgentStepRequest (user_input, project, prev_outputs, tech_stack, rag_enabled, rag_top_k).
@@ -36,7 +39,7 @@ GET  /workflow/{workflow_id}
     Trả về WorkflowRecord bao gồm step_outputs, completed_steps, artifacts, error.
 
 GET  /workflows
-    Liệt kê tối đa 50 workflow gần nhất, sắp xếp theo thời gian tạo mới nhất trước.
+    Liệt kê tối đa 50 workflow gần nhất (?limit= tối đa 500), mới nhất trước.
 
 GET  /workflow/{workflow_id}/artifacts
     Liệt kê metadata của tất cả file artifact đã được trích xuất và lưu vào disk.
@@ -49,12 +52,15 @@ GET  /workflow/{workflow_id}/artifacts/{role}/{path}
 Vòng đời workflow
 -----------------
     POST /workflow/run
-        → WorkflowRecord tạo với status=pending, lưu vào workflow_store
+        → WorkflowRecord tạo với status=pending, lưu vào SQLite (store.py)
         → BackgroundTasks.add_task(_run_workflow_task)
             → status=running, LangGraph StateGraph.stream() bắt đầu
             → Mỗi node hoàn thành: cập nhật step_outputs, completed_steps, artifacts
+              rồi ghi lại record vào SQLite (GET /workflow/{id} thấy tiến trình)
             → Sau node cuối cùng (clarifier): chạy Clarifier Regen Loop nếu được bật
             → status=completed (hoặc failed nếu có lỗi không xử lý được)
+    agent-api khởi động lại giữa chừng → lúc startup (lifespan) mọi run còn
+    pending/running bị chuyển sang failed với lỗi "Bị gián đoạn do agent-api khởi động lại".
 
 Clarifier Regen Loop
 --------------------
@@ -67,20 +73,20 @@ Clarifier output để tìm danh sách agent cần re-generate. Với mỗi vòn
 
 Concurrency và thread-safety
 -----------------------------
-- workflow_store là dict in-memory, được bảo vệ bởi _store_lock (threading.Lock)
-  cho mọi thao tác đọc/ghi để tránh race condition.
+- Trạng thái workflow nằm trong SQLite (WorkflowStore, store.py): WAL mode,
+  connection-per-call, ghi tuần tự bằng lock — đọc/ghi an toàn giữa các thread.
 - get_workflow() dùng double-checked locking: kiểm tra trước lock, kiểm tra lại
   sau lock, đảm bảo LangGraph StateGraph chỉ được compile đúng một lần dù
   nhiều request đến đồng thời lúc khởi động.
-- _run_workflow_task chạy trong thread-pool của FastAPI BackgroundTasks.
-  WorkflowRecord được cập nhật trực tiếp (pass-by-reference) — không cần re-insert.
+- _run_workflow_task chạy trong thread-pool của FastAPI BackgroundTasks. Task giữ
+  bản WorkflowRecord của riêng nó và ghi lại (_persist) sau mỗi thay đổi đáng kể.
 - Artifact extraction chạy ngay sau mỗi node hoàn thành (non-fatal: exception
   trong extraction chỉ ghi warning log, không dừng workflow).
 
 Bộ nhớ và giới hạn
 ------------------
-- Tối đa _MAX_STORED_WORKFLOWS (50) workflow trong bộ nhớ. Entry cũ nhất bị xóa
-  khi đạt giới hạn.
+- SQLite tại WORKFLOW_DB_PATH giữ tối đa MAX_STORED_WORKFLOWS (500) workflow mới nhất;
+  bản ghi đã kết thúc cũ nhất bị xóa trước, run đang chạy không bao giờ bị xóa.
 - user_input được sanitize tại boundary: loại bỏ ký tự điều khiển, cắt tại
   _MAX_INPUT_CHARS (10.000) ký tự.
 - Mỗi workflow run được ghi vào data/memory/episodic/workflow_runs.jsonl để
@@ -93,6 +99,8 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -103,9 +111,11 @@ from artifacts import ARTIFACT_ROLES as _ARTIFACT_ROLES
 from artifacts import extract_and_save as _extract_artifacts
 from artifacts import list_artifacts as _list_artifacts
 from artifacts import read_artifact as _read_artifact
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from store import INTERRUPTED_ERROR, MAX_STORED_WORKFLOWS, WorkflowStore
 from workflow import (
     OLLAMA_BASE_URL,
     RAG_API_URL,
@@ -139,12 +149,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("agent-api")
 
-app = FastAPI(title="rag-agent-platform - Bộ điều phối SDLC Agent", version="1.0.0")
-
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
-@app.on_event("startup")
 def _validate_models_on_startup() -> None:
     """A4 — cảnh báo (KHÔNG chặn khởi động) nếu model per-role chưa được pull về Ollama.
 
@@ -173,6 +180,53 @@ def _validate_models_on_startup() -> None:
         )
     else:
         logger.info("A4: tất cả %d model per-role đã sẵn sàng trên Ollama.", len(wanted))
+
+
+# ── Kho workflow bền vững (SQLite) ──────────────────────────────────────────────
+# Khởi tạo lười (lần dùng đầu hoặc trong lifespan) — import app.py không đụng tới disk.
+# Đường dẫn DB lấy từ env WORKFLOW_DB_PATH (mặc định /data/memory/workflows.sqlite3).
+
+_store: WorkflowStore | None = None
+_store_init_lock = threading.Lock()
+
+
+def _get_store() -> WorkflowStore:
+    """Trả về WorkflowStore dùng chung, tạo + init schema ở lần gọi đầu (thread-safe)."""
+    global _store
+    if _store is None:
+        with _store_init_lock:
+            if _store is None:
+                store = WorkflowStore()
+                store.init()
+                _store = store
+    return _store
+
+
+def _init_store_and_recover() -> None:
+    """Mở SQLite store và đánh dấu failed mọi run bị bỏ dở bởi process trước (crash recovery).
+
+    Fatal: không mở được DB thì raise để container restart với log rõ ràng — chạy tiếp
+    mà không lưu được trạng thái sẽ làm mất mọi kết quả workflow.
+    """
+    _get_store().recover_interrupted(INTERRUPTED_ERROR)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Startup: kiểm tra model Ollama (non-fatal) → init SQLite store → crash recovery."""
+    _validate_models_on_startup()
+    _init_store_and_recover()
+    yield
+
+
+app = FastAPI(
+    title="rag-agent-platform - Bộ điều phối SDLC Agent",
+    version="1.0.0",
+    lifespan=_lifespan,
+)
+# File tĩnh của UI (static/vendor/<lib> → /ui/static/vendor/<lib>). /ui và /ui/ vẫn trả
+# workflow.html qua route riêng bên dưới.
+app.mount("/ui/static", StaticFiles(directory=_STATIC_DIR), name="ui-static")
 
 
 # ── Models Pydantic cho Request và Response của các endpoint ────────────────────────────────────────
@@ -243,15 +297,8 @@ class WorkflowRecord(BaseModel):
     completed_at: str | None = None
 
 
-# ── In-memory workflow store — đồng bộ hóa bằng _store_lock ───────────────────
-# workflow_store lưu kết quả của tất cả workflow trong RAM. Giới hạn
-# _MAX_STORED_WORKFLOWS entry — entry cũ nhất bị xóa khi đạt giới hạn.
-# Môi trường production cần Redis hoặc database để persistence.
-
-workflow_store: dict[str, WorkflowRecord] = {}
-_store_lock = threading.Lock()
-
-_MAX_STORED_WORKFLOWS = 50
+# Số workflow tối đa GET /workflows trả về mặc định (UI render mọi dòng).
+_LIST_DEFAULT_LIMIT = 50
 # Số vòng lặp Clarifier re-generation tối đa. 0 = tắt toàn bộ tính năng.
 # Tăng lên 2 nếu muốn nhiều vòng tinh chỉnh hơn (tốn thêm thời gian).
 _CLARIFIER_REGEN_LOOPS: int = int(os.environ.get("CLARIFIER_REGEN_LOOPS", "1"))
@@ -322,37 +369,51 @@ def _log_workflow_run(
 
 
 def _store_workflow(record: WorkflowRecord) -> None:
-    """Lưu *record* vào workflow_store, tự động xóa entry cũ nhất khi store đạt giới hạn.
+    """Lưu (upsert) *record* vào SQLite store; retention do store tự áp dụng.
 
-    Thread-safe: dùng _store_lock để đồng bộ hóa ghi vào dict in-memory.
+    C4 giữ nguyên: store chỉ xóa bản ghi đã KẾT THÚC — run pending/running không bị xóa.
     """
-    with _store_lock:
-        if len(workflow_store) >= _MAX_STORED_WORKFLOWS:
-            # C4: chỉ evict entry đã KẾT THÚC (completed/failed) và cũ nhất.
-            # Không bao giờ xóa workflow đang pending/running để tránh mất kết quả
-            # của một run đang dở (dict giữ thứ tự chèn → phần tử đầu là cũ nhất).
-            evictable = [
-                k for k, v in workflow_store.items()
-                if v.status in (WorkflowStatus.completed, WorkflowStatus.failed)
-            ]
-            if evictable:
-                del workflow_store[evictable[0]]
-            else:
-                logger.warning(
-                    "workflow_store đạt giới hạn (%d) nhưng mọi entry đang chạy — "
-                    "tạm thời vượt giới hạn thay vì drop một run đang dở.",
-                    _MAX_STORED_WORKFLOWS,
-                )
-        workflow_store[record.workflow_id] = record
+    _get_store().save(record.model_dump(mode="json"))
+
+
+def _persist(record: WorkflowRecord) -> None:
+    """Ghi lại *record* từ background task — non-fatal (lỗi DB không được làm hỏng workflow).
+
+    Nếu ghi thất bại, GET /workflow/{id} tạm thấy trạng thái cũ; lần ghi sau (hoặc recovery
+    lúc restart) sẽ đồng bộ lại.
+    """
+    try:
+        _store_workflow(record)
+    except Exception as exc:
+        logger.warning("Ghi workflow %s vào store thất bại (non-fatal): %s", record.workflow_id, exc)
+
+
+def _load_workflow(workflow_id: str) -> WorkflowRecord | None:
+    """Đọc WorkflowRecord từ SQLite store; None nếu không có hoặc dữ liệu không hợp lệ."""
+    data = _get_store().get(workflow_id)
+    if data is None:
+        return None
+    try:
+        return WorkflowRecord.model_validate(data)
+    except Exception as exc:
+        logger.warning("Bản ghi workflow %s không hợp lệ (bỏ qua): %s", workflow_id, exc)
+        return None
 
 
 def _reconstruct_from_disk(workflow_id: str) -> WorkflowRecord | None:
-    """W2 — dựng lại WorkflowRecord từ disk khi record đã bị evict khỏi store in-memory.
+    """W2 — fallback: dựng lại WorkflowRecord từ disk cho run cũ KHÔNG có trong SQLite store.
+
+    Chỉ dùng khi store không có bản ghi (run trước khi có SQLite, hoặc đã bị retention
+    xóa). Kết quả chỉ để đọc — KHÔNG ghi ngược vào store.
 
     Nguồn dữ liệu bền vững: episodic JSONL (metadata: status, project, completed_steps,
     error, timestamp) + artifacts trên disk (_output.md của từng role → step_outputs).
     Không khôi phục được output của role không sinh artifact (planning roles). Trả về
     None nếu không có cả episodic entry lẫn artifact nào trên disk.
+
+    Dòng JSONL chỉ được ghi khi run KẾT THÚC. Có artifact mà không có dòng JSONL nghĩa là
+    container đã chết giữa chừng → báo failed với lỗi INTERRUPTED_ERROR (không phải
+    completed như trước) và completed_at=None.
     """
     disk_arts = _list_artifacts(workflow_id)
     meta: dict | None = None
@@ -380,12 +441,29 @@ def _reconstruct_from_disk(workflow_id: str) -> WorkflowRecord | None:
         if res:
             step_outputs[role] = res[0]
 
-    meta = meta or {}
-    try:
-        status = WorkflowStatus(meta.get("status", "completed"))
-    except ValueError:
-        status = WorkflowStatus.completed
     now_iso = datetime.now(timezone.utc).isoformat()
+    if meta is None:
+        # Không có dòng hoàn tất trong JSONL → run bị gián đoạn giữa chừng.
+        return WorkflowRecord(
+            workflow_id=workflow_id,
+            status=WorkflowStatus.failed,
+            project=None,
+            user_input="",
+            step_outputs=step_outputs,
+            completed_steps=list(disk_arts.keys()),
+            error=INTERRUPTED_ERROR,
+            artifacts=disk_arts,
+            created_at=now_iso,
+            completed_at=None,
+        )
+
+    try:
+        status = WorkflowStatus(meta.get("status", "failed"))
+    except ValueError:
+        status = WorkflowStatus.failed
+    if status in (WorkflowStatus.pending, WorkflowStatus.running):
+        # JSONL chỉ ghi lúc kết thúc — trạng thái "đang chạy" ở đây là dữ liệu bất thường.
+        status = WorkflowStatus.failed
     return WorkflowRecord(
         workflow_id=workflow_id,
         status=status,
@@ -408,17 +486,21 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
     Được gọi bởi FastAPI BackgroundTasks — chạy trong thread-pool thread riêng biệt.
 
     Thread-safety:
-    - Chỉ một background task tồn tại cho mỗi workflow_id.
-    - WorkflowRecord được cập nhật trực tiếp (pass-by-reference) vì dict
-      là kiểu tham chiếu — không cần re-insert vào store.
-    - Các endpoint đọc (GET /workflow/{id}) chỉ đọc các trường được ghi nguyên tử.
+    - Chỉ một background task tồn tại cho mỗi workflow_id; task giữ bản WorkflowRecord
+      riêng (đọc từ store) và là nơi DUY NHẤT ghi record này cho tới khi kết thúc.
+    - Sau mỗi thay đổi đáng kể (running, mỗi node, mỗi bước regen, kết thúc) record được
+      ghi lại vào SQLite qua _persist() → GET /workflow/{id} phản ánh tiến trình.
     """
-    with _store_lock:
-        record = workflow_store.get(workflow_id)
+    try:
+        record = _load_workflow(workflow_id)
+    except Exception:
+        logger.exception("Workflow %s: không đọc được record từ store", workflow_id)
+        return
     if record is None:
         return
 
     record.status = WorkflowStatus.running
+    _persist(record)
     logger.info("Workflow %s started", workflow_id)
 
     # user_input đã được sanitize lúc enqueue và lưu vào record — tái sử dụng trực tiếp
@@ -440,7 +522,6 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
 
     _start = time.monotonic()
     try:
-        final_state: SDLCState = {}  # type: ignore[assignment]
         _node_errors: list[str] = []
         _timed_out = False
         for chunk in get_workflow().stream(initial_state, stream_mode="updates"):
@@ -472,7 +553,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                         )
                     if node_output.get("error"):
                         _node_errors.append(str(node_output["error"]))
-                    final_state.update(node_output)
+            # Ghi tiến trình sau mỗi node để GET /workflow/{id} (đọc từ SQLite) thấy ngay.
+            _persist(record)
             # W1: kiểm tra ngân sách thời gian SAU mỗi node (không mất output node vừa xong).
             if _WORKFLOW_MAX_SECONDS and (time.monotonic() - _start) > _WORKFLOW_MAX_SECONDS:
                 _timed_out = True
@@ -488,6 +570,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
         if _timed_out:
             record.error = (record.error + " | " if record.error else "") + \
                 f"[Timeout: vượt {_WORKFLOW_MAX_SECONDS}s, dừng sớm]"
+        # Chưa ghi 'completed' vào store ở đây: regen loop có thể chạy tiếp → client poll
+        # không được thấy 'completed' sớm rồi dừng. finally ghi trạng thái cuối + completed_at.
         record.status = WorkflowStatus.completed
 
         # ── Clarifier Regen Loop ───────────────────────────────────────────────────────────────────
@@ -512,6 +596,7 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                     _loop_idx + 1, _CLARIFIER_REGEN_LOOPS, regen_roles,
                 )
                 record.status = WorkflowStatus.running
+                _persist(record)
 
                 # Re-run từng agent được đề xuất theo thứ tự WORKFLOW_STEPS (dependency order).
                 for _role in regen_roles:
@@ -542,6 +627,7 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                             "Clarifier regen loop %d: %s re-generated (%d chars)",
                             _loop_idx + 1, _role, len(_new_output),
                         )
+                        _persist(record)
                     except Exception as _regen_exc:
                         logger.warning(
                             "Clarifier regen loop %d: re-gen '%s' thất bại (non-fatal): %s",
@@ -563,6 +649,7 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                     )
                     _live_outputs["clarifier"] = _new_clarifier
                     record.step_outputs["clarifier"] = _new_clarifier
+                    _persist(record)
                     logger.info(
                         "Clarifier regen loop %d: clarifier re-run xong (%d chars)",
                         _loop_idx + 1, len(_new_clarifier),
@@ -584,6 +671,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
         record.error = str(exc)
     finally:
         record.completed_at = datetime.now(timezone.utc).isoformat()
+        # _persist không raise → không che exception gốc (nếu có).
+        _persist(record)
         _duration = time.monotonic() - _start
         logger.info("Workflow %s hoàn thành với status=%s",
                     workflow_id, record.status)
@@ -702,10 +791,9 @@ def start_workflow(req: WorkflowRunRequest, background_tasks: BackgroundTasks) -
 @app.get("/workflow/{workflow_id}", response_model=WorkflowRecord)
 def get_workflow_status(workflow_id: str) -> WorkflowRecord:
     """Trả về trạng thái hiện tại của một lần chạy workflow (pending / running / completed / failed)."""
-    with _store_lock:
-        record = workflow_store.get(workflow_id)
+    record = _load_workflow(workflow_id)
     if record is None:
-        # W2: store in-memory bị evict → thử dựng lại từ disk (episodic log + artifacts).
+        # W2: không có trong SQLite (run cũ / đã bị retention xóa) → dựng lại từ disk.
         record = _reconstruct_from_disk(workflow_id)
     if record is None:
         raise HTTPException(
@@ -716,23 +804,24 @@ def get_workflow_status(workflow_id: str) -> WorkflowRecord:
 
 
 @app.get("/workflows")
-def list_workflows() -> dict[str, Any]:
-    """Liệt kê các workflow gần đây (mới nhất trước, tối đa _MAX_STORED_WORKFLOWS bản ghi)."""
-    with _store_lock:
-        snapshot = list(workflow_store.values())
+def list_workflows(
+    limit: int = Query(_LIST_DEFAULT_LIMIT, ge=1, le=MAX_STORED_WORKFLOWS),
+) -> dict[str, Any]:
+    """Liệt kê các workflow gần đây (mới nhất trước; mặc định 50, tối đa MAX_STORED_WORKFLOWS)."""
+    rows = _get_store().list_recent(limit)
     return {
-        "count": len(snapshot),
+        "count": len(rows),
         "workflows": [
             {
-                "workflow_id": r.workflow_id,
-                "status": r.status,
-                "project": r.project,
-                "completed_steps": len(r.completed_steps),
+                "workflow_id": r["workflow_id"],
+                "status": r["status"],
+                "project": r["project"],
+                "completed_steps": r["completed_steps"],
                 "total_steps": len(WORKFLOW_STEPS),
-                "created_at": r.created_at,
-                "completed_at": r.completed_at,
+                "created_at": r["created_at"],
+                "completed_at": r["completed_at"],
             }
-            for r in reversed(snapshot)
+            for r in rows
         ],
     }
 
@@ -740,16 +829,15 @@ def list_workflows() -> dict[str, Any]:
 @app.get("/workflow/{workflow_id}/artifacts")
 def get_workflow_artifacts(workflow_id: str) -> dict[str, Any]:
     """Liệt kê artifacts đã lưu cho workflow (metadata only, không bao gồm nội dung file)."""
-    with _store_lock:
-        record = workflow_store.get(workflow_id)
-    # Merge in-memory artifacts with disk (in case container was restarted/evicted).
+    record = _load_workflow(workflow_id)
+    # Merge artifacts của record (SQLite) với disk (record đã bị retention xóa vẫn đọc được).
     disk_arts = _list_artifacts(workflow_id)
     if record is None and not disk_arts:
         raise HTTPException(
             status_code=404,
             detail=f"Workflow '{workflow_id}' không tìm thấy.",
         )
-    # W2: nếu record đã evict nhưng artifact còn trên disk, vẫn trả về được.
+    # W2: nếu record không còn trong store nhưng artifact còn trên disk, vẫn trả về được.
     merged = {**disk_arts, **(record.artifacts if record else {})}
     return {"workflow_id": workflow_id, "artifacts": merged}
 
