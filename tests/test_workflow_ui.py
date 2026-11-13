@@ -63,6 +63,7 @@ const LIBS = {
     broken: {},
   },
   DOMPurify: { ok: { sanitize(h, cfg) { calls.push(['sanitize', cfg]); return 'CLEAN:' + h; } } },
+  hljs: { ok: { highlightElement(el) { calls.push(['hl', el.id]); if (el.id === 'bad') throw new Error('x'); } } },
 };
 const ctx = { window: { location: { search: '' } }, URLSearchParams, console: { warn() {} },
   document: { getElementById: el } };
@@ -74,6 +75,8 @@ process.stdout.write(JSON.stringify({
   diagram: (input.diagram || []).map(s => ctx.looksLikeAsciiDiagram(s)),
   promote: (input.promote || []).map(t => { const tok = { ...t }; ctx.promoteAsciiDiagram(tok); return tok; }),
   render: (input.render || []).map(s => ctx.renderMarkdown(s)),
+  highlight: (input.highlight || []).map(ids => ctx.highlightCode({
+    querySelectorAll(sel) { calls.push(['sel', sel]); return ids.map(id => ({ id })); } })),
   calls,
 }));
 """
@@ -240,3 +243,15 @@ def test_vendor_libs_present_render_sanitized_markdown():
     assert ["setOptions", {"breaks": True, "gfm": True}] in calls
     assert ["use", "function"] in calls
     assert ["sanitize", _FORBID] in calls
+
+
+@pytest.mark.parametrize("with_hljs", [True, False], ids=["hljs", "no-hljs"])
+def test_highlight_only_explicit_languages_and_never_throws(with_hljs):
+    """Khối ``` không ghi ngôn ngữ không bị hljs tự đoán; lỗi ở một khối không làm hỏng lượt render."""
+    libs = {"marked": "ok", "DOMPurify": "ok", **({"hljs": "ok"} if with_hljs else {})}
+    calls = _run_js({"libs": libs, "highlight": [["a", "bad", "b"]]})["calls"]
+    hl = [c for c in calls if c[0] in ("sel", "hl")]
+    if with_hljs:
+        assert hl == [["sel", 'pre code[class*="language-"]'], ["hl", "a"], ["hl", "bad"], ["hl", "b"]]
+    else:
+        assert hl == []

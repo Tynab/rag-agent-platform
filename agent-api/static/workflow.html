@@ -579,6 +579,12 @@
     }
     /* Override hljs background to match theme */
     .hljs { background: var(--surface) !important; }
+    /* highlight.js chỉ tô màu chữ; nền/padding/cuộn do <pre> bọc ngoài quyết định. Theme
+       cho code.hljs display:block + padding 1em + overflow riêng → hộp lồng hộp trong
+       .md pre và thanh cuộn ngang lồng trong khung cuộn của <pre>. */
+    .md pre code.hljs, .art-viewer-body code.hljs {
+      display: inline; padding: 0; overflow: visible; background: transparent !important;
+    }
     /* Markdown code blocks: scrollable, not overflowing */
     .md pre { max-height: 520px; overflow-y: auto; overflow-x: auto;
               border-radius: 6px; margin: 8px 0;
@@ -1138,9 +1144,7 @@ function renderTabBody(data) {
       if (btnFil) btnFil.classList.add('active');
     }
     // Apply syntax highlighting to code blocks inside rendered markdown
-    if (window.hljs) {
-      body.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
-    }
+    highlightCode(body);
     // Wrap every table in a scrollable container so wide tables don't overflow
     body.querySelectorAll('.md table').forEach(tbl => {
       const wrap = document.createElement('div');
@@ -1242,6 +1246,17 @@ function renderMarkdown(src) {
   // KHÔNG bao giờ chèn HTML của marked khi thiếu DOMPurify — chỉ text đã esc().
   return `<p class="md-fallback-note">⚠️ Không định dạng được markdown — đang hiện nội dung thô.</p>`
        + `<pre class="md-fallback">${esc(src)}</pre>`;
+}
+
+// Tô màu code bằng highlight.js (nếu đã tải). Chỉ khối có ngôn ngữ rõ ràng
+// (```python → class language-python; viewer artifact luôn có): khối ``` không ghi ngôn
+// ngữ thường là cây thư mục/sơ đồ/log — để hljs tự đoán sẽ tô màu bừa. Lỗi của một khối
+// không được làm hỏng cả lượt render (→ trang ngừng poll).
+function highlightCode(root) {
+  if (typeof hljs === 'undefined') return;
+  root.querySelectorAll('pre code[class*="language-"]').forEach(el => {
+    try { hljs.highlightElement(el); } catch (e) { console.warn('highlight.js lỗi:', e); }
+  });
 }
 
 /* ── Sơ đồ ASCII không bọc code fence ───────────────────────────────── */
@@ -1523,9 +1538,7 @@ async function viewArtifact(role, path) {
         <button class="btn btn-secondary btn-sm" onclick="closeArtViewer()">✕</button>
       </div>
       <pre class="art-viewer-body"><code class="language-${esc(lang)}">${escaped}</code></pre>`;
-    if (window.hljs) {
-      viewer.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
-    }
+    highlightCode(viewer);
     const _reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     viewer.scrollIntoView({ behavior: _reduce ? 'auto' : 'smooth', block: 'nearest' });
   } catch (e) { /* ignore */ }
