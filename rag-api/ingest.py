@@ -746,6 +746,10 @@ class _PipelineResult:
     stale_ids: list[str] | None
     failed_batches: int = 0
     batch_error: str | None = None
+    # reset=True và collection cũ ĐÃ bị xóa/dựng lại (có batch embed thành công, hoặc project
+    # không còn chunk nào). False khi mọi batch lỗi → index cũ được giữ → graph Neo4j cũng
+    # phải giữ nguyên cho khớp.
+    reset_applied: bool = False
 
 
 async def _run_async_pipeline(
@@ -882,6 +886,7 @@ async def _run_async_pipeline(
         stale_ids=stale_ids,
         failed_batches=len(failed),
         batch_error=f"{type(failed[0]).__name__}: {failed[0]}" if failed else None,
+        reset_applied=reset and not gate.drop_pending,
     )
 
 
@@ -1004,7 +1009,9 @@ def _plan_graph_writes(
 ) -> tuple[list[tuple], list[tuple]]:
     """Ingest tăng dần cho Neo4j — trả về (pairs cần ghi, pairs mới cần trích xuất thực thể).
 
-    - reset=True: graph của project vừa bị xóa → ghi + trích xuất toàn bộ như trước.
+    - reset=True: graph của project vừa bị xóa (chỉ khi Qdrant đã dựng lại —
+      _PipelineResult.reset_applied) → ghi + trích xuất toàn bộ chunk đã vào Qdrant.
+      Reset lỗi toàn bộ thì *pairs* rỗng → không ghi gì, graph cũ giữ nguyên.
     - Không-reset: hỏi Neo4j chunk hiện tại nào ĐÃ có node (existing_chunk_ids). Chunk
       thiếu là chunk mới/đã sửa — hoặc mọi chunk khi project chưa có graph (vd. vừa bật
       GRAPH_ENABLED) hay graph dở dang do lần ingest trước lỗi → dựng bù đủ. Chỉ chunk
@@ -1049,12 +1056,6 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
 
     chunks = split_documents(docs)
 
-    if reset and GRAPH_ENABLED and _graph_module is not None:
-        try:
-            _graph_module.delete_project_graph(project)
-        except Exception as exc:
-            logger.warning("Graph delete failed (non-fatal): %s", exc)
-
     # Async pipeline: embed + upsert INGEST_EMBED_WORKERS batch đồng thời (chỉ chunk mới
     # khi không-reset).
     result = asyncio.run(
@@ -1068,6 +1069,19 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
     # ── Tích hợp Neo4j graph ──────────────────────────────────────────────────
     graph_chunks_saved = 0
     if GRAPH_ENABLED and _graph_module is not None:
+        # reset: xóa graph cũ SAU pipeline và chỉ khi Qdrant thật sự đã dựng lại — trước đây
+        # graph bị xóa trước khi embed, nên reset lỗi (Ollama down, model chưa pull) để lại
+        # Neo4j trống trong khi Qdrant vẫn giữ index cũ.
+        if reset and result.reset_applied:
+            try:
+                _graph_module.delete_project_graph(project)
+            except Exception as exc:
+                logger.warning("Graph delete failed (non-fatal): %s", exc)
+        elif reset:
+            logger.warning(
+                "Reset project=%s: không batch embed nào thành công → giữ nguyên graph Neo4j.",
+                project,
+            )
         try:
             _graph_module.setup_schema()
             # Chỉ chunk ĐANG có trong Qdrant (không đổi + vừa upsert thành công) mới được

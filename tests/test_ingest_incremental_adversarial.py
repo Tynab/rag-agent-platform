@@ -434,23 +434,41 @@ def test_graph_failed_batch_keeps_old_chunk_and_skips_failed_chunk(env, graph, m
     assert graph.saved[-1] == sorted(d_ids)  # chunk a.md mới (lỗi embed) KHÔNG được ghi
 
 
-def test_graph_wiped_by_failed_reset_is_rebuilt_without_embedding(env, graph):
+def test_failed_reset_keeps_graph_and_next_ingest_rewrites_nothing(env, graph):
     proj, store, state, write, embedded, index = env
     _seed(write)
     ingest.ingest(project=PROJECT)
+    before_graph = dict(graph.chunks)
     embedded()
 
     state["status"] = 503
-    ingest.ingest(project=PROJECT, reset=True)
-    assert graph.deleted_projects == [PROJECT]
-    assert len(index()) == 3  # Qdrant giữ nguyên dù reset thất bại
+    result = ingest.ingest(project=PROJECT, reset=True)
+    assert result["failed_batches"] == 1
+    assert graph.deleted_projects == []  # Qdrant giữ index cũ → graph cũng giữ nguyên
+    assert graph.chunks == before_graph
+    assert len(index()) == 3
     assert len(embedded()) == 3  # reset đã thử embed (và lỗi)
 
     state["status"] = 200
     result = ingest.ingest(project=PROJECT)
 
-    # Qdrant không có gì mới → 0 embed, nhưng graph trống → dựng lại đủ.
+    # Không có gì mới ở cả Qdrant lẫn Neo4j → 0 embed, 0 chunk graph ghi lại.
     assert embedded() == []
     assert set(graph.chunks) == set(index())
     assert graph.keep_calls[-1] == set(index())
-    assert result["graph_chunks_saved"] == 3 and result["stale_removed"] == 0
+    assert result["graph_chunks_saved"] == 0 and result["stale_removed"] == 0
+
+
+def test_partial_reset_rebuilds_graph_from_embedded_chunks_only(env, graph, monkeypatch):
+    proj, store, state, write, embedded, index = env
+    _seed(write)
+    ingest.ingest(project=PROJECT)
+    monkeypatch.setattr(ingest, "UPSERT_BATCH_SIZE", 1)
+    state["fail"] = "alpha"  # batch của a.md lỗi, b.md/c.md thành công
+
+    result = ingest.ingest(project=PROJECT, reset=True)
+
+    assert result["failed_batches"] == 1
+    assert graph.deleted_projects == [PROJECT]  # Qdrant đã dựng lại → graph dựng lại theo
+    assert sorted(index().values()) == ["b.md", "c.md"]
+    assert set(graph.chunks) == set(index())  # graph khớp đúng các chunk đã có vector
