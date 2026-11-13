@@ -210,3 +210,20 @@ def test_concurrent_writers_and_readers(db):
     assert not errors
     assert db.count() == 6
     assert all(r["completed_steps"] == 20 for r in db.list_recent(10))
+
+
+def test_cancelled_is_finished_for_retention_and_recovery(tmp_path):
+    assert "cancelled" in store_mod.FINISHED_STATUSES
+    assert not set(store_mod.FINISHED_STATUSES) & set(store_mod.ACTIVE_STATUSES)
+    s = WorkflowStore(tmp_path / "wf.sqlite3", max_records=2)
+    s.init()
+    s.save(_rec("old-cancelled", status="cancelled", created_at=_ts(0), error="Đã hủy"))
+    s.save(_rec("old-pending", status="pending", created_at=_ts(1)))
+    s.save(_rec("new-1", created_at=_ts(2)))
+    s.save(_rec("new-2", status="cancelled", created_at=_ts(3)))
+    # Bản ghi cancelled cũ bị retention xóa như completed/failed; run pending thì không.
+    assert {r["workflow_id"] for r in s.list_recent(10)} == {"old-pending", "new-1", "new-2"}
+
+    before = _raw_rows(s.db_path)["new-2"]
+    assert s.recover_interrupted() == ["old-pending"]
+    assert _raw_rows(s.db_path)["new-2"] == before, "recovery không được đụng tới run đã hủy"

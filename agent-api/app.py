@@ -779,6 +779,12 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
     if record is None:
         logger.warning("Workflow %s: không có record hợp lệ trong store — bỏ qua.", workflow_id)
         return
+    if record.status in _TERMINAL_STATUSES:
+        # Phòng thủ: record đã kết thúc (đã hủy / recovery) thì không bao giờ chạy lại.
+        logger.warning(
+            "Workflow %s đã kết thúc (status=%s) — bỏ qua, không chạy.", workflow_id, record.status.value
+        )
+        return
 
     def _cancel_requested() -> bool:
         return queue.is_cancel_requested(workflow_id)
