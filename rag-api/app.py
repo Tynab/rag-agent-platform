@@ -24,14 +24,17 @@ POST /ingest
     Ingest tài liệu vào Qdrant và Neo4j (nếu GRAPH_ENABLED=true).
     Body tùy chọn: {"project": "tên_project", "reset": false}
     - Nếu không truyền project: ingest tất cả project có trong RAW_DATA_DIR.
-    - reset=true: xóa collection cũ trước, sau đó ingest lại toàn bộ.
+    - reset=true: embed lại toàn bộ; collection cũ chỉ bị xóa khi batch embed đầu tiên
+      thành công (Ollama down / model chưa pull → giữ nguyên index cũ, xem
+      `failed_batches` + `batch_error`).
     - Idempotent + tăng dần: point_id tất định theo nội dung → chỉ chunk mới/đã sửa được
       embed + upsert; chunk không đổi bỏ qua (`skipped_unchanged`), chunk của file đã
       sửa/xóa bị dọn khỏi Qdrant + Neo4j (`stale_removed`).
 
 POST /reset-ingest
     Xóa toàn bộ collection (hoặc một project cụ thể) rồi ingest lại từ đầu.
-    Tương đương gọi /ingest với reset=true.
+    Tương đương gọi /ingest với reset=true (collection Qdrant cũ chỉ bị xóa khi embed
+    thành công — xem trên).
 
 POST /ask
     Hỏi đáp RAG hybrid (Qdrant + Neo4j + LLM).

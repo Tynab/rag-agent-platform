@@ -54,6 +54,9 @@ Tập giữ lại là MỌI chunk hiện tại (mới + không đổi), không c
 Lưu ý: payload của chunk không đổi KHÔNG được ghi lại (doc_type/module suy luận,
 source_path, created_at giữ giá trị lần embed đầu) — sau khi đổi luật suy luận
 metadata hoặc RAW_DATA_DIR, chạy /reset-ingest để làm mới.
+reset=True embed lại toàn bộ; collection cũ chỉ bị xóa khi batch embed THẬT đầu tiên
+thành công → Ollama down / EMBEDDING_MODEL mới chưa pull thì index cũ được giữ nguyên
+(response có failed_batches + batch_error) thay vì bị xóa trắng.
 
 Metadata của mỗi chunk trong Qdrant
 ------------------------------------
@@ -539,14 +542,43 @@ class _CollectionGate:
     collection ngay trước khi upsert. ensure() không có await bên trong nên các coroutine
     batch chạy đồng thời không thể chen ngang giữa bước kiểm tra và bước tạo; batch đầu
     lỗi thì batch thành công kế tiếp tạo collection.
+
+    *drop_existing* (reset=True): collection cũ CHỈ bị xóa ở batch embed thành công đầu
+    tiên, ngay trước khi tạo lại theo số chiều mới. Trước đây embed "health check" lỗi
+    (Ollama down, EMBEDDING_MODEL mới chưa pull) làm /reset-ingest dừng TRƯỚC bước xóa;
+    nếu xóa ngay từ đầu thì mọi batch lỗi sẽ để lại project không còn index nào.
     """
 
-    def __init__(self, client: QdrantClient, collection_name: str, vector_size: int | None) -> None:
+    def __init__(
+        self,
+        client: QdrantClient,
+        collection_name: str,
+        vector_size: int | None,
+        *,
+        drop_existing: bool = False,
+    ) -> None:
         self._client = client
         self._collection_name = collection_name
         self._vector_size = vector_size
+        self._drop_pending = drop_existing
+
+    @property
+    def drop_pending(self) -> bool:
+        """True nếu reset chưa xóa collection cũ (chưa batch embed nào thành công)."""
+        return self._drop_pending
+
+    def drop_if_pending(self) -> None:
+        """reset: xóa collection cũ (một lần) — số chiều cũ không còn ràng buộc batch sau."""
+        if not self._drop_pending:
+            return
+        self._drop_pending = False
+        self._vector_size = None
+        if self._client.collection_exists(self._collection_name):
+            logger.warning("Deleting collection before reset: %s", self._collection_name)
+            self._client.delete_collection(self._collection_name)
 
     def ensure(self, dim: int) -> None:
+        self.drop_if_pending()
         if self._vector_size is None:
             _ensure_collection(self._client, self._collection_name, vector_size=dim)
             self._vector_size = dim
@@ -587,7 +619,15 @@ async def _embed_and_upsert_batch_async(
                     json={"model": EMBEDDING_MODEL, "input": texts},
                 )
                 resp.raise_for_status()
-                vectors = resp.json()["embeddings"]
+                embeddings = resp.json()["embeddings"]
+                # Số vector phải khớp số chunk: zip() bên dưới cắt im lặng → chunk thiếu
+                # vector bị coi như đã upsert, bước dọn F11 xóa bản cũ của nó → index thủng.
+                # Coi là batch lỗi (retry như lỗi HTTP) — không bao giờ chạm tới gate/dọn.
+                if len(embeddings) != len(texts):
+                    raise ValueError(
+                        f"Ollama /api/embed trả {len(embeddings)} vector cho {len(texts)} chunk"
+                    )
+                vectors = embeddings
                 break
             except Exception as exc:
                 if _attempt >= _INGEST_EMBED_RETRIES:
@@ -719,7 +759,9 @@ async def _run_async_pipeline(
       • Ingest không-reset: tra các point_id hiện tại đã có trong collection
         (_existing_point_ids) → chỉ embed + upsert chunk có ID mới; chunk không đổi
         được bỏ qua. Không có chunk mới → không tạo HTTP client, không gọi Ollama.
-      • reset=True: xóa collection rồi embed + upsert toàn bộ như trước.
+      • reset=True: embed + upsert toàn bộ như trước; collection cũ bị xóa ở batch embed
+        thành công đầu tiên (_CollectionGate) → Ollama down/model chưa pull thì mọi batch
+        lỗi và index cũ được GIỮ NGUYÊN (failed_batches/batch_error trong response).
       • Không còn embed "health check": vector size đọc từ config collection có sẵn,
         hoặc lấy từ batch embed thật đầu tiên khi phải tạo collection (_CollectionGate).
       • asyncio.gather gửi tất cả batch cùng lúc.
@@ -732,16 +774,15 @@ async def _run_async_pipeline(
     all_ids = [pid for _, pid in pairs]
 
     sync_client = QdrantClient(url=QDRANT_URL)
-    if reset and sync_client.collection_exists(collection_name):
-        logger.warning("Deleting collection before reset: %s", collection_name)
-        sync_client.delete_collection(collection_name)
 
+    # reset=True: KHÔNG xóa collection ở đây (gate xóa khi có batch embed thành công) và
+    # KHÔNG đọc vector size / ID cũ — collection sẽ dựng lại, thường chính vì
+    # EMBEDDING_MODEL đổi số chiều (đọc size cũ sẽ làm gate báo lệch dimension oan).
     vector_size: int | None = None
     existing_ids: set[str] = set()
-    if sync_client.collection_exists(collection_name):
+    if not reset and sync_client.collection_exists(collection_name):
         vector_size = collection_vector_size(sync_client, collection_name)
-        if not reset:
-            existing_ids = _existing_point_ids(sync_client, collection_name, all_ids)
+        existing_ids = _existing_point_ids(sync_client, collection_name, all_ids)
 
     new_chunks = [chunk for chunk, pid in pairs if pid not in existing_ids]
     unchanged = [(chunk, pid) for chunk, pid in pairs if pid in existing_ids]
@@ -752,8 +793,11 @@ async def _run_async_pipeline(
 
     results: list[list[tuple] | BaseException] = []
     total_batches = 0
-    if new_chunks:
-        gate = _CollectionGate(sync_client, collection_name, vector_size)
+    gate = _CollectionGate(sync_client, collection_name, vector_size, drop_existing=reset)
+    if not new_chunks:
+        # reset mà project không có chunk nào → không có gì để embed: xóa ngay như trước.
+        gate.drop_if_pending()
+    else:
         # read = RAG_TIMEOUT (trước đây hardcode 600 nên RAG_TIMEOUT không có tác dụng lúc ingest).
         timeout = httpx.Timeout(connect=10.0, read=_EMBED_HTTP_TIMEOUT, write=60.0, pool=10.0)
         async with httpx.AsyncClient(timeout=timeout) as http_client:
@@ -794,6 +838,11 @@ async def _run_async_pipeline(
     upserted: list[tuple] = [
         pair for r in results if not isinstance(r, BaseException) for pair in r
     ]
+    if gate.drop_pending:
+        logger.warning(
+            "Reset project=%s: không batch embed nào thành công → GIỮ NGUYÊN collection cũ '%s'.",
+            project, collection_name,
+        )
 
     # Không còn embed "health check" tạo sẵn collection: nếu mọi batch lỗi (hoặc project
     # không có chunk nào) thì collection có thể chưa tồn tại → không scroll/count trên nó.
