@@ -1026,7 +1026,7 @@ def test_tables_wrap_with_sticky_header_and_tabs_stick_below_header():
     cells = _css_rule(".md th, .md td")
     assert "nowrap" not in cells and "min-width" in cells
     assert "max-content" not in _css_rule(".md table") and "separate" in _css_rule(".md table")
-    assert "sticky" in _css_rule(".md th") and "nowrap" in _css_rule(".md td:first-child")
+    assert "sticky" in _css_rule(".md th") and "nowrap" in _css_rule(".md table.first-col-nowrap td:first-child")
     assert "max-height" in _css_rule(".md .table-wrap")
     tabs = _css_rule(".tabs-nav")
     assert "position: sticky" in tabs and "top: var(--header-h)" in tabs
@@ -1068,3 +1068,22 @@ def test_extra_highlight_grammars_register_after_the_core_bundle():
     proc = subprocess.run([node, "-e", js, *files], capture_output=True, text=True, timeout=30, check=False)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == [True] * 5
+
+
+def test_table_first_column_stays_on_one_line_only_when_short():
+    """Cột đầu nowrap chỉ khi mọi ô ngắn (ID / tên ngắn) — cột đầu là câu dài phải được xuống dòng."""
+    res = _run_sm([["eval", """[
+      shortFirstColumn(['FR-001', '  NFR-001  ', 'Password reset']),
+      shortFirstColumn(['FR-001', 'The system will be deployed on a single VM with 16 GB RAM']),
+      shortFirstColumn(['x'.repeat(32)]), shortFirstColumn(['x'.repeat(33)]), shortFirstColumn([]),
+    ]"""]])
+    assert res["out"][0] == [True, False, True, False, True]
+
+
+def test_ui_artifact_roles_match_backend():
+    """ARTIFACT_ROLES của UI (quyết định khi nào tải lại /artifacts) phải khớp agent-api/artifacts.py."""
+    import artifacts
+
+    m = re.search(r"const ARTIFACT_ROLES\s*=\s*new Set\(\[([^\]]*)\]\)", _inline_script())
+    assert m, "không thấy ARTIFACT_ROLES trong workflow.html"
+    assert set(re.findall(r"'([a-z_]+)'", m.group(1))) == set(artifacts.ARTIFACT_ROLES)

@@ -567,8 +567,9 @@
       font-family: inherit; /* keep the same stack — don't inherit from .md code */ }
     /* Bảng: ô được xuống dòng — trước đây th/td nowrap + width:max-content làm bảng yêu cầu
        rộng ~2× màn hình. Bảng vừa khung (width 100%); chỉ khi tổng độ rộng tối thiểu của các
-       cột (mỗi cột ≥ 8em, cột đầu + hàng tiêu đề giữ một dòng) vượt khung thì .table-wrap mới
-       cuộn ngang. Bảng cao bị giới hạn 70vh, cuộn dọc bên trong với hàng tiêu đề dính trên. */
+       cột (mỗi cột 8em–40em, hàng tiêu đề + cột đầu NGẮN giữ một dòng) vượt khung thì
+       .table-wrap mới cuộn ngang. Bảng cao bị giới hạn 70vh, cuộn dọc bên trong với hàng tiêu
+       đề dính trên. */
     .md .table-wrap { overflow: auto; width: 100%; max-height: 70vh; margin: 1em 0;
       /* thin custom scrollbar */
       scrollbar-width: thin;
@@ -590,7 +591,7 @@
       font-size: 13px;
       min-width: 8em;
       max-width: 40em;
-      overflow-wrap: anywhere;   /* URL / định danh dài không đẩy cột rộng ra */
+      overflow-wrap: break-word; /* giữ nguyên từ; URL / định danh dài bị ngắt khi chạm max-width */
     }
     .md th {
       background: var(--surface2);
@@ -601,7 +602,9 @@
       z-index: 1;
     }
     .md thead tr:first-child > * { border-top: 1px solid var(--border); }
-    .md td:first-child { white-space: nowrap; }
+    /* Cột đầu một dòng chỉ khi mọi ô của nó ngắn (ID, tên ngắn — renderTabBody gắn class qua
+       shortFirstColumn); cột đầu là câu dài thì xuống dòng như các cột khác. */
+    .md table.first-col-nowrap td:first-child { white-space: nowrap; }
     .md tr:nth-child(even) { background: rgba(255,255,255,.02); }
 
     /* ── Toast ───────────────────────────────────────────────── */
@@ -800,6 +803,7 @@
       .progress-head { flex-wrap: wrap; gap: 4px 12px; }
       .tab-body     { padding: 16px 12px; }
       .ft-item      { padding-left: 16px; padding-right: 10px; }
+      .md th, .md td { min-width: 7em; padding: 6px 8px; }   /* bảng 3 cột vừa khung 360px */
       .toast-stack  { left: 12px; right: 12px; bottom: 12px; max-width: none; align-items: stretch; }
     }
 
@@ -1007,6 +1011,7 @@ const HL_ALIASES = new Map([
   ['shell', 'bash'], ['zsh', 'bash'],   // hljs "shell" = phiên terminal có prompt $; fence ```shell thường chỉ là lệnh
 ]);
 const HL_MAX_CHARS = 200000;   // khối lớn hơn: để trơn (hljs chạy đồng bộ, khóa trang)
+const FIRST_COL_NOWRAP_MAX = 32;   // cột đầu của bảng giữ một dòng khi mọi ô ≤ chừng này ký tự
 const FILE_GEN_ERRORS_RE = /^##[ \t]*⚠️?[ \t]*File generation errors[ \t]*$/m;
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -1598,6 +1603,8 @@ function renderTabBody(data) {
       wrap.className = 'table-wrap';
       tbl.parentNode.insertBefore(wrap, tbl);
       wrap.appendChild(tbl);
+      const firstCol = Array.from(tbl.querySelectorAll('tbody td:first-child'), td => td.textContent);
+      if (shortFirstColumn(firstCol)) tbl.classList.add('first-col-nowrap');
     });
     // Sơ đồ ASCII bị LLM quên bọc ``` đã được chuyển thành <pre> ngay trong lúc
     // parse markdown (xem promoteAsciiDiagram) — dựa trên markdown NGUỒN, không phải
@@ -1678,6 +1685,12 @@ function renderTabBody(data) {
         <p>${why}</p>
       </div>`;
   }
+}
+
+// Cột đầu của bảng giữ một dòng (ID kiểu "FR-001", tên ngắn) chỉ khi MỌI ô đều ngắn — cột
+// đầu là câu dài mà nowrap thì tràn sang cột bên cạnh / kéo bảng rộng gấp mấy lần màn hình.
+function shortFirstColumn(texts) {
+  return texts.every(t => String(t).trim().length <= FIRST_COL_NOWRAP_MAX);
 }
 
 /* ── Markdown → HTML an toàn (có đường lui) ─────────────────────────── */
