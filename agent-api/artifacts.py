@@ -201,7 +201,8 @@ class FencedBlock(NamedTuple):
     @property
     def lang(self) -> str:
         """Từ đầu tiên của info string (chỉ ký tự word), chữ thường — ví dụ "ts"."""
-        return re.match(r"\w*", self.info).group(0).lower()
+        m = re.match(r"\w*", self.info)   # \w* luôn khớp (có thể rỗng)
+        return m.group(0).lower() if m else ""
 
 
 def find_fenced_blocks(text: str) -> list[FencedBlock]:

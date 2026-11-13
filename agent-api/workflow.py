@@ -62,13 +62,21 @@ Giới hạn context window
     tester: 3.000, clarifier: 1.500.
     OLLAMA_NUM_CTX: context window Ollama, mặc định 32.768 token.
 
+Gọi LLM — llm.py
+-----------------
+    Mọi ChatOllama được tạo qua llm.make_chat(): timeout httpx thật
+    (OLLAMA_REQUEST_TIMEOUT qua client_kwargs) + trần num_predict theo loại lời gọi
+    (PLANNER_/FILEGEN_/REPORT_NUM_PREDICT, có headroom cho reasoning model) +
+    FILEGEN_THINK cho lời gọi sinh file. Xem docstring llm.py.
+
 Xử lý reasoning models
 -----------------------
-    _REASONING_MODELS: frozenset khớp chuỗi con tên model reasoning
+    llm.is_reasoning_model(): khớp chuỗi con tên model reasoning
     (phi4-mini-reasoning, phi4-reasoning, qwq, deepseek-r1, qwen3,
     north-mini-code, gemma4, mistral-medium-3.5).
     _strip_thinking(): loại bỏ <think>...</think> khỏi output trước khi
-    lưu vào step_outputs — chỉ giữ lại phần nội dung thực sự.
+    lưu vào step_outputs — chỉ giữ lại phần nội dung thực sự (kể cả block
+    <think> bị cắt cụt khi chạm trần num_predict).
 
 Chống vòng lặp output
 ----------------------
@@ -113,8 +121,8 @@ import requests
 from agents import AGENTS, MAX_PREV_OUTPUT_CHARS, WORKFLOW_STEPS, AgentConfig
 from artifacts import fence_for, find_fenced_blocks
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
+from llm import filegen_reasoning, hit_token_cap, is_reasoning_model, make_chat, num_predict_for
 
 logger = logging.getLogger("agent-workflow")
 
@@ -126,10 +134,8 @@ RAG_TOP_K: int = int(os.environ.get("RAG_TOP_K", "5"))
 OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "32768"))
 # Timeout (giây) chờ rag-api trả về kết quả mỗi lần gọi POST /retrieve (F10: chỉ
 # embed + search, không sinh LLM → không còn phụ thuộc OLLAMA_REQUEST_TIMEOUT của rag-api).
+# Timeout của chính các lời gọi LLM (OLLAMA_REQUEST_TIMEOUT) nằm trong llm.py.
 RAG_TIMEOUT: int = int(os.environ.get("RAG_TIMEOUT", "600"))
-# Timeout (giây) chờ Ollama trả về response cho mỗi lần gọi LLM.
-# Nên đặt cao hơn RAG_TIMEOUT vì LLM generation tốn thời gian hơn embed.
-OLLAMA_REQUEST_TIMEOUT: int = int(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "1200"))
 
 # Model nhẹ chuyên lập kế hoạch danh sách file cần sinh — dùng chat model,
 # không phải coding model, vì nhiệm vụ là phân tích task rồi xuất JSON array.
@@ -281,29 +287,32 @@ def _compact_context(context: str, max_chars: int) -> str:
     return head + "\n" + body[-tail_budget:]
 
 
-# Frozenset các chuỗi con khớp tên model reasoning. Khi tên model chứa
-# một trong các chuỗi này, _strip_thinking() sẽ loại bỏ <think>...</think>
-# khỏi output trước khi lưu vào step_outputs.
-_REASONING_MODELS: frozenset[str] = frozenset({
-    "phi4-mini-reasoning",
-    "phi4-reasoning",
-    "qwq",
-    "deepseek-r1",
-    "qwen3",
-    "north-mini-code",
-    "gemma4",
-    "mistral-medium-3.5",
-})
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
 
 
 def _strip_thinking(text: str) -> str:
-    """Loại bỏ tất cả block <think>...</think> từ output của reasoning model.
+    """Loại bỏ chain-of-thought <think>...</think> khỏi output của reasoning model.
 
     Một số model (qwen3, deepseek-r1, qwq...) phát ra chain-of-thought nội bộ
     trong tag <think>. Người dùng không cần thấy phần này — chỉ giữ lại
     phần nội dung thực sự sau khi quá trình suy luận kết thúc.
+
+    Ngoài block đóng đủ cặp, xử lý hai dạng lệch:
+    - "</think>" mồ côi (template đã chèn sẵn "<think>" vào prompt nên output chỉ có
+      tag đóng) → bỏ mọi thứ tới hết tag đóng CUỐI CÙNG.
+    - "<think>" không có tag đóng (chạm trần num_predict giữa lúc suy luận) → bỏ từ
+      tag mở tới hết văn bản. Kết quả có thể rỗng — caller coi rỗng là thất bại /
+      output quá ngắn, KHÔNG lưu bản nháp suy luận thành file hay báo cáo.
     """
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = _THINK_BLOCK_RE.sub("", text)
+    closes = list(_THINK_CLOSE_RE.finditer(text))
+    if closes:
+        text = text[closes[-1].end():]
+    opened = _THINK_OPEN_RE.search(text)
+    if opened:
+        text = text[:opened.start()]
     return text.strip()
 
 
@@ -549,8 +558,8 @@ def _extract_tl_tasks(role: str, context: str) -> list[dict]:
             columns = _tl_table_columns(row)
             continue
 
-        if columns and columns[1] is not None:
-            id_col, task_col, prio_col = columns
+        id_col, task_col, prio_col = columns or (None, None, None)
+        if task_col is not None:
             if task_col >= len(row):
                 continue
             task_text = row[task_col]
@@ -730,7 +739,9 @@ def _find_regen_section(clarifier_output: str) -> str | None:
     if start is None:
         return None
 
-    md = _SEC10_LINE_RE.match(lines[start]).group("md") or ""
+    # _SEC10_LINE_RE luôn khớp (mọi thành phần đều tuỳ chọn) — kiểm tra None chỉ để mypy hài lòng.
+    start_m = _SEC10_LINE_RE.match(lines[start])
+    md = (start_m.group("md") if start_m else None) or ""
     level = len(md) if md.startswith("#") else 6
     stop_re = re.compile(
         rf"^\s*(?:#{{1,{level}}}\s+\S|(?:#{{1,6}}\s*|\*\*|__)?\s*(?:§\s*)?(?:1[1-9]|[2-9]\d)\s*[.)]\s+[*_]*[A-Z])"
@@ -761,7 +772,7 @@ def _regen_roles_in(text: str, *, prose: bool = False, role_only: bool = False) 
         return set()
     rest = _REGEN_FILLER_RE.sub(" ", _REGEN_ROLE_RE.sub(" ", text))
     if not re.search(r"[^\W_]", rest):
-        return {m.lastgroup for m in matches}
+        return {g for m in matches if (g := m.lastgroup)}
     if role_only:
         return set()
 
@@ -776,6 +787,10 @@ def _regen_roles_in(text: str, *, prose: bool = False, role_only: bool = False) 
 
     found: set[str] = set()
     for i, m in enumerate(matches):
+        # Mỗi nhánh của _REGEN_ROLE_RE là một named group → lastgroup không bao giờ None.
+        role = m.lastgroup
+        if role is None:
+            continue
         if _weak(m):
             before, after = text[:m.start()], text[m.end():]
             has_ctx = (
@@ -787,7 +802,7 @@ def _regen_roles_in(text: str, *, prose: bool = False, role_only: bool = False) 
             )
             if not has_ctx:
                 continue
-        found.add(m.lastgroup)
+        found.add(role)
     return found
 
 
@@ -1133,12 +1148,12 @@ def _plan_code_files(
     rồi trả về JSON array mô tả các file: [{filename, description, language}].
     Nếu parse JSON thất bại hoặc model không trả về kết quả, trả về [].
     """
-    planner = ChatOllama(
-        model=CODING_PLANNER_MODEL,
+    planner_ctx = min(8192, OLLAMA_NUM_CTX)
+    planner = make_chat(
+        CODING_PLANNER_MODEL,
         base_url=ollama_base_url,
-        temperature=0.1,
-        num_ctx=min(8192, OLLAMA_NUM_CTX),
-        request_timeout=float(OLLAMA_REQUEST_TIMEOUT),
+        num_ctx=planner_ctx,
+        num_predict=num_predict_for("planner", CODING_PLANNER_MODEL, num_ctx=planner_ctx),
     )
     stack_str = ", ".join(tech_stack) if tech_stack else "not specified"
     # Nếu có TL task board, chèn danh sách task vào planning prompt
@@ -1162,6 +1177,11 @@ def _plan_code_files(
     )
     try:
         resp = planner.invoke([HumanMessage(content=prompt)])
+        if hit_token_cap(resp):
+            logger.warning(
+                "Planner %s chạm trần PLANNER_NUM_PREDICT cho role=%s — JSON có thể bị cắt cụt.",
+                CODING_PLANNER_MODEL, role,
+            )
         # Bỏ <think>...</think> nếu CODING_PLANNER_MODEL là reasoning model — tránh
         # bắt nhầm JSON nháp trong chain-of-thought.
         content = _strip_thinking(str(resp.content))
@@ -1195,12 +1215,15 @@ def _generate_one_file(
     Trả về chuỗi nội dung file (không có code fence bao ngoài).
     Nếu LLM call thất bại, trả về comment lỗi để không làm crash workflow.
     """
-    llm = ChatOllama(
-        model=agent.model,
+    num_ctx = _get_num_ctx(agent.model)
+    # FILEGEN_THINK chỉ áp cho lời gọi sinh file; None = để model tự quyết thinking.
+    reasoning = filegen_reasoning()
+    llm = make_chat(
+        agent.model,
         base_url=ollama_base_url,
-        temperature=0.1,
-        num_ctx=_get_num_ctx(agent.model),
-        request_timeout=float(OLLAMA_REQUEST_TIMEOUT),
+        num_ctx=num_ctx,
+        num_predict=num_predict_for("filegen", agent.model, num_ctx=num_ctx, reasoning=reasoning),
+        reasoning=reasoning,
     )
     stack_str = ", ".join(tech_stack) if tech_stack else "not specified"
     ctx_block  = f"\n\nReview context (previous agents):\n{context_snippet}" if context_snippet else ""
@@ -1222,10 +1245,11 @@ def _generate_one_file(
             )),
             HumanMessage(content=prompt),
         ])
+        _warn_if_capped(resp, agent, f"FILEGEN_NUM_PREDICT ({filename})")
         result = str(resp.content)
         # W3: nếu coding role dùng reasoning model, loại bỏ <think>...</think>
         # TRƯỚC khi lưu — nếu không chain-of-thought bị ghi thẳng vào file artifact.
-        if any(m in agent.model.lower() for m in _REASONING_MODELS):
+        if is_reasoning_model(agent.model):
             result = _strip_thinking(result)
         result = _strip_code_fence(result, language, filename)   # chỉ bóc fence bọc ngoài
         result = _deloop(result)                        # remove infinite loops
@@ -1361,6 +1385,15 @@ def _generate_artifacts_multi_turn(
     return "\n".join(parts)
 
 
+def _warn_if_capped(response: object, agent: AgentConfig, cap_name: str) -> None:
+    """Ghi log cảnh báo khi Ollama dừng sinh vì chạm trần num_predict (*cap_name*)."""
+    if hit_token_cap(response):
+        logger.warning(
+            "Agent '%s' (model=%s) chạm trần %s — output có thể bị cắt cụt.",
+            agent.name, agent.model, cap_name,
+        )
+
+
 def _call_agent(
     agent: AgentConfig,
     ollama_base_url: str,
@@ -1375,19 +1408,22 @@ def _call_agent(
     thực hiện retry với context rút gọn 1.500 ký tự (_compact_context: giữ đề bài +
     tech stack ở đầu, lấp phần còn lại bằng đuôi context) để giảm tải.
     """
-    llm = ChatOllama(
-        model=agent.model,
+    num_ctx = _get_num_ctx(agent.model)
+    # Trần REPORT_NUM_PREDICT áp cho cả lần gọi chính lẫn lần retry (cùng instance llm),
+    # kể cả khi _call_agent là fallback single-call của artifact role.
+    llm = make_chat(
+        agent.model,
         base_url=ollama_base_url,
-        temperature=0.1,
-        num_ctx=_get_num_ctx(agent.model),
-        request_timeout=float(OLLAMA_REQUEST_TIMEOUT),
+        num_ctx=num_ctx,
+        num_predict=num_predict_for("report", agent.model, num_ctx=num_ctx),
     )
     # Kiểm tra một lần — dùng lại cho cả lần gọi chính và lần retry.
-    is_reasoning = any(m in agent.model.lower() for m in _REASONING_MODELS)
+    is_reasoning = is_reasoning_model(agent.model)
 
     # Build system message once — reused in primary call and retry to avoid duplication.
     sys_msg  = SystemMessage(content=COMMON_AGENT_RULES + "\n\n---\n\n" + agent.system_prompt)
     response = llm.invoke([sys_msg, HumanMessage(content=context)])
+    _warn_if_capped(response, agent, "REPORT_NUM_PREDICT")
     result   = str(response.content)
 
     # Strip chain-of-thought blocks from reasoning models.
@@ -1401,6 +1437,7 @@ def _call_agent(
         )
         trimmed = _compact_context(context, 1_500)
         response = llm.invoke([sys_msg, HumanMessage(content=trimmed)])
+        _warn_if_capped(response, agent, "REPORT_NUM_PREDICT")
         result = str(response.content)
         if is_reasoning:
             result = _strip_thinking(result)

@@ -1,6 +1,6 @@
 """Regression test cho TL task board parsing (F7) và planner / fallback context (F8).
 
-Không gọi Ollama thật: ChatOllama, _plan_code_files và _call_agent được monkeypatch.
+Không gọi Ollama thật: llm.ChatOllama, _plan_code_files và _call_agent được monkeypatch.
 """
 
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 workflow = pytest.importorskip("workflow")
+llm = pytest.importorskip("llm")
 
 _FILLER = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 12
 
@@ -204,7 +205,7 @@ def test_plan_code_files_extracts_json_array(monkeypatch, reply, expected):
         def invoke(self, messages):
             return SimpleNamespace(content=reply)
 
-    monkeypatch.setattr(workflow, "ChatOllama", FakeLLM)
+    monkeypatch.setattr(llm, "ChatOllama", FakeLLM)
     files = workflow._plan_code_files("fe", workflow.AGENTS["fe"], "http://x", "task", TECH, "ctx")
     assert [f["filename"] for f in files] == expected
 
@@ -266,7 +267,7 @@ def test_call_agent_short_output_retry_keeps_head(monkeypatch):
             prompts.append(messages[-1].content)
             return SimpleNamespace(content=replies.pop(0))
 
-    monkeypatch.setattr(workflow, "ChatOllama", FakeLLM)
+    monkeypatch.setattr(llm, "ChatOllama", FakeLLM)
     ctx = _context(role="ba", extra_context="rag chunk " * 400)
     out = workflow._call_agent(workflow.AGENTS["ba"], "http://x", ctx)
     assert out == "a long enough answer for the retry path"
