@@ -10,7 +10,7 @@ description: >
     được trích xuất, và Clarifier audit report.
 required_open_webui_version: 0.3.0
 requirements: requests
-version: 2.1.0
+version: 2.1.1
 
 Mô tả chi tiết
 --------------
@@ -200,8 +200,14 @@ class Tools:
             ),
         )
         timeout: int = Field(
-            default=600,
-            description="Timeout cho single-step request (giây). Full workflow dùng polling.",
+            default=3600,
+            description=(
+                "Timeout cho single-step request run_agent_step (giây). Full workflow dùng "
+                "polling. Một bước báo cáo gọi LLM 1–2 lần, mỗi lần tới OLLAMA_REQUEST_TIMEOUT "
+                "của agent-api (mặc định 1200s); bước code (be/fe/...) gọi planner + từng file "
+                "→ có thể lâu hơn nhiều. Bỏ cuộc sớm thì agent-api vẫn chạy tiếp và giữ slot "
+                "Ollama duy nhất. Bước code dài nên dùng run_sdlc_workflow."
+            ),
         )
         poll_interval: int = Field(
             default=15,

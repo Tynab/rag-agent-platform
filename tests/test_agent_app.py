@@ -474,3 +474,62 @@ def test_model_check_failure_is_not_fatal(env, monkeypatch):
     monkeypatch.setattr(requests, "get", boom)
     with TestClient(app_mod.app) as client:
         assert client.get("/health").status_code == 200
+
+
+# ── GET /agents, POST /agent/{role} ─────────────────────────────────────────────
+
+
+def test_list_agents_matches_registry(env):
+    with TestClient(app_mod.app) as client:
+        body = client.get("/agents").json()
+    assert list(body) == list(app_mod.AGENTS)
+    for role, cfg in app_mod.AGENTS.items():
+        assert body[role] == {
+            "step_id": cfg.step_id, "name": cfg.name, "model": cfg.model,
+            "depends_on": list(cfg.depends_on),
+        }
+
+
+def test_agent_step_runs_single_step_with_request_fields(env, monkeypatch):
+    calls = []
+
+    def fake_step(**kw):
+        calls.append(kw)
+        return "BA output"
+
+    monkeypatch.setattr(app_mod, "run_single_step", fake_step)
+    with TestClient(app_mod.app) as client:
+        r = client.post("/agent/ba", json={
+            "user_input": "Build a CRM", "project": "crm", "extra_context": "ctx",
+            "prev_outputs": {"pm": "PM out"}, "tech_stack": ["nestjs"], "rag_enabled": False,
+        })
+    assert r.status_code == 200
+    ba = app_mod.AGENTS["ba"]
+    assert r.json() == {"role": "ba", "name": ba.name, "model": ba.model, "output": "BA output"}
+    (kw,) = calls
+    assert kw["role"] == "ba" and kw["project"] == "crm" and kw["extra_context"] == "ctx"
+    assert kw["prev_outputs"] == {"pm": "PM out"} and kw["tech_stack"] == ["nestjs"]
+    assert kw["rag_enabled"] is False
+
+
+def test_agent_step_unknown_role_is_404(env):
+    with TestClient(app_mod.app) as client:
+        r = client.post("/agent/nope", json={"user_input": "x"})
+    assert r.status_code == 404 and "nope" in r.json()["detail"]
+
+
+def test_agent_step_failure_is_500_with_reason(env, monkeypatch):
+    import workflow
+
+    def empty(**kw):
+        raise workflow.EmptyAgentOutputError("Model m trả về output rỗng sau 2 lần gọi")
+
+    monkeypatch.setattr(app_mod, "run_single_step", empty)
+    with TestClient(app_mod.app) as client:
+        r = client.post("/agent/ba", json={"user_input": "x"})
+    assert r.status_code == 500 and "output rỗng" in r.json()["detail"]
+
+
+def test_agent_step_validates_body(env):
+    with TestClient(app_mod.app) as client:
+        assert client.post("/agent/ba", json={"user_input": ""}).status_code == 422

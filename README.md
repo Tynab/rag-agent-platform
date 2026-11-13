@@ -567,7 +567,7 @@ curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567
 4. Lặp lại cho `open-webui-tools/yan_agent_workflow.py`
 5. Bật tool trong **Model Settings → Tools**
 
-> **Tool không tự cập nhật:** Open WebUI lưu bản tool được dán tay, nên sau khi pull code mới phải dán lại cả hai file (hiện là `yan_knowledge_base` 1.2.0 và `yan_agent_workflow` 2.1.0). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) **giữ nguyên** tới khi sửa tay trong **Valves** — xem [mục 13](#13-open-webui--custom-tools).
+> **Tool không tự cập nhật:** Open WebUI lưu bản tool được dán tay, nên sau khi pull code mới phải dán lại cả hai file (hiện là `yan_knowledge_base` 1.2.0 và `yan_agent_workflow` 2.1.1). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) **giữ nguyên** tới khi sửa tay trong **Valves** — xem [mục 13](#13-open-webui--custom-tools).
 
 ---
 
@@ -899,10 +899,10 @@ curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq
 | `pending` | Đã xếp hàng, chưa bắt đầu (xem `queue_position`) |
 | `running` | LangGraph đang thực thi các bước (bao gồm cả Clarifier regen loop) |
 | `completed` | Hoàn tất toàn bộ + Clarifier regen loop (có thể kèm một vài bước lỗi trong `failed_steps`) |
-| `failed` | Lỗi không xử lý được, hoặc bị gián đoạn do agent-api khởi động lại — kiểm tra trường `error` |
+| `failed` | Lỗi không xử lý được — kiểm tra trường `error`. Các thông báo cố định: `Bị gián đoạn do agent-api khởi động lại` (run đang chạy/xếp hàng lúc restart), `Không đọc được bản ghi workflow từ store — workflow không được chạy` (record trong SQLite hỏng/không đọc được lúc worker nhận slot — không node nào chạy), `Workflow dừng bất thường do lỗi hệ thống` (worker thoát bất thường) |
 | `cancelled` | Bị hủy qua `POST /workflow/{id}/cancel` — `error = "Đã hủy theo yêu cầu người dùng"`; output các bước đã xong vẫn giữ nguyên |
 
-> Nếu một bước gặp lỗi LLM (timeout, model chưa pull, coding agent không sinh được file nào...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs`, thêm role vào `failed_steps` và tóm tắt vào trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp.
+> Nếu một bước gặp lỗi LLM (timeout, model chưa pull, coding agent không sinh được file nào, agent báo cáo trả về output **rỗng** sau cả lần retry...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs`, thêm role vào `failed_steps` và tóm tắt vào trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp. Trong Clarifier regen loop: bước regen lỗi **giữ nguyên** output + artifact của lần chạy trước; bước từng lỗi mà regen thành công được gỡ khỏi `failed_steps`.
 
 ### POST /workflow/{workflow_id}/cancel
 
@@ -1119,6 +1119,8 @@ Ingest tài liệu vào Qdrant (+ Neo4j nếu `GRAPH_ENABLED=true`).
 **Ingest tăng dần:** `point_id` tất định theo (`relative_path`, `loader_index`, `chunk_index`, `content_hash`, `embedding_model`). Ingest không-reset chỉ embed + upsert chunk **mới/đã sửa**; chunk không đổi được bỏ qua (`skipped_unchanged`) — chạy lại khi không có gì đổi thì không gọi Ollama lần nào. Chunk của file đã sửa/xóa/đổi tên bị dọn khỏi Qdrant và Neo4j (`stale_removed`). Không còn lời gọi embed "health check": vector size đọc từ collection có sẵn, hoặc lấy từ batch embed thật đầu tiên.
 
 > Payload của chunk không đổi **không** được ghi lại (doc_type/module suy luận, `created_at` giữ giá trị lần embed đầu). Sau khi đổi luật suy luận metadata hoặc `RAW_DATA_DIR`, chạy `/reset-ingest` để làm mới.
+>
+> Trích xuất thực thể (`GRAPH_ENTITY_EXTRACTION`) cũng chỉ chạy cho chunk **mới** trong Neo4j: bật `GRAPH_ENTITY_EXTRACTION` sau lần ingest đầu, hoặc muốn thử lại sau một lần trích xuất không ra thực thể nào → chạy `/reset-ingest`.
 
 **Request body:**
 
@@ -1179,7 +1181,7 @@ Project không có file hỗ trợ trả `"status": "empty"`.
 
 ### POST /reset-ingest
 
-Embed lại và dựng lại collection từ đầu (tương đương `POST /ingest` với `"reset": true`) — cho tất cả project, hoặc một project nếu truyền `project`. Collection Qdrant cũ chỉ bị xóa khi batch embed thật đầu tiên thành công, nên chạy lúc Ollama đang lỗi không làm mất index vector (graph Neo4j của project vẫn bị xóa trước, và được dựng bù ở lần ingest thành công kế tiếp).
+Embed lại và dựng lại collection từ đầu (tương đương `POST /ingest` với `"reset": true`) — cho tất cả project, hoặc một project nếu truyền `project`. Collection Qdrant cũ chỉ bị xóa khi batch embed thật đầu tiên thành công, nên chạy lúc Ollama đang lỗi không làm mất index vector. Graph Neo4j của project theo cùng quy tắc: chỉ bị xóa (rồi dựng lại từ các chunk đã có vector) khi Qdrant thật sự đã dựng lại; reset lỗi toàn bộ thì graph cũ giữ nguyên. Xem `failed_batches` / `batch_error` trong response.
 
 ```bash
 # Reset và ingest lại toàn bộ
@@ -1467,7 +1469,7 @@ cat data/memory/episodic/workflow_runs.jsonl | jq 'select(.steps_count < 15)'
 3. Dán nội dung file tool, nhấn **Save**
 4. Bật tool trong **Model Settings → Tools** cho model đang dùng
 
-> **Cập nhật tool:** tool được dán tay vào Admin Panel nên **không** tự cập nhật khi pull code mới — dán lại cả hai file (hiện là `yan_knowledge_base` **1.2.0** và `yan_agent_workflow` **2.1.0**). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) giữ nguyên tới khi sửa tay trong **Valves**.
+> **Cập nhật tool:** tool được dán tay vào Admin Panel nên **không** tự cập nhật khi pull code mới — dán lại cả hai file (hiện là `yan_knowledge_base` **1.2.0** và `yan_agent_workflow` **2.1.1**). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) giữ nguyên tới khi sửa tay trong **Valves**.
 >
 > **URL theo tên service:** Valve URL mặc định là tên service trong compose (`http://rag-api:8090`, `http://agent-api:8091`) — đúng khi Open WebUI chạy cùng network `yan` của stack. `localhost` / `host.docker.internal` **không** dùng được từ trong container vì cổng host chỉ bind `127.0.0.1`. Open WebUI chạy ở container/compose khác thì nối vào network của stack rồi giữ nguyên URL theo tên service:
 > ```bash
@@ -1507,7 +1509,7 @@ Tìm thông tin về billing schema trong project yanlib, module billing
 |---|---|---|
 | `agent_api_url` | `http://agent-api:8091` | URL agent-api — tên service trong compose (xem lưu ý ở [Cài đặt](#cài-đặt)) |
 | `block_until_complete` | `false` | `false` = `run_sdlc_workflow` trả `workflow_id` ngay; `true` = poll đồng bộ tới khi kết thúc (có thể 30+ phút, dễ vượt timeout proxy/browser) |
-| `timeout` | `600` | Timeout cho single-step request (giây) |
+| `timeout` | `3600` | Timeout cho single-step request `run_agent_step` (giây). Một bước báo cáo gọi LLM 1–2 lần, mỗi lần tới `OLLAMA_REQUEST_TIMEOUT` của agent-api (1200); bước code gọi planner + từng file nên có thể lâu hơn — dùng `run_sdlc_workflow` cho bước code dài. Tool bỏ cuộc sớm thì agent-api vẫn chạy tiếp và giữ slot Ollama |
 | `poll_interval` | `15` | Khoảng cách poll workflow status (giây) |
 | `poll_max_attempts` | `120` | Số poll tối đa trước khi timeout (120 × 15s = 30 phút) |
 | `rag_enabled` | `true` | Query RAG mỗi agent step |
@@ -1904,5 +1906,7 @@ Một số test đáng chú ý khi sửa code:
 | `tests/test_role_registry*.py` | Bảng hành vi dẫn xuất từ `AgentConfig` và các bất biến của role registry |
 | `tests/test_workflow_queue*.py` | Hàng đợi FIFO, `WORKFLOW_CONCURRENCY`, hủy workflow và các race hủy/hoàn tất |
 | `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |
+| `tests/test_agent_app.py` | Endpoint agent-api (`/health`, `/agents`, `/agent/{role}`, `/workflow/*`, `/workflows`, artifacts, `/ui`, `/ui/static`) + recovery lúc khởi động |
+| `tests/test_rag_api_endpoints.py` | Endpoint rag-api (`/ingest`, `/reset-ingest`, `/ask`, `/retrieve`, `/projects`, `/graph/status`, entities) và `_query_rag` của agent-api |
 | `tests/test_workflow_ui.py` | UI `/ui`: không CDN, file vendor + LICENSE + phiên bản, trạng thái/poll (phần chạy JS của trang cần `node`; tự skip nếu không có) |
 | `tests/test_ingest_incremental*.py` | Ingest tăng dần, `skipped_unchanged`, `stale_removed`, reset an toàn khi Ollama lỗi |

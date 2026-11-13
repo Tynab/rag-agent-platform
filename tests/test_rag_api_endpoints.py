@@ -146,3 +146,55 @@ def test_agent_query_rag_uses_retrieve(rag, monkeypatch):
     assert rag.llm.calls == 0
     # rag-api trả lỗi (vd. 400 project sai) → chuỗi rỗng, không dừng workflow.
     assert workflow._query_rag("http://rag-api:8090", "q", "../x", 3) == ""
+
+
+# ── GET /projects, GET /graph/status ────────────────────────────────────────────
+
+
+def test_projects_lists_indexed_and_unindexed(rag, monkeypatch):
+    class _Count:
+        def __init__(self, n):
+            self.count = n
+
+    monkeypatch.setattr(rag_app, "get_projects", lambda: ["crm", "hr"])
+    rag.qdrant.count = lambda collection_name, exact: _Count(42)
+    r = rag.client.get("/projects")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["raw_data_dir"] == rag_app.RAW_DATA_DIR
+    assert body["projects"]["crm"] == {
+        "collection": rag_app.get_collection_name("crm"), "indexed": True, "points_count": 42,
+    }
+    # Chưa ingest → không gọi count trên collection không tồn tại.
+    assert body["projects"]["hr"]["indexed"] is False and body["projects"]["hr"]["points_count"] is None
+
+
+def test_graph_status_disabled(rag):
+    r = rag.client.get("/graph/status")
+    assert r.status_code == 200 and r.json()["enabled"] is False
+
+
+def test_graph_status_module_failed_to_load(rag, monkeypatch):
+    monkeypatch.setattr(rag_app, "GRAPH_ENABLED", True)
+    monkeypatch.setattr(rag_app, "_graph_module", None)
+    body = rag.client.get("/graph/status").json()
+    assert body["enabled"] is True and body["connected"] is False
+
+
+@pytest.mark.parametrize("connected", [True, False])
+def test_graph_status_connected_and_down(rag, monkeypatch, connected):
+    stats_calls = []
+    fake = types.SimpleNamespace(
+        ping=lambda: connected,
+        get_graph_stats=lambda: stats_calls.append(1) or {"chunks": 7},
+        NEO4J_URI="bolt://neo4j:7687",
+        GRAPH_ENTITY_EXTRACTION=False,
+    )
+    monkeypatch.setattr(rag_app, "GRAPH_ENABLED", True)
+    monkeypatch.setattr(rag_app, "_graph_module", fake)
+    body = rag.client.get("/graph/status").json()
+    assert body["enabled"] is True and body["connected"] is connected
+    assert body["neo4j_uri"] == "bolt://neo4j:7687" and body["entity_extraction"] is False
+    # Neo4j không phản hồi → không truy vấn thống kê.
+    assert body["stats"] == ({"chunks": 7} if connected else {})
+    assert stats_calls == ([1] if connected else [])
