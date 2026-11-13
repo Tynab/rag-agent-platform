@@ -73,8 +73,8 @@ const LIBS = {
   DOMPurify: { ok: { sanitize(h, cfg) { calls.push(['sanitize', cfg]); return 'CLEAN:' + h; } } },
   hljs: { ok: { highlightElement(el) { calls.push(['hl', el.id]); if (el.id === 'bad') throw new Error('x'); } } },
 };
-const ctx = { window: { location: { search: '' } }, URLSearchParams, console: { warn() {} },
-  document: { getElementById: el, addEventListener() {} } };
+const ctx = { window: { location: { search: '' }, addEventListener() {}, history: { pushState() {} } },
+  URLSearchParams, console: { warn() {} }, document: { getElementById: el, addEventListener() {} } };
 for (const [name, kind] of Object.entries(input.libs || { marked: 'ok' })) ctx[name] = LIBS[name][kind];
 vm.createContext(ctx);
 vm.runInContext(src, ctx);
@@ -282,7 +282,7 @@ function makeEl(id) {
   let first = null;
   const el = {
     id, style: {}, textContent: '', innerHTML: '', disabled: false, title: '', value: '',
-    dataset: {}, scrollLeft: 0,
+    dataset: {}, scrollLeft: 0, children: [], parent: null,
     classList: {
       toggle(c, on) { if (on === undefined) on = !cls.has(c); if (on) cls.add(c); else cls.delete(c); return on; },
       add(c) { cls.add(c); }, remove(c) { cls.delete(c); }, contains(c) { return cls.has(c); },
@@ -290,26 +290,47 @@ function makeEl(id) {
     get className() { return [...cls].join(' '); },
     set className(v) { cls.clear(); String(v).split(/\s+/).filter(Boolean).forEach(c => cls.add(c)); },
     get firstChild() { return first || (first = makeEl('')); },
-    appendChild(c) { return c; }, remove() {}, setAttribute() {}, addEventListener() {},
+    appendChild(c) { c.parent = el; el.children.push(c); return c; },
+    remove() { if (el.parent) el.parent.children = el.parent.children.filter(x => x !== el); el.parent = null; },
+    setAttribute() {}, addEventListener() {}, focus() {}, select() {}, setSelectionRange() {},
+    click() { logs.clicks.push({ attached: !!el.parent, href: el.href, download: el.download,
+                                 revokedBefore: logs.revoked.length }); },
     querySelector() { return makeEl(''); }, querySelectorAll() { return []; },
     getBoundingClientRect() { return { left: 0, right: 0, width: 0 }; },
   };
   return el;
 }
 
-const els = {}, listeners = {}, toasts = [];
+const els = {}, listeners = {}, winListeners = {}, pushes = [];
+const logs = { clicks: [], revoked: [], clip: [], zip: [] };
 const document = {
   hidden: false,
   getElementById(id) { return els[id] || (els[id] = makeEl(id)); },
   createElement() { return makeEl(''); },
   addEventListener(type, fn) { listeners[type] = fn; },
-  body: Object.assign(makeEl('body'), { appendChild(c) { toasts.push(c); return c; } }),
+  body: makeEl('body'),
   head: makeEl('head'),
+  activeElement: null,
 };
+// input.exec: true/false = execCommand('copy') trả về giá trị đó; vắng mặt = không có execCommand
+if (input.exec !== undefined && input.exec !== null) {
+  document.execCommand = cmd => {
+    const ta = document.body.children[document.body.children.length - 1];
+    logs.clip.push(['exec', cmd, ta && ta.value]);
+    return input.exec;
+  };
+}
+class FakeURL extends URL {
+  static createObjectURL(b) { logs.zip.push(['blob', b]); return 'blob:zip-1'; }
+  static revokeObjectURL(u) { logs.revoked.push(u); }
+}
 
 const timers = [];
 let tid = 0;
 const queue = [...(input.responses || [])];
+// GET /workflow/{id}/artifacts: lần lượt lấy từ input.artifacts, hết thì dùng lại cái cuối.
+const artQueue = [...(input.artifacts || [{}])];
+let artLast = artQueue[0];
 const fetchLog = [];
 // {"defer": tên, "then": response}: request treo tới thao tác ["resolve", tên]. Như fetch
 // thật, abort() của AbortController làm nó reject AbortError ngay — trừ khi "ignoreAbort".
@@ -321,8 +342,13 @@ function resp(r) {
 }
 const ctx = {
   window: { location: { search: '', href: 'http://agent.test/ui', toString() { return this.href; } },
-            history: { pushState() {} }, matchMedia: () => ({ matches: false }) },
-  document, URL, URLSearchParams, AbortController,
+            history: { pushState(st, t, u) { pushes.push(String(u)); setLocation(String(u)); } },
+            matchMedia: () => ({ matches: false }),
+            addEventListener(type, fn) { winListeners[type] = fn; },
+            isSecureContext: !!input.secure,
+            JSZip: class { folder(name) { return { file(n, c) { logs.zip.push(['file', name + '/' + n, c]); } }; }
+                           async generateAsync(o) { return 'BLOB:' + o.type; } } },
+  document, URL: FakeURL, URLSearchParams, AbortController,
   console: { warn() {}, error() {}, log() {} },
   setTimeout(fn, ms) { const t = { id: ++tid, fn, ms, done: false }; timers.push(t); return t.id; },
   clearTimeout(id) { const t = timers.find(x => x.id === id); if (t) t.done = true; },
@@ -330,7 +356,10 @@ const ctx = {
   confirm() { return confirmAnswer; },
   async fetch(url, opts = {}) {
     fetchLog.push((opts.method || 'GET') + ' ' + url);
-    if (url.endsWith('/artifacts')) return resp({ status: 200, body: { artifacts: {} } });
+    if (url.endsWith('/artifacts')) {
+      if (artQueue.length) artLast = artQueue.shift();
+      return resp({ status: 200, body: { artifacts: artLast } });
+    }
     if (url === '/workflows') return resp({ status: 200, body: { workflows: [] } });
     const r = url.endsWith('/cancel') ? input.cancel : queue.shift();
     if (!r) throw new Error('kịch bản hết response cho ' + url);
@@ -348,6 +377,19 @@ const ctx = {
     return resp(r);
   },
 };
+function setLocation(href) {
+  const u = new URL(href, 'http://agent.test/ui');
+  ctx.window.location.href = u.href;
+  ctx.window.location.search = u.search;
+}
+if (input.url) setLocation(input.url);
+// input.clipboard: 'ok' | 'reject' → có navigator.clipboard; vắng mặt → không có Clipboard API
+if (input.clipboard) {
+  ctx.navigator = { clipboard: { async writeText(t) {
+    logs.clip.push(['api', t]);
+    if (input.clipboard === 'reject') throw new Error('NotAllowedError');
+  } } };
+}
 vm.createContext(ctx);
 vm.runInContext(src, ctx);
 const run = code => vm.runInContext(code, ctx);
@@ -377,7 +419,10 @@ function snap() {
     tabs: tabEls && tabEls.map(t => ({ cls: t.btn.className, icon: t.icon.textContent })),
     body: g('tab-body').innerHTML,
     fetches: fetchLog.length,
-    toasts: toasts.map(t => t.textContent),
+    toasts: g('toast-stack').children.map(t => t.textContent),
+    toastCls: g('toast-stack').children.map(t => t.className),
+    url: ctx.window.location.search, pushes: pushes.length,
+    input: g('wid-input').value, copyBtn: g('copy-btn').style.display,
   };
 }
 
@@ -400,21 +445,33 @@ function snap() {
     else if (op === 'retry') { ctx.pollNow(); await flush(); }   // nút "Thử lại ngay"
     else if (op === 'resolve') { deferred[arg](); await flush(); }
     else if (op === 'recent') { ctx.showRecent(); await flush(); }
+    else if (op === 'pop') { setLocation(arg); winListeners.popstate({ state: null }); await flush(); }
+    else if (op === 'await') { out.push(await run(arg)); await flush(); }
+    else if (op === 'flush') await flush();
+    else if (op === 'timers') {
+      for (const t of timers.filter(x => !x.done && x.fn !== pollFn && x.ms === arg)) { t.done = true; t.fn(); }
+      await flush();
+    }
     else if (op === 'tab') ctx.selectTab(arg);
     else if (op === 'eval') out.push(run(arg));
     else if (op === 'snap') out.push(snap());
     else throw new Error('op lạ: ' + op);
   }
-  process.stdout.write(JSON.stringify({ out, fetchLog }));
+  logs.bodyChildren = document.body.children.length;
+  logs.pendingTimers = timers.filter(t => !t.done && t.fn !== pollFn).map(t => t.ms);
+  process.stdout.write(JSON.stringify({ out, fetchLog, logs }));
 })().catch(e => { console.error((e && e.stack) || e); process.exit(1); });
 """
 
 
-def _run_sm(script: list, responses: list | None = None, cancel: dict | None = None) -> dict:
+def _run_sm(script: list, responses: list | None = None, cancel: dict | None = None,
+            artifacts: list | None = None, url: str | None = None, **env) -> dict:
+    """env: secure / clipboard ('ok' | 'reject') / exec (bool) — môi trường clipboard giả."""
     node = shutil.which("node")
     if not node:
         pytest.skip("không có node trên PATH")
-    payload = {"script": script, "responses": responses or [], "cancel": cancel}
+    payload = {"script": script, "responses": responses or [], "cancel": cancel,
+               "artifacts": artifacts, "url": url, **env}
     proc = subprocess.run(
         [node, "-e", _SM_RUNNER, str(HTML)],
         input=json.dumps(payload), capture_output=True, text=True, timeout=30, check=False,
@@ -560,12 +617,16 @@ def test_cancel_pending_run_is_cancelled_immediately():
     assert "đã bị hủy" in s["body"]
 
 
-@pytest.mark.parametrize("code", [404, 409, 500])
-def test_cancel_error_keeps_view_and_reenables_button(code):
+@pytest.mark.parametrize(("code", "toast", "kind"), [
+    (404, "không tìm thấy", "toast-err"), (409, "đã kết thúc", "toast-warn"), (500, "HTTP 500", "toast-err"),
+])
+def test_cancel_error_keeps_view_and_reenables_button(code, toast, kind):
     """404/409 của POST /cancel chỉ báo toast + poll lại — không xóa view, không dừng theo dõi."""
     res = _run_sm([["track", "wf-1"], ["cancel"], ["snap"]], [_ok(_RUNNING), _ok(_RUNNING)],
                   cancel={"status": code, "body": {"detail": "x"}})
     s = res["out"][0]
+    assert len(s["toasts"]) == 1 and toast in s["toasts"][0]
+    assert s["toastCls"] == [f"toast {kind}"]
     assert s["view"] == "block" and s["errBox"] == "none"
     assert s["cancel"] == {"display": "", "disabled": False, "text": "✕ Hủy workflow"}
     assert s["timers"] == [2500]
@@ -712,3 +773,138 @@ def test_cancel_reply_after_switching_workflow_does_not_leak():
     assert s["cancel"] == {"display": "", "disabled": False, "text": "✕ Hủy workflow"}
     assert s["note"]["display"] == "none" and s["toasts"] == []
     assert res["fetchLog"].count("GET /workflow/wf-2") == 1   # không poll thêm vì hủy của wf-1
+
+
+# ── Điều hướng (Back/Forward), thời gian, toast + clipboard, chữ ký tab-body, tải artifact ──
+
+_TODAY = "2026-11-13T10:00:00+00:00"
+
+
+def test_back_forward_follow_the_url_and_never_push_duplicates():
+    res = _run_sm(
+        [["flush"], ["snap"],
+         ["track", "wf-1"], ["snap"],                 # Track lại cùng id → không push mục trùng
+         ["track", "wf-2"], ["snap"],
+         ["pop", "/ui?id=wf-1"], ["snap"],            # Back → về wf-1, ngừng poll wf-2
+         ["pop", "/ui?id=wf-1#yeu-cau"], ["snap"],    # Back qua mục #anchor → không tải lại
+         ["pop", "/ui"], ["snap"],                    # Back về trang ban đầu
+         ["pop", "/ui?id=wf-2"], ["snap"]],           # Forward
+        [_ok(_A), _ok(_A), _ok(_B), _ok(_A), _ok(_B)],
+        url="/ui?id=wf-1",
+    )
+    load, again, b, back_a, anchor, empty, fwd = res["out"]
+    assert load["project"] == "A" and load["pushes"] == 0, "tải trang với ?id= không được push thêm mục"
+    assert again["pushes"] == 0 and again["url"] == "?id=wf-1"
+    assert b["project"] == "B" and b["pushes"] == 1 and b["url"] == "?id=wf-2"
+    assert back_a["project"] == "A" and back_a["pushes"] == 1 and back_a["input"] == "wf-1"
+    assert back_a["timers"] == [2500], "chỉ còn đúng một vòng poll (của wf-1)"
+    assert res["fetchLog"].count("GET /workflow/wf-2") == 2   # B lần đầu + Forward, không poll nền
+    assert anchor["fetches"] == back_a["fetches"] and anchor["timers"] == [2500]
+    assert empty["view"] == "none" and empty["empty"] == "flex" and empty["timers"] == []
+    assert empty["copyBtn"] == "none" and empty["input"] == "" and empty["poll"] == "none"
+    assert fwd["project"] == "B" and fwd["view"] == "block" and fwd["pushes"] == 1
+
+
+def test_fmt_time_adds_the_date_when_not_today():
+    res = _run_sm([["eval", """(() => {
+      const now = new Date(2026, 10, 13, 15, 0, 0);
+      const today = new Date(2026, 10, 13, 9, 5, 7), other = new Date(2026, 10, 10, 9, 5, 7);
+      return {
+        today: fmtTime(today.toISOString(), now), todayExp: today.toLocaleTimeString(),
+        other: fmtTime(other.toISOString(), now),
+        otherDate: other.toLocaleDateString(undefined, { year: 'numeric', month: '2-digit', day: '2-digit' }),
+        bad: fmtTime('không-phải-ngày', now), none: fmtTime(null, now), full: fmtFullTime(null),
+      };
+    })()"""]])
+    r = res["out"][0]
+    assert r["today"] == r["todayExp"]
+    assert r["otherDate"] in r["other"] and r["other"] != r["today"]
+    assert r["bad"] == "không-phải-ngày" and r["none"] == "—" and r["full"] == ""
+
+
+def test_toast_stack_keeps_only_the_newest():
+    res = _run_sm([["eval", "['a','b','c','d','e','f'].forEach((m, i) => toast(m, i % 2 ? 'err' : 'ok'))"],
+                   ["snap"]])
+    s = res["out"][1]
+    assert s["toasts"] == ["c", "d", "e", "f"]
+    assert s["toastCls"] == ["toast toast-ok", "toast toast-err", "toast toast-ok", "toast toast-err"]
+    assert sorted(res["logs"]["pendingTimers"]) == [3000, 3000, 3000, 6000, 6000, 6000]
+
+
+@pytest.mark.parametrize(
+    ("env", "via", "ok"),
+    [
+        ({"exec": True}, ["exec"], True),                                         # http://<ip> — không có Clipboard API
+        ({"secure": True, "clipboard": "ok", "exec": True}, ["api"], True),
+        ({"secure": True, "clipboard": "reject", "exec": True}, ["api", "exec"], True),
+        ({"clipboard": "ok", "exec": True}, ["exec"], True),                      # có API nhưng không secure context
+        ({}, [], False),                                                          # không cách nào sao chép được
+    ],
+    ids=["insecure-fallback", "secure-api", "api-rejected-fallback", "api-not-secure", "nothing"],
+)
+def test_copy_id_falls_back_to_exec_command_and_always_gives_feedback(env, via, ok):
+    res = _run_sm([["track", "wf-1"], ["await", "copyId()"], ["snap"]], [_ok(_A)], **env)
+    s = res["out"][1]
+    clip = res["logs"]["clip"]
+    assert [c[0] for c in clip] == via
+    for c in clip:
+        assert (c[1] if c[0] == "api" else c[2]) == "wf-1"
+    assert res["logs"]["bodyChildren"] == 0, "textarea tạm phải được gỡ khỏi DOM"
+    if ok:
+        assert s["toasts"] == ["✓ Đã sao chép Workflow ID"] and s["toastCls"] == ["toast toast-ok"]
+    else:
+        assert s["toastCls"] == ["toast toast-err"] and "wf-1" in s["toasts"][0]   # hiện ID để chép tay
+
+
+def test_tab_body_rerenders_on_same_length_output_and_changed_artifact_files():
+    done = ROLES[:7]   # … fe → tab tự chọn là fe
+    r1 = _rec("running", completed_steps=done, step_outputs={r: f"{r} out-1" for r in done})
+    r2 = _rec("running", completed_steps=done, step_outputs={r: f"{r} out-2" for r in done})
+    res = _run_sm(
+        [["track", "wf-1"], ["snap"], ["await", "loadArtifacts('wf-1')"], ["snap"], ["tick"], ["snap"]],
+        [_ok(r1), _ok(r2)],
+        artifacts=[{"fe": [{"filename": "src/a.ts", "size": 10}]},
+                   {"fe": [{"filename": "src/a.ts", "size": 2048}]}],
+    )
+    first, resized, regen = (o for o in res["out"] if isinstance(o, dict))
+    assert "out-1" in first["body"] and "10 B" in first["body"]
+    assert "2.0 KB" in resized["body"], "cùng số file nhưng đổi kích thước → phải render lại"
+    assert "out-2" in regen["body"] and "out-1" not in regen["body"], "output cùng độ dài → phải render lại"
+
+
+def test_live_artifact_reload_only_when_completed_artifact_roles_change():
+    """Role artifact đã xong mà /artifacts không có mục nào (vd. không sinh file) → không gọi lại mỗi poll."""
+    fe = _rec("running", completed_steps=ROLES[:7], step_outputs={r: "x" for r in ROLES[:7]})
+    mob = _rec("running", completed_steps=ROLES[:8], step_outputs={r: "x" for r in ROLES[:8]})
+    end = _rec("completed", completed_steps=ROLES[:8], step_outputs={r: "x" for r in ROLES[:8]})
+    res = _run_sm(
+        [["track", "wf-1"], ["tick"], ["tick"], ["tick"], ["snap"],
+         ["tick"], ["tick"], ["snap"],
+         ["eval", "_artLoadAt -= ART_RETRY_MS"], ["tick"], ["tick"], ["snap"],
+         ["tick"], ["snap"]],
+        [_ok(fe)] * 4 + [_ok(mob)] * 2 + [_ok(mob)] * 2 + [_ok(end)],
+    )
+    log = res["fetchLog"]
+    n_art = []
+    for o in res["out"]:
+        if isinstance(o, dict):
+            n_art.append(sum(1 for f in log[: o["fetches"]] if f.endswith("/artifacts")))
+    assert n_art == [1, 2, 3, 4], f"số lần GET /artifacts sau mỗi giai đoạn: {n_art}"
+
+
+def test_download_all_attaches_anchor_revokes_later_and_reports_missing_files():
+    res = _run_sm(
+        [["track", "wf-1"],
+         ["eval", "artifactsCache = { fe: [{ filename: 'a.ts', size: 1 }, { filename: 'b.ts', size: 2 }] }; 0"],
+         ["await", "downloadRoleZip('fe')"], ["snap"], ["timers", 1000]],
+        [_ok(_A), _ok({"path": "a.ts", "language": "ts", "content": "A"}), {"status": 404, "body": {}}],
+    )
+    logs = res["logs"]
+    assert logs["clicks"] == [{"attached": True, "href": "blob:zip-1", "download": "fe-artifacts.zip",
+                               "revokedBefore": 0}]
+    assert ["file", "fe/a.ts", "A"] in logs["zip"]
+    assert logs["bodyChildren"] == 0, "anchor phải được gỡ sau khi click"
+    assert logs["revoked"] == ["blob:zip-1"], "object URL được thu hồi sau một nhịp (timer), không ngay lúc click"
+    s = res["out"][2]
+    assert s["toasts"][-1].startswith("⚠") and "1/2" in s["toasts"][-1]
+    assert "alert(" not in _inline_script()

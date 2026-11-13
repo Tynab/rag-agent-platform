@@ -550,17 +550,34 @@
     .md tr:nth-child(even) { background: rgba(255,255,255,.02); }
 
     /* ── Toast ───────────────────────────────────────────────── */
-    .toast {
+    /* Ngăn xếp toast cố định góc dưới phải (toast mới nằm dưới cùng). #toast-stack có sẵn
+       trong HTML với role="status" — vùng live phải tồn tại TRƯỚC khi chèn nội dung thì
+       trình đọc màn hình mới đọc. pointer-events: none để không chặn click vào trang. */
+    .toast-stack {
       position: fixed;
-      bottom: 24px; right: 24px;
+      right: 24px; bottom: 24px;
+      z-index: 999;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+      max-width: min(420px, calc(100vw - 48px));
+      pointer-events: none;
+    }
+    .toast {
       background: var(--surface2);
       border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
       padding: 10px 16px;
       border-radius: var(--radius);
       font-size: 12px;
-      z-index: 999;
+      box-shadow: 0 6px 20px rgba(0,0,0,.35);
+      overflow-wrap: anywhere;
       animation: slide-up .25s ease;
     }
+    .toast-ok   { border-left-color: var(--ok); }
+    .toast-warn { border-left-color: var(--warn); }
+    .toast-err  { border-left-color: var(--err); }
     @keyframes slide-up {
       from { transform: translateY(12px); opacity: 0; }
       to   { transform: translateY(0);    opacity: 1; }
@@ -705,7 +722,7 @@
       .progress-head { flex-wrap: wrap; gap: 4px 12px; }
       .tab-body     { padding: 16px 12px; }
       .ft-item      { padding-left: 16px; padding-right: 10px; }
-      .toast        { left: 12px; right: 12px; bottom: 12px; }
+      .toast-stack  { left: 12px; right: 12px; bottom: 12px; max-width: none; align-items: stretch; }
     }
 
     /* ── Giảm chuyển động ────────────────────────────────────── */
@@ -827,6 +844,10 @@
 
 </main>
 
+<!-- Toast xếp chồng (toast()) — vùng live tĩnh: phản hồi Copy ID / hủy / tải zip được đọc
+     cho trình đọc màn hình mà không cắt ngang (polite); chỉ phần mới thêm được đọc. -->
+<div id="toast-stack" class="toast-stack" role="status" aria-live="polite" aria-atomic="false"></div>
+
 <!-- ── SVG ICONS ──────────────────────────────────────────────────────── -->
 <svg style="display:none">
   <symbol id="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor">
@@ -887,6 +908,11 @@ const STATUS_MAP = {
 // FILE_GEN_ERRORS_HEADER = "## ⚠️ File generation errors" (workflow.py — viết bằng \u
 // escape để không phụ thuộc cách lưu emoji; FE0F tùy chọn).
 const STEP_ERROR_PREFIX  = '[LỖI';
+// Role có file artifact (khớp ARTIFACT_ROLES của agent-api/artifacts.py)
+const ARTIFACT_ROLES = new Set(['fe', 'mobile', 'be', 'dba', 'devsecops', 'tech_lead', 'da']);
+// Còn role đã xong mà /artifacts chưa có mục nào (vd. role không sinh file) → thử lại thưa
+const ART_RETRY_MS   = 30000;
+const TOAST_MAX      = 4;      // số toast hiện cùng lúc tối đa — cũ nhất bị bỏ trước
 const FILE_GEN_ERRORS_RE = /^##[ \t]*⚠️?[ \t]*File generation errors[ \t]*$/m;
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -915,6 +941,9 @@ let cancelInFlight  = false; // POST /workflow/{id}/cancel đang bay → nút h�
 let cancelRequested = false; // server đã nhận yêu cầu hủy (200) — chờ poll xác nhận
 let mdReady      = false;  // marked + DOMPurify đã tải và cấu hình xong (xem setupMarkdown)
 let jszipLoading = null;   // Promise nạp JSZip lười (xem loadJSZip) — null = chưa nạp / lần trước lỗi
+let currentView  = 'empty'; // view đang hiện: 'empty' | 'recent' | 'wf' (showView)
+let _artRolesKey = '';     // tập role artifact đã hoàn thành ở lần tải /artifacts gần nhất (shouldLoadArtifacts)
+let _artLoadAt   = 0;      // Date.now() của lần tải /artifacts gần nhất trong lúc workflow chạy
 
 /* ────────────────────────────────────────────────────────────────────────
    INIT — pick up workflow_id from URL query string
@@ -934,6 +963,7 @@ let jszipLoading = null;   // Promise nạp JSZip lười (xem loadJSZip) — nu
     if (e.key === 'Enter') trackFromInput();
   });
   document.addEventListener('visibilitychange', onVisibilityChange);
+  window.addEventListener('popstate', onPopState);
 })();
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -945,7 +975,8 @@ function trackFromInput() {
   trackWorkflow(id);
 }
 
-function trackWorkflow(id) {
+// opts.push === false: gọi từ popstate (Back/Forward) — URL đã đúng, không push thêm mục history.
+function trackWorkflow(id, opts = {}) {
   stopAll();
   currentId    = id;
   activeTab    = null;
@@ -956,9 +987,11 @@ function trackWorkflow(id) {
   _lastBodyKey = null;   // buộc render lại tab-body cho workflow mới
   cancelInFlight  = false;
   cancelRequested = false;
+  _artRolesKey = '';
+  _artLoadAt   = 0;
   pollAbort    = new AbortController();   // stopAll() đã hủy request của lần theo dõi trước
 
-  pushUrl(id);
+  if (opts.push !== false) pushUrl(id);
   showView('wf');
   document.getElementById('wf-view').classList.add('wf-loading');
   document.getElementById('copy-btn').style.display = 'inline-flex';
@@ -1050,19 +1083,30 @@ async function fetchAndUpdate() {
   if (live) {
     // pollNow() được gọi khi request vừa rồi đang bay (vd. vừa gửi hủy) → poll lại ngay.
     schedulePoll(pollAgain ? 0 : POLL_MS);
-    // Tải artifact metadata trong khi chạy (mỗi khi có role mới hoàn thành)
-    const _artifactRoles = new Set(['fe','mobile','be','dba','devsecops','tech_lead','da']);
-    // Array.isArray: dữ liệu lạ ở đây không được ném (ngoài try → unhandled rejection)
-    const _completedArt  = (Array.isArray(data.completed_steps) ? data.completed_steps : [])
-      .filter(r => _artifactRoles.has(r));
-    if (_completedArt.some(r => !(r in artifactsCache))) {
-      loadArtifacts(id);
-    }
+    // Tải artifact metadata trong khi chạy — chỉ khi có role artifact mới hoàn thành
+    // (xem shouldLoadArtifacts). Array.isArray: dữ liệu lạ ở đây không được ném (ngoài try
+    // → unhandled rejection).
+    const _completedArt = (Array.isArray(data.completed_steps) ? data.completed_steps : [])
+      .filter(r => ARTIFACT_ROLES.has(r));
+    if (shouldLoadArtifacts(_completedArt, Date.now())) loadArtifacts(id);
   } else {
     stopDur();
     // Luôn tải lại artifact khi workflow kết thúc
     loadArtifacts(id);
   }
+}
+
+// Trong lúc chạy, chỉ tải lại /artifacts khi TẬP role artifact đã hoàn thành thay đổi; nếu
+// vẫn còn role đã xong mà /artifacts chưa có mục nào thì thử lại sau ART_RETRY_MS. Trước đây
+// một role không sinh file (vd. da chỉ có văn bản) khiến MỖI lần poll (2.5s) đều gọi /artifacts
+// cho tới khi workflow kết thúc. Workflow kết thúc → fetchAndUpdate luôn tải lại một lần.
+function shouldLoadArtifacts(completedArt, now) {
+  const key     = [...completedArt].sort().join(',');
+  const missing = completedArt.some(r => !(r in artifactsCache));
+  if (key === _artRolesKey && !(missing && now - _artLoadAt >= ART_RETRY_MS)) return false;
+  _artRolesKey = key;
+  _artLoadAt   = now;
+  return true;
 }
 
 // Luôn chỉ tồn tại đúng 1 timer poll.
@@ -1234,7 +1278,10 @@ function renderStatusBar(data) {
 
   // textContent (không phải innerHTML) → giá trị từ API không bao giờ được parse thành HTML
   setText(document.getElementById('meta-project'), data.project || '—');
-  setText(document.getElementById('meta-started'), fmtTime(data.created_at));
+  const _started = document.getElementById('meta-started');
+  setText(_started, fmtTime(data.created_at));
+  const _startedTitle = fmtFullTime(data.created_at);
+  if (_started.title !== _startedTitle) _started.title = _startedTitle;
   setText(document.getElementById('dur-val'), dur);
   setText(document.getElementById('meta-steps'), `${(data.completed_steps || []).length} / ${STEPS.length}`);
   const _nFailed = STEPS.filter(st => isStepFailed(data, st.role)).length;
@@ -1386,17 +1433,19 @@ function renderTabBody(data) {
   // thay đổi (đổi tab, step có output mới, trạng thái/hàng đợi/hủy đổi, artifact vừa
   // tải xong). Lưu ý: sub-tab (Output/Files) do switchSubTab tự toggle display nên KHÔNG
   // nằm trong chữ ký → lựa chọn sub-tab của người dùng được giữ nguyên qua các lần poll.
-  const _artCount = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_')).length;
+  // Chữ ký nội dung (không chỉ độ dài): Clarifier regen có thể sinh lại output CÙNG độ dài,
+  // hoặc đổi file artifact (tên/kích thước) mà số file giữ nguyên → vẫn phải render lại.
+  const roleArts = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_'));
   const _bodyKey = [
     activeTab,
     _hasKey ? 1 : 0,
-    output.length,
+    output.length + ':' + hashStr(output),
     data.status,
     state,
     currentStep || '',   // "Chờ hoàn thành N bước trước" phụ thuộc bước đang chạy
     data.status === 'pending' && data.queue_position != null ? data.queue_position : '',
     state === 'active' && cancelling ? 'x' : '',
-    _artCount,
+    roleArts.length + ':' + hashStr(artifactSig(roleArts)),
   ].join('|');
   if (_bodyKey === _lastBodyKey) return;   // không đổi → giữ nguyên DOM + scroll
   _lastBodyKey = _bodyKey;
@@ -1414,7 +1463,6 @@ function renderTabBody(data) {
           + `“File generation errors” bên dưới.</div>`
         : '';
     const clean    = renderMarkdown(output);
-    const roleArts = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_'));
     const filesBtn = roleArts.length
       ? `<button class="sub-tab-btn" id="stb-files" onclick="switchSubTab('files')">📁 Files <span class="art-count">${roleArts.length}</span></button>`
       : '';
@@ -1666,6 +1714,7 @@ async function showRecent() {
       const icon    = iconMap[w.status] || '?';
       const chip    = document.createElement('div');
       chip.className = 'recent-chip';
+      chip.title     = fmtFullTime(w.created_at);
       // Dữ liệu server (đặc biệt project do người dùng nhập) → luôn esc() (chống stored XSS).
       chip.innerHTML = `
         <div class="rc-id">${icon} ${esc(String(w.workflow_id).substring(0, 16))}…</div>
@@ -1685,6 +1734,7 @@ async function showRecent() {
    HELPERS
    ──────────────────────────────────────────────────────────────────────── */
 function showView(which) {
+  currentView = which;
   document.getElementById('empty-state').style.display      = which === 'empty'  ? 'flex' : 'none';
   document.getElementById('recent-section').style.display   = which === 'recent' ? 'block' : 'none';
   document.getElementById('wf-view').style.display          = which === 'wf'     ? 'block' : 'none';
@@ -1736,13 +1786,57 @@ function setPollIndicator(mode) {
   setText(document.getElementById('poll-text'), mode === 'retry' ? 'Mất kết nối…' : 'Polling…');
 }
 
-function toast(msg, ms = 2800) {
+// Toast xếp chồng trong #toast-stack (vùng live role="status", có sẵn trong HTML).
+// kind: 'info' | 'ok' | 'warn' | 'err' — viền trái đổi màu; lỗi hiện lâu hơn để kịp đọc.
+// textContent (không innerHTML) → msg có chứa dữ liệu server cũng không thành HTML.
+function toast(msg, kind = 'info', ms) {
+  const stack = document.getElementById('toast-stack');
   const t = document.createElement('div');
-  t.className = 'toast';
-  t.setAttribute('role', 'status');
+  t.className = 'toast toast-' + kind;
   t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), ms);
+  stack.appendChild(t);
+  // Giữ tối đa TOAST_MAX toast — bỏ các cái cũ nhất
+  Array.from(stack.children).slice(0, -TOAST_MAX).forEach(c => c.remove());
+  setTimeout(() => t.remove(), ms || (kind === 'err' ? 6000 : 3000));
+  return t;
+}
+
+// Sao chép text vào clipboard → Promise<boolean>, không bao giờ reject.
+// navigator.clipboard chỉ có trong secure context (https / localhost) — UI thường được mở
+// qua http://<ip>:8000 nên trước đây Copy ID ném "reading 'writeText'" và không báo gì.
+// Đường lui: textarea ẩn + document.execCommand('copy') (vẫn chạy ở http thường).
+async function copyText(text) {
+  text = String(text);
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* bị từ chối quyền / tài liệu không focus → thử đường lui */ }
+  return legacyCopy(text);
+}
+
+function legacyCopy(text) {
+  const prev = document.activeElement;
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');        // không bật bàn phím ảo trên điện thoại
+  ta.setAttribute('aria-hidden', 'true');
+  ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none';
+  document.body.appendChild(ta);
+  let ok = false;
+  try {
+    ta.focus({ preventScroll: true });
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    ok = !!document.execCommand('copy');
+  } catch (e) { ok = false; }
+  ta.remove();
+  // Trả focus về nút vừa bấm (người dùng bàn phím không bị mất vị trí)
+  if (prev && typeof prev.focus === 'function') {
+    try { prev.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
+  }
+  return ok;
 }
 
 /* ── Hủy workflow ───────────────────────────────────────────────────── */
@@ -1768,17 +1862,17 @@ async function requestCancel() {
       cancelRequested = true;
       toast(j.status === 'cancelled'
         ? '✓ Đã hủy workflow.'
-        : '✓ Đã gửi yêu cầu hủy — workflow sẽ dừng sau bước hiện tại.');
+        : '✓ Đã gửi yêu cầu hủy — workflow sẽ dừng sau bước hiện tại.', 'ok');
     } else if (res.status === 409) {
-      toast('Workflow đã kết thúc — không còn gì để hủy.');
+      toast('Workflow đã kết thúc — không còn gì để hủy.', 'warn');
     } else if (res.status === 404) {
-      toast('✗ Không hủy được: agent-api không tìm thấy workflow (hoặc chưa hỗ trợ hủy).');
+      toast('✗ Không hủy được: agent-api không tìm thấy workflow (hoặc chưa hỗ trợ hủy).', 'err');
     } else {
-      toast(`✗ Hủy thất bại (HTTP ${res.status}) — thử lại sau.`);
+      toast(`✗ Hủy thất bại (HTTP ${res.status}) — thử lại sau.`, 'err');
     }
   } catch (e) {
     if (gen !== pollGen) return;
-    toast(`✗ Không gửi được yêu cầu hủy: ${e.message}`);
+    toast(`✗ Không gửi được yêu cầu hủy: ${e.message}`, 'err');
   } finally {
     if (gen === pollGen) {
       cancelInFlight = false;
@@ -1805,9 +1899,38 @@ function fmtDur(from, to) {
   return `${m}:${(s % 60).toString().padStart(2, '0')}`;
 }
 
-function fmtTime(iso) {
+// Hôm nay → chỉ giờ (như trước); ngày khác → ngày + giờ:phút. Trước đây chỉ có giờ nên các
+// mục Recent khác ngày trông y hệt nhau. `now` là tham số để test không phụ thuộc đồng hồ.
+function fmtTime(iso, now = new Date()) {
   if (!iso) return '—';
-  try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString();
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// Thời điểm đầy đủ (ngày + giờ:phút:giây) cho tooltip
+function fmtFullTime(iso) {
+  const d = new Date(iso);
+  return iso && !isNaN(d.getTime()) ? d.toLocaleString() : '';
+}
+
+// FNV-1a 32-bit — chữ ký rẻ cho nội dung (output vài chục KB: dưới 1 ms mỗi lần poll)
+function hashStr(s) {
+  s = String(s);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+// Chữ ký danh sách file artifact: tên + kích thước (nối chuỗi — không cần nội dung file)
+function artifactSig(files) {
+  return (files || []).map(f => f.filename + ':' + f.size).join('\n');
 }
 
 function esc(s) {
@@ -1816,21 +1939,42 @@ function esc(s) {
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// URL ?id=<workflow_id> ↔ workflow đang theo dõi. Mỗi lần theo dõi một workflow KHÁC → một
+// mục history (Back quay lại workflow trước, xem onPopState). URL không đổi (tải trang với
+// ?id=, bấm Track lại cùng id, chọn chip Recent của workflow đang mở) → không push mục trùng.
 function pushUrl(id) {
   const u = new URL(window.location);
   u.searchParams.set('id', id);
-  window.history.pushState({}, '', u);
+  if (u.href === String(window.location.href)) return;
+  window.history.pushState({ id }, '', u);
 }
 
-function copyId() {
+// Back / Forward: trước đây pushState đổi URL nhưng không ai nghe popstate → URL đổi còn
+// giao diện đứng yên (vẫn poll workflow cũ). Chỉ dựa vào ?id= của URL mới.
+function onPopState() {
+  const id = new URLSearchParams(window.location.search).get('id');
+  if (!id) {
+    // Về trang ban đầu (không có ?id=) → ngừng theo dõi, hiện màn hình trống
+    stopAll();
+    currentId = null;
+    lastData  = null;
+    document.getElementById('wid-input').value = '';
+    document.getElementById('copy-btn').style.display = 'none';
+    showView('empty');
+    return;
+  }
+  // Cùng workflow đang hiển thị (vd. Back qua mục #anchor của link trong output) → giữ
+  // nguyên tab + vị trí cuộn, không tải lại.
+  if (id === currentId && currentView === 'wf') return;
+  document.getElementById('wid-input').value = id;
+  trackWorkflow(id, { push: false });
+}
+
+async function copyId() {
   if (!currentId) return;
-  navigator.clipboard.writeText(currentId).then(() => {
-    const t = document.createElement('div');
-    t.className = 'toast';
-    t.textContent = '✓ Copied workflow ID';
-    document.body.appendChild(t);
-    setTimeout(() => t.remove(), 2000);
-  });
+  const id = currentId;
+  if (await copyText(id)) toast('✓ Đã sao chép Workflow ID', 'ok');
+  else toast('✗ Không sao chép được — Workflow ID: ' + id, 'err');
 }
 
 /* ── Artifacts / File tree ──────────────────────────────────────────── */
@@ -1845,8 +1989,9 @@ async function loadArtifacts(wid) {
     // Đã chuyển sang workflow khác trong lúc chờ → không ghi đè cache bằng file của workflow cũ
     if (gen !== pollGen) return;
     artifactsCache = data.artifacts || {};
-    // Re-render tab body nếu tab hiện tại có artifact mới
-    if (lastData && activeTab && artifactsCache[activeTab]) renderTabBody(lastData);
+    // Render lại tab body — chữ ký _bodyKey (tên + kích thước file) quyết định có rebuild hay
+    // không, kể cả khi artifact của tab hiện tại vừa bị xóa hoặc đổi nội dung.
+    if (lastData && activeTab) renderTabBody(lastData);
   } catch (e) { /* non-fatal */ }
 }
 
@@ -1967,33 +2112,39 @@ function loadJSZip() {
 async function downloadRoleZip(role) {
   const files = (artifactsCache[role] || []).filter(f => !f.filename.startsWith('_'));
   const wid   = encodeURIComponent(currentId);   // chốt id: đổi workflow giữa chừng không trộn file
-  if (!files.length) { alert('Không có file để tải.'); return; }
-
-  const _toast = msg => {
-    const t = document.createElement('div');
-    t.className = 'toast'; t.textContent = msg;
-    document.body.appendChild(t); setTimeout(() => t.remove(), 2800);
-  };
+  if (!files.length) { toast('Không có file để tải.', 'warn'); return; }
 
   let JSZipLib;
   try { JSZipLib = await loadJSZip(); }
-  catch (e) { _toast(`✗ ${e.message} — thử lại sau.`); return; }
-  _toast(`⏳ Đang nén ${files.length} file…`);
+  catch (e) { toast(`✗ ${e.message} — thử lại sau.`, 'err'); return; }
+  toast(`⏳ Đang nén ${files.length} file…`);
 
   try {
     const zip    = new JSZipLib();
     const folder = zip.folder(role);
+    let missing  = 0;   // file không tải được (404 / mạng) — báo thay vì im lặng bỏ qua
     await Promise.all(files.map(async f => {
-      const r = await fetch(`/workflow/${wid}/artifacts/${role}/${encodeURIComponent(f.filename)}`);
-      if (r.ok) { const d = await r.json(); folder.file(f.filename, d.content); }
+      try {
+        const r = await fetch(`/workflow/${wid}/artifacts/${role}/${encodeURIComponent(f.filename)}`);
+        if (!r.ok) { missing++; return; }
+        const d = await r.json();
+        folder.file(f.filename, d.content);
+      } catch (e) { missing++; }
     }));
+    if (missing === files.length) { toast('✗ Không tải được file nào — thử lại sau.', 'err'); return; }
     const blob = await zip.generateAsync({ type: 'blob' });
     const url  = URL.createObjectURL(blob);
+    // Anchor phải nằm trong DOM thì click() mới chắc chắn tải được (Firefox); thu hồi object
+    // URL sau một nhịp — revoke ngay sau click() có thể hủy tải trước khi trình duyệt đọc blob.
     const a    = document.createElement('a');
-    a.href = url; a.download = `${role}-artifacts.zip`; a.click();
-    URL.revokeObjectURL(url);
-    _toast(`✓ Đã tải ${role}-artifacts.zip`);
-  } catch (e) { _toast(`✗ Lỗi: ${e.message}`); }
+    a.href = url; a.download = `${role}-artifacts.zip`; a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    if (missing) toast(`⚠ Đã tải ${role}-artifacts.zip — thiếu ${missing}/${files.length} file không tải được.`, 'warn');
+    else toast(`✓ Đã tải ${role}-artifacts.zip`, 'ok');
+  } catch (e) { toast(`✗ Lỗi: ${e.message}`, 'err'); }
 }
 
 function getFileIcon(filename) {
