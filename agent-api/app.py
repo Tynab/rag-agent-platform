@@ -881,7 +881,9 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
 
     _start = time.monotonic()
     try:
-        _node_errors: list[str] = []
+        # role → tóm tắt lỗi của node đó (thứ tự chèn = thứ tự chạy). Theo role để regen
+        # thành công gỡ được đúng lỗi của bước đó khỏi record.error.
+        _node_errors: dict[str, str] = {}
         _timed_out = False
         # Hủy được yêu cầu trong khoảnh khắc giữa lúc nhận slot và lúc bắt đầu → không chạy gì.
         _cancelled = _cancel_requested()
@@ -897,7 +899,7 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
                     # chunk = {ten_node: partial_state_dict} với stream_mode="updates".
                     # Mỗi chunk cập nhật được ngay lập tức vào record để GET /workflow/{id}
                     # phản ánh tiến trình real-time.
-                    for node_output in chunk.values():
+                    for _node_name, node_output in chunk.items():
                         if isinstance(node_output, dict):
                             # Cập nhật real-time để GET /workflow/{id} phản ánh tiến trình
                             if "step_outputs" in node_output:
@@ -921,7 +923,7 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
                                     )
                                 )
                             if node_output.get("error"):
-                                _node_errors.append(str(node_output["error"]))
+                                _node_errors[_node_name] = str(node_output["error"])
                     # Ghi tiến trình sau mỗi node để GET /workflow/{id} (đọc từ SQLite) thấy ngay.
                     _persist(record)
                     # C1: có yêu cầu hủy → dừng sau node vừa xong (ưu tiên hơn ngân sách W1).
@@ -948,7 +950,7 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
         # Stream hoàn tất (hoặc dừng do timeout) ⇒ 'completed'. Lỗi từng node nằm trong
         # failed_steps + record.error (tóm tắt); chỉ outer-except mới là 'failed' thật sự.
         if _node_errors:
-            record.error = "; ".join(_node_errors[:5])
+            record.error = "; ".join(list(_node_errors.values())[:5])
         if _timed_out:
             record.error = (record.error + " | " if record.error else "") + \
                 f"[Timeout: vượt {_WORKFLOW_MAX_SECONDS}s, dừng sớm]"
@@ -1017,9 +1019,13 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _Workfl
                             continue
                         _live_outputs[_role] = _new_output
                         record.step_outputs[_role] = _new_output
-                        # Lần chạy đầu lỗi nhưng regen thành công → bước không còn là lỗi.
+                        # Lần chạy đầu lỗi nhưng regen thành công → bước không còn là lỗi:
+                        # gỡ khỏi failed_steps và tóm tắt lại record.error từ lỗi còn lại
+                        # (regen chỉ chạy khi không timeout → không có hậu tố [Timeout]).
                         if _role in record.failed_steps:
                             record.failed_steps.remove(_role)
+                        if _node_errors.pop(_role, None) is not None:
+                            record.error = "; ".join(list(_node_errors.values())[:5]) or None
                         # Re-extract artifact nếu role này có file code — cập nhật artifacts sau re-gen.
                         if _role in _ARTIFACT_ROLES and _new_output:
                             _arts = _extract_artifacts(_role, _new_output, workflow_id)

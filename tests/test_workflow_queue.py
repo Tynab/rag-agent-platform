@@ -632,6 +632,28 @@ def test_regen_success_clears_failed_step(qenv, monkeypatch):
         ra = _get(client, A)
     assert ra["step_outputs"]["be"] == "BE v2"
     assert "be" not in ra["failed_steps"]
+    assert ra["error"] is None                              # không còn tóm tắt lỗi cũ
+
+
+def test_regen_success_keeps_other_step_errors(qenv, monkeypatch):
+    class _TwoFailing(_HookGraph):
+        def stream(self, state, stream_mode="updates"):
+            self.calls.append(state["user_input"])
+            for role in ("be", "fe"):
+                yield {role: {"step_outputs": {role: f"[LỖI trong {role}] boom"},
+                              "completed_steps": [role], "error": f"Bước '{role}' thất bại: boom"}}
+            yield _node("clarifier", "clarifier của A")
+
+    qenv.use_graph(_TwoFailing(("be", "fe", "clarifier")))
+    monkeypatch.setattr(app_mod, "_CLARIFIER_REGEN_LOOPS", 1)
+    monkeypatch.setattr(app_mod, "_parse_clarifier_regen_list", lambda text: ["be"])
+    monkeypatch.setattr(app_mod, "run_single_step", lambda role, **kw: f"{role.upper()} v2")
+    with TestClient(app_mod.app) as client:
+        A = _post(client, "A")["workflow_id"]
+        _wait_finished(A)
+        ra = _get(client, A)
+    assert ra["failed_steps"] == ["fe"]
+    assert ra["error"] == "Bước 'fe' thất bại: boom"
 
 
 # ── Ghi trạng thái cuối có thử lại ─────────────────────────────────────────────

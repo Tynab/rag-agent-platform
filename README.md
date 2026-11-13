@@ -902,7 +902,7 @@ curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq
 | `failed` | Lỗi không xử lý được — kiểm tra trường `error`. Các thông báo cố định: `Bị gián đoạn do agent-api khởi động lại` (run đang chạy/xếp hàng lúc restart), `Không đọc được bản ghi workflow từ store — workflow không được chạy` (record trong SQLite hỏng/không đọc được lúc worker nhận slot — không node nào chạy), `Workflow dừng bất thường do lỗi hệ thống` (worker thoát bất thường) |
 | `cancelled` | Bị hủy qua `POST /workflow/{id}/cancel` — `error = "Đã hủy theo yêu cầu người dùng"`; output các bước đã xong vẫn giữ nguyên |
 
-> Nếu một bước gặp lỗi LLM (timeout, model chưa pull, coding agent không sinh được file nào, agent báo cáo trả về output **rỗng** sau cả lần retry...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs`, thêm role vào `failed_steps` và tóm tắt vào trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp. Trong Clarifier regen loop: bước regen lỗi **giữ nguyên** output + artifact của lần chạy trước; bước từng lỗi mà regen thành công được gỡ khỏi `failed_steps`.
+> Nếu một bước gặp lỗi LLM (timeout, model chưa pull, coding agent không sinh được file nào, agent báo cáo trả về output **rỗng** sau cả lần retry...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs`, thêm role vào `failed_steps` và tóm tắt vào trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp. Trong Clarifier regen loop: bước regen lỗi **giữ nguyên** output + artifact của lần chạy trước; bước từng lỗi mà regen thành công được gỡ khỏi `failed_steps` và khỏi tóm tắt trong `error`.
 
 ### POST /workflow/{workflow_id}/cancel
 
