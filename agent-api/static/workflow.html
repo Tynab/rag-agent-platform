@@ -4,11 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>rag-agent-platform · Workflow UI</title>
-  <script src="https://cdn.jsdelivr.net/npm/marked@11/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>
+  <!-- Thư viện vendor đi kèm repo (agent-api/static/vendor/, phiên bản ghi trong tên file)
+       → chạy offline hoàn toàn, không phụ thuộc CDN. Giữ thẻ script đồng bộ (không defer/async):
+       script inline bên dưới cần marked/DOMPurify sẵn sàng. JSZip nạp lười khi bấm Download All. -->
+  <script src="/ui/static/vendor/marked-11.2.0.min.js"></script>
+  <script src="/ui/static/vendor/dompurify-3.4.17.min.js"></script>
+  <link rel="stylesheet" href="/ui/static/vendor/highlight-11.12.0-github-dark.min.css">
+  <script src="/ui/static/vendor/highlight-11.12.0.min.js"></script>
   <style>
     /* ── Reset & tokens ───────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -585,6 +587,10 @@
     .md pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
     .md pre code { font-size: 12.5px; line-height: 1.45; }
     .md code { font-size: 12px; }
+    /* Đường lui khi không render được markdown (renderMarkdown): text thô xuống dòng như
+       văn bản — không thành hộp 520px cuộn ngang/dọc trên màn hẹp. */
+    .md pre.md-fallback { white-space: pre-wrap; overflow-wrap: anywhere; max-height: none; overflow: visible; }
+    .md .md-fallback-note { margin: 0 0 .5em; color: var(--warn); font-size: 12px; }
 
     /* ── Responsive ──────────────────────────────────────────── */
     /* Đặt cuối <style> để thắng các rule cùng độ ưu tiên ở trên. Mục tiêu: không có
@@ -777,11 +783,17 @@ let _stepEls     = null;   // [{ node, conn, circle, state }] — progress track
 let _tabEls      = null;   // [{ btn, icon }] — thanh tab dựng một lần
 let pollGen      = 0;      // "thế hệ" theo dõi — tăng mỗi lần stopAll(); response của thế hệ cũ bị bỏ qua
 let pollAbort    = null;   // AbortController cho các request của thế hệ hiện tại
+let mdReady      = false;  // marked + DOMPurify đã tải và cấu hình xong (xem setupMarkdown)
+let jszipLoading = null;   // Promise nạp JSZip lười (xem loadJSZip) — null = chưa nạp / lần trước lỗi
 
 /* ────────────────────────────────────────────────────────────────────────
    INIT — pick up workflow_id from URL query string
    ──────────────────────────────────────────────────────────────────────── */
 (function init() {
+  // Cấu hình marked TRƯỚC khi theo dõi: nếu thư viện thiếu, setupMarkdown() chỉ trả false
+  // (render dùng text thô) chứ không ném lỗi làm hỏng cả init.
+  setupMarkdown();
+
   const p = new URLSearchParams(window.location.search);
   const id = p.get('id');
   if (id) {
@@ -791,10 +803,6 @@ let pollAbort    = null;   // AbortController cho các request của thế hệ 
   document.getElementById('wid-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') trackFromInput();
   });
-
-  // Configure marked
-  marked.setOptions({ breaks: true, gfm: true });
-  marked.use({ walkTokens: promoteAsciiDiagram });
 })();
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -1107,14 +1115,8 @@ function renderTabBody(data) {
   _lastBodyKey = _bodyKey;
 
   if (_hasKey && output && output.trim()) {
-    // Hoàn thành — render markdown + panel files nếu có artifact.
-    // DOMPurify đã chặn script/on*; cấm thêm id/name (HTML thô trong output agent có
-    // thể trùng id của trang như "art-viewer"/"sub-files" → getElementById trỏ nhầm)
-    // và <style>/<form> (CSS thô không bọc ``` sẽ áp lên toàn trang).
-    const clean    = DOMPurify.sanitize(marked.parse(output), {
-      FORBID_TAGS: ['style', 'form'],
-      FORBID_ATTR: ['id', 'name'],
-    });
+    // Hoàn thành — render markdown (đã sanitize, xem renderMarkdown) + panel files nếu có artifact.
+    const clean    = renderMarkdown(output);
     const roleArts = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_'));
     const filesBtn = roleArts.length
       ? `<button class="sub-tab-btn" id="stb-files" onclick="switchSubTab('files')">📁 Files <span class="art-count">${roleArts.length}</span></button>`
@@ -1199,6 +1201,47 @@ function renderTabBody(data) {
         <p>Chưa chạy.</p>
       </div>`;
   }
+}
+
+/* ── Markdown → HTML an toàn (có đường lui) ─────────────────────────── */
+// marked + DOMPurify nạp từ /ui/static/vendor/. Nếu một trong hai không tải được (file
+// thiếu, bị chặn…) hoặc parse/sanitize ném lỗi → hiện output dạng text thô đã esc() trong
+// <pre> thay vì ném: lỗi ném ra trong renderTabBody rơi vào catch của fetchAndUpdate →
+// showError + stopAll → trang NGỪNG poll (trước đây: "marked is not defined").
+// Dùng `typeof X` (không phải window.X) để chạy được cả trong vm của test node.
+function setupMarkdown() {
+  mdReady = false;
+  try {
+    if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+      console.warn('Không tải được marked/DOMPurify — output hiển thị dạng text thô.');
+      return false;
+    }
+    marked.setOptions({ breaks: true, gfm: true });
+    marked.use({ walkTokens: promoteAsciiDiagram });
+    mdReady = true;
+  } catch (e) {
+    console.warn('Cấu hình marked lỗi — output hiển thị dạng text thô:', e);
+  }
+  return mdReady;
+}
+
+function renderMarkdown(src) {
+  if (mdReady) {
+    try {
+      // DOMPurify đã chặn script/on*; cấm thêm id/name (HTML thô trong output agent có
+      // thể trùng id của trang như "art-viewer"/"sub-files" → getElementById trỏ nhầm)
+      // và <style>/<form> (CSS thô không bọc ``` sẽ áp lên toàn trang).
+      return DOMPurify.sanitize(marked.parse(String(src)), {
+        FORBID_TAGS: ['style', 'form'],
+        FORBID_ATTR: ['id', 'name'],
+      });
+    } catch (e) {
+      console.warn('Render markdown lỗi — hiển thị text thô:', e);
+    }
+  }
+  // KHÔNG bao giờ chèn HTML của marked khi thiếu DOMPurify — chỉ text đã esc().
+  return `<p class="md-fallback-note">⚠️ Không định dạng được markdown — đang hiện nội dung thô.</p>`
+       + `<pre class="md-fallback">${esc(src)}</pre>`;
 }
 
 /* ── Sơ đồ ASCII không bọc code fence ───────────────────────────────── */
@@ -1493,21 +1536,44 @@ function closeArtViewer() {
   if (v) v.style.display = 'none';
 }
 
+// JSZip (~100 KB) chỉ cần khi bấm "Download All" → nạp lười đúng một lần (các lần bấm
+// sau dùng chung Promise). Nạp lỗi → gỡ thẻ script hỏng + xóa cache để lần bấm sau thử lại.
+function loadJSZip() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  if (!jszipLoading) {
+    const s = document.createElement('script');
+    s.src = '/ui/static/vendor/jszip-3.10.2.min.js';
+    jszipLoading = new Promise((resolve, reject) => {
+      s.onload  = () => window.JSZip ? resolve(window.JSZip) : reject(new Error('JSZip không khởi tạo được'));
+      s.onerror = () => reject(new Error('Không tải được JSZip'));
+      document.head.appendChild(s);
+    }).catch(e => {
+      s.remove();
+      jszipLoading = null;
+      throw e;
+    });
+  }
+  return jszipLoading;
+}
+
 async function downloadRoleZip(role) {
   const files = (artifactsCache[role] || []).filter(f => !f.filename.startsWith('_'));
   const wid   = encodeURIComponent(currentId);   // chốt id: đổi workflow giữa chừng không trộn file
   if (!files.length) { alert('Không có file để tải.'); return; }
-  if (!window.JSZip) { alert('JSZip chưa tải xong, thử lại sau.'); return; }
 
   const _toast = msg => {
     const t = document.createElement('div');
     t.className = 'toast'; t.textContent = msg;
     document.body.appendChild(t); setTimeout(() => t.remove(), 2800);
   };
+
+  let JSZipLib;
+  try { JSZipLib = await loadJSZip(); }
+  catch (e) { _toast(`✗ ${e.message} — thử lại sau.`); return; }
   _toast(`⏳ Đang nén ${files.length} file…`);
 
   try {
-    const zip    = new JSZip();
+    const zip    = new JSZipLib();
     const folder = zip.folder(role);
     await Promise.all(files.map(async f => {
       const r = await fetch(`/workflow/${wid}/artifacts/${role}/${encodeURIComponent(f.filename)}`);
