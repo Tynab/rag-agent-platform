@@ -24,6 +24,9 @@ class _FakeGraph:
     def setup_schema(self):
         pass
 
+    def existing_chunk_ids(self, project, ids):
+        return set()  # graph trống → ingest ghi đủ graph
+
     def save_project_graph(self, project, pairs):
         return len(pairs)
 

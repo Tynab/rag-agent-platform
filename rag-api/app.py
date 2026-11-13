@@ -25,7 +25,9 @@ POST /ingest
     Body tùy chọn: {"project": "tên_project", "reset": false}
     - Nếu không truyền project: ingest tất cả project có trong RAW_DATA_DIR.
     - reset=true: xóa collection cũ trước, sau đó ingest lại toàn bộ.
-    - Idempotent: chạy lại cùng file sẽ upsert đúng point_id, không tạo bản sao.
+    - Idempotent + tăng dần: point_id tất định theo nội dung → chỉ chunk mới/đã sửa được
+      embed + upsert; chunk không đổi bỏ qua (`skipped_unchanged`), chunk của file đã
+      sửa/xóa bị dọn khỏi Qdrant + Neo4j (`stale_removed`).
 
 POST /reset-ingest
     Xóa toàn bộ collection (hoặc một project cụ thể) rồi ingest lại từ đầu.
@@ -94,6 +96,7 @@ from ingest import (
     OLLAMA_REQUEST_TIMEOUT,
     RAW_DATA_DIR,
     InvalidProjectError,
+    collection_vector_size,
     embed_texts,
     get_collection_name,
     get_projects,
@@ -240,25 +243,6 @@ def get_chat_model() -> ChatOllama:
     return _llm
 
 
-def _collection_vector_size(client, collection_name: str) -> int | None:
-    """A2 — trả về số chiều vector của collection (None nếu không đọc được).
-
-    Dùng để phát hiện sớm việc đổi EMBEDDING_MODEL (lệch dimension) và báo lỗi rõ ràng
-    yêu cầu /reset-ingest, thay vì để Qdrant ném lỗi khó hiểu giữa chừng truy vấn.
-    """
-    try:
-        params = client.get_collection(collection_name).config.params.vectors
-        if hasattr(params, "size"):
-            return int(params.size)
-        if isinstance(params, dict) and params:
-            first = next(iter(params.values()))
-            size = getattr(first, "size", None)
-            return int(size) if size else None
-    except Exception as exc:
-        logger.debug("A2: không đọc được vector size của %s: %s", collection_name, exc)
-    return None
-
-
 @app.get("/health")
 def health() -> dict[str, Any]:
     graph_info: dict[str, Any] = {"enabled": GRAPH_ENABLED}
@@ -400,7 +384,7 @@ def _retrieve_context(req: AskRequest, op: str) -> tuple[str, list[SourceItem]]:
         for _proj, coll_name in collections_to_search:
             # A2: chặn truy vấn lên collection được index bằng EMBEDDING_MODEL khác
             # (lệch số chiều vector) — báo lỗi rõ ràng thay vì để Qdrant fail mơ hồ.
-            _dim = _collection_vector_size(client, coll_name)
+            _dim = collection_vector_size(client, coll_name)
             if _dim is not None and _dim != len(query_vector):
                 raise HTTPException(
                     status_code=409,

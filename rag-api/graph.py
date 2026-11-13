@@ -49,6 +49,9 @@ Chú ý hiệu suất
 - GRAPH_ENTITY_EXTRACTION=true làm chậm quá trình ingest đáng kể vì gọi LLM
   cho mỗi chunk. Nên tắt khi ingest lần đầu số lượng lớn tài liệu.
 - GRAPH_ENABLED=false sẽ bỏ qua hoàn toàn Neo4j — RAG chỉ dùng Qdrant.
+- Ingest không-reset chỉ ghi + trích xuất thực thể cho chunk chưa có node
+  (existing_chunk_ids) → bật GRAPH_ENTITY_EXTRACTION SAU khi đã ingest thì chunk cũ
+  không được trích xuất cho tới khi chạy /reset-ingest.
 - Kết nối Neo4j được tái sử dụng qua module-level driver singleton.
 """
 
@@ -291,6 +294,33 @@ def delete_project_graph(project: str) -> None:
             p=project,
         )
     logger.info("Deleted Neo4j graph for project '%s'", project)
+
+
+def existing_chunk_ids(project: str, ids: list[str]) -> set[str]:
+    """
+    Ingest tăng dần — trả về các id trong *ids* ĐÃ có Chunk node của *project* (gắn với
+    một Document qua HAS_CHUNK) trong Neo4j.
+
+    ingest.py chỉ ghi + trích xuất thực thể cho chunk KHÔNG có trong tập này. Project
+    chưa có Chunk nào (vd. GRAPH_ENABLED vừa bật, Neo4j bị xóa) → tập rỗng → dựng đủ
+    graph; graph dở dang do lần ingest trước lỗi cũng tự được ghi bù. Tra theo id (có
+    uniqueness constraint chunk_id) nên không quét toàn bộ Chunk của project.
+    """
+    if not ids:
+        return set()
+    driver = get_driver()
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run(
+            """
+            UNWIND $ids AS cid
+            MATCH (c:Chunk {id: cid})
+            WHERE c.project = $p AND (:Document)-[:HAS_CHUNK]->(c)
+            RETURN c.id AS id
+            """,
+            ids=list(ids),
+            p=project,
+        )
+        return {str(r["id"]) for r in result}
 
 
 def delete_stale_chunks(project: str, keep_ids: list[str]) -> int:

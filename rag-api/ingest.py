@@ -23,6 +23,8 @@ Quy trình xử lý chi tiết
     _run_async_pipeline()
         Pipeline bất đồng bộ sử dụng asyncio + httpx gọi trực tiếp đến
         Ollama endpoint /api/embed (không qua LangChain để tối đa hiệu suất).
+        - Ingest tăng dần (không-reset): chỉ embed + upsert chunk có point_id CHƯA
+          có trong collection (chunk mới/đã sửa); chunk không đổi được bỏ qua
         - asyncio.gather(): toàn bộ batch embed được submit đồng thời
         - asyncio.Semaphore(INGEST_EMBED_WORKERS): giới hạn số request embed
           đồng thời, tránh làm quá tải GPU/CPU
@@ -36,14 +38,22 @@ Quy trình xử lý chi tiết
         Nếu GRAPH_ENTITY_EXTRACTION=true, LLM trích xuất thực thể từ nội dung
         chunk và lưu quan hệ (:Chunk)-[:MENTIONS]->(:Entity) và
         (:Entity)-[:CO_OCCURS_WITH]->(:Entity).
+        Ingest không-reset chỉ ghi (và trích xuất thực thể cho) chunk chưa có node
+        trong Neo4j — xem _plan_graph_writes().
 
-Idempotency
------------
-make_point_id() sinh UUID5 tất định từ tổ hợp (đường dẫn file + hash nội dung).
-Chạy /ingest nhiều lần trên cùng một file sẽ upsert đúng point_id đã tồn tại
-— Qdrant tự cập nhật payload, không tạo bản ghi trùng lặp.
+Idempotency & ingest tăng dần
+-----------------------------
+make_point_id() sinh UUID5 tất định từ tổ hợp (relative_path, loader_index,
+chunk_index, content_hash, embedding_model). Ingest không-reset tra trước các ID
+đã có trong collection (retrieve theo trang, không lấy payload/vector) và chỉ
+embed + upsert chunk có ID mới → chạy lại /ingest khi không có gì đổi KHÔNG gọi
+Ollama lần nào (`skipped_unchanged` trong response).
 F11: ingest không-reset còn xóa các point (và Chunk Neo4j) KHÔNG thuộc lần ingest
 hiện tại — chunk của file đã sửa/xóa/đổi tên — để index không giữ nội dung cũ.
+Tập giữ lại là MỌI chunk hiện tại (mới + không đổi), không chỉ chunk vừa upsert.
+Lưu ý: payload của chunk không đổi KHÔNG được ghi lại (doc_type/module suy luận,
+source_path, created_at giữ giá trị lần embed đầu) — sau khi đổi luật suy luận
+metadata hoặc RAW_DATA_DIR, chạy /reset-ingest để làm mới.
 
 Metadata của mỗi chunk trong Qdrant
 ------------------------------------
@@ -100,9 +110,11 @@ import re
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import httpx
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
@@ -498,6 +510,55 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 _INGEST_EMBED_RETRIES: int = max(1, int(os.environ.get("INGEST_EMBED_RETRIES", "3")))
 
 
+def collection_vector_size(client: QdrantClient, collection_name: str) -> int | None:
+    """A2 — trả về số chiều vector của collection (None nếu không đọc được).
+
+    Dùng chung cho app.py (phát hiện sớm việc đổi EMBEDDING_MODEL lệch dimension → báo
+    lỗi rõ ràng yêu cầu /reset-ingest, thay vì để Qdrant ném lỗi khó hiểu giữa chừng truy
+    vấn) và cho ingest (biết vector size của collection có sẵn mà KHÔNG phải gọi embed).
+    """
+    try:
+        params: Any = client.get_collection(collection_name).config.params.vectors
+        if hasattr(params, "size"):
+            return int(params.size)
+        if isinstance(params, dict) and params:
+            first = next(iter(params.values()))
+            size = getattr(first, "size", None)
+            return int(size) if size else None
+    except Exception as exc:
+        logger.debug("A2: không đọc được vector size của %s: %s", collection_name, exc)
+    return None
+
+
+class _CollectionGate:
+    """Tạo collection Qdrant đúng một lần với số chiều của batch embed THẬT đầu tiên.
+
+    Thay cho lời gọi embed "health check" trước đây (mỗi project ingest embed thêm một
+    chuỗi giả chỉ để biết vector size): collection đã tồn tại → size đọc từ config
+    (collection_vector_size, không embed); chưa tồn tại → batch embed xong ĐẦU TIÊN tạo
+    collection ngay trước khi upsert. ensure() không có await bên trong nên các coroutine
+    batch chạy đồng thời không thể chen ngang giữa bước kiểm tra và bước tạo; batch đầu
+    lỗi thì batch thành công kế tiếp tạo collection.
+    """
+
+    def __init__(self, client: QdrantClient, collection_name: str, vector_size: int | None) -> None:
+        self._client = client
+        self._collection_name = collection_name
+        self._vector_size = vector_size
+
+    def ensure(self, dim: int) -> None:
+        if self._vector_size is None:
+            _ensure_collection(self._client, self._collection_name, vector_size=dim)
+            self._vector_size = dim
+        elif dim != self._vector_size:
+            # Lệch dimension → upsert chắc chắn hỏng; báo rõ nguyên nhân thay vì lỗi Qdrant mơ hồ.
+            raise RuntimeError(
+                f"Collection '{self._collection_name}' có vector dim={self._vector_size} nhưng "
+                f"EMBEDDING_MODEL hiện tại sinh dim={dim} → EMBEDDING_MODEL đã thay đổi. "
+                "Chạy POST /reset-ingest để dựng lại index."
+            )
+
+
 async def _embed_and_upsert_batch_async(
     http_client: httpx.AsyncClient,
     qdrant: AsyncQdrantClient,
@@ -507,10 +568,12 @@ async def _embed_and_upsert_batch_async(
     chunk_batch: list[Document],
     collection_name: str,
     project: str,
+    gate: _CollectionGate,
 ) -> list[tuple]:
     """
     Embed một batch qua Ollama /api/embed rồi upsert vào Qdrant.
     Semaphore giới hạn số batch chạy đồng thời = INGEST_EMBED_WORKERS.
+    *gate* bảo đảm collection tồn tại (tạo theo số chiều vector thật) trước khi upsert.
     """
     async with sem:
         texts = [c.page_content for c in chunk_batch]
@@ -536,6 +599,8 @@ async def _embed_and_upsert_batch_async(
                 )
                 await asyncio.sleep(_wait)
         assert vectors is not None  # vòng lặp trên hoặc gán vectors hoặc raise
+        if vectors:
+            gate.ensure(len(vectors[0]))
 
         _now = datetime.now(timezone.utc).isoformat()
         points = [
@@ -604,62 +669,116 @@ def _delete_stale_points(client: QdrantClient, collection_name: str, keep_ids: s
     return stale
 
 
+def _existing_point_ids(client: QdrantClient, collection_name: str, ids: list[str]) -> set[str]:
+    """Ingest tăng dần — trả về các ID trong *ids* ĐÃ có trong collection.
+
+    retrieve theo trang _STALE_PAGE_SIZE ID, không lấy payload/vector (chỉ cần biết tồn
+    tại). Point ID tất định theo nội dung + embedding model nên ID đã có ⇒ vector đã có
+    đúng cho chunk đó → không cần embed lại.
+    """
+    found: set[str] = set()
+    for start in range(0, len(ids), _STALE_PAGE_SIZE):
+        page: list[ExtendedPointId] = [*ids[start: start + _STALE_PAGE_SIZE]]
+        records = client.retrieve(
+            collection_name=collection_name,
+            ids=page,
+            with_payload=False,
+            with_vectors=False,
+        )
+        found.update(str(r.id) for r in records)
+    return found
+
+
+@dataclass
+class _PipelineResult:
+    """Kết quả _run_async_pipeline cho một project."""
+
+    # ID point của MỌI chunk hiện tại (mới + không đổi) — tập giữ lại khi dọn point cũ.
+    all_ids: list[str]
+    # (chunk, point_id) vừa embed + upsert ở lần ingest này (chunk mới/đã sửa).
+    upserted: list[tuple]
+    # (chunk, point_id) đã có sẵn trong Qdrant — không embed lại.
+    unchanged: list[tuple]
+    points_count: int
+    # ID point cũ đã xóa — None nếu KHÔNG chạy bước dọn (reset=True hoặc có batch lỗi).
+    stale_ids: list[str] | None
+    failed_batches: int = 0
+    batch_error: str | None = None
+
+
 async def _run_async_pipeline(
     chunks: list[Document],
     collection_name: str,
     project: str,
     reset: bool,
-) -> tuple[list[tuple], int, list[str] | None]:
+) -> _PipelineResult:
     """
     Async embed + upsert pipeline: INGEST_EMBED_WORKERS batch chạy đồng thời.
 
     Cách hoạt động:
+      • Ingest không-reset: tra các point_id hiện tại đã có trong collection
+        (_existing_point_ids) → chỉ embed + upsert chunk có ID mới; chunk không đổi
+        được bỏ qua. Không có chunk mới → không tạo HTTP client, không gọi Ollama.
+      • reset=True: xóa collection rồi embed + upsert toàn bộ như trước.
+      • Không còn embed "health check": vector size đọc từ config collection có sẵn,
+        hoặc lấy từ batch embed thật đầu tiên khi phải tạo collection (_CollectionGate).
       • asyncio.gather gửi tất cả batch cùng lúc.
       • Semaphore giới hạn Ollama request đồng thời = INGEST_EMBED_WORKERS.
       • Embed và upsert của mỗi batch chạy nối tiếp trong cùng coroutine,
         nhưng nhiều batch chạy song song → GPU và Qdrant luôn bận.
       • Tăng INGEST_EMBED_WORKERS = OLLAMA_NUM_PARALLEL để khai thác tối đa.
-
-    Trả về (cặp (chunk, point_id) đã upsert, số point trong collection, ID point cũ đã
-    xóa — None nếu KHÔNG chạy bước dọn: reset=True hoặc có batch lỗi).
     """
-    # read = RAG_TIMEOUT (trước đây hardcode 600 nên RAG_TIMEOUT không có tác dụng lúc ingest).
-    timeout = httpx.Timeout(connect=10.0, read=_EMBED_HTTP_TIMEOUT, write=60.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as http_client:
-        # Phát hiện kích thước vector từ model embedding
-        sample_resp = await http_client.post(
-            f"{OLLAMA_BASE_URL}/api/embed",
-            json={"model": EMBEDDING_MODEL, "input": ["health check"]},
-        )
-        sample_resp.raise_for_status()
-        sample_vector = sample_resp.json()["embeddings"][0]
+    pairs = [(chunk, make_point_id(chunk)) for chunk in chunks]
+    all_ids = [pid for _, pid in pairs]
 
-        sync_client = QdrantClient(url=QDRANT_URL)
-        if reset and sync_client.collection_exists(collection_name):
-            logger.warning("Deleting collection before reset: %s", collection_name)
-            sync_client.delete_collection(collection_name)
-        _ensure_collection(sync_client, collection_name, vector_size=len(sample_vector))
+    sync_client = QdrantClient(url=QDRANT_URL)
+    if reset and sync_client.collection_exists(collection_name):
+        logger.warning("Deleting collection before reset: %s", collection_name)
+        sync_client.delete_collection(collection_name)
 
-        qdrant = AsyncQdrantClient(url=QDRANT_URL)
-        sem = asyncio.Semaphore(INGEST_EMBED_WORKERS)
-        chunk_batches = list(batched(chunks, UPSERT_BATCH_SIZE))
-        total_batches = len(chunk_batches)
+    vector_size: int | None = None
+    existing_ids: set[str] = set()
+    if sync_client.collection_exists(collection_name):
+        vector_size = collection_vector_size(sync_client, collection_name)
+        if not reset:
+            existing_ids = _existing_point_ids(sync_client, collection_name, all_ids)
 
-        logger.info(
-            "Async pipeline: %s batches, batch_size=%s, concurrency=%s",
-            total_batches, UPSERT_BATCH_SIZE, INGEST_EMBED_WORKERS,
-        )
+    new_chunks = [chunk for chunk, pid in pairs if pid not in existing_ids]
+    unchanged = [(chunk, pid) for chunk, pid in pairs if pid in existing_ids]
+    logger.info(
+        "Ingest project=%s: %d chunk mới/đã sửa cần embed, %d chunk không đổi (bỏ qua embed).",
+        project, len(new_chunks), len(unchanged),
+    )
 
-        tasks = [
-            _embed_and_upsert_batch_async(
-                http_client, qdrant, sem,
-                i + 1, total_batches, batch,
-                collection_name, project,
+    results: list[list[tuple] | BaseException] = []
+    total_batches = 0
+    if new_chunks:
+        gate = _CollectionGate(sync_client, collection_name, vector_size)
+        # read = RAG_TIMEOUT (trước đây hardcode 600 nên RAG_TIMEOUT không có tác dụng lúc ingest).
+        timeout = httpx.Timeout(connect=10.0, read=_EMBED_HTTP_TIMEOUT, write=60.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            qdrant = AsyncQdrantClient(url=QDRANT_URL)
+            sem = asyncio.Semaphore(INGEST_EMBED_WORKERS)
+            chunk_batches = list(batched(new_chunks, UPSERT_BATCH_SIZE))
+            total_batches = len(chunk_batches)
+
+            logger.info(
+                "Async pipeline: %s batches, batch_size=%s, concurrency=%s",
+                total_batches, UPSERT_BATCH_SIZE, INGEST_EMBED_WORKERS,
             )
-            for i, batch in enumerate(chunk_batches)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        await qdrant.close()
+
+            tasks = [
+                _embed_and_upsert_batch_async(
+                    http_client, qdrant, sem,
+                    i + 1, total_batches, batch,
+                    collection_name, project, gate,
+                )
+                for i, batch in enumerate(chunk_batches)
+            ]
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                await qdrant.close()
 
     # R1: một batch lỗi KHÔNG làm hỏng cả project ingest. Bỏ qua batch lỗi và ghi
     # log số batch thất bại; các batch thành công vẫn được upsert. count phản ánh
@@ -670,15 +789,21 @@ async def _run_async_pipeline(
     if failed:
         logger.error(
             "Ingest project=%s: %d/%d batch thất bại (đã bỏ qua, phần còn lại vẫn upsert). Lỗi đầu tiên: %s",
-            project, len(failed), len(tasks), failed[0],
+            project, len(failed), total_batches, failed[0],
         )
-    all_pairs: list[tuple] = [
+    upserted: list[tuple] = [
         pair for r in results if not isinstance(r, BaseException) for pair in r
     ]
+
+    # Không còn embed "health check" tạo sẵn collection: nếu mọi batch lỗi (hoặc project
+    # không có chunk nào) thì collection có thể chưa tồn tại → không scroll/count trên nó.
+    collection_exists = sync_client.collection_exists(collection_name)
 
     # F11: upsert không bao giờ xóa point của chunk đã sửa/file đã xóa → dọn sau khi
     # upsert xong. Chỉ dọn khi MỌI batch thành công: nếu có batch lỗi, phiên bản mới
     # của chunk đó chưa vào Qdrant — giữ bản cũ còn hơn làm thủng index.
+    # Tập giữ lại = MỌI chunk hiện tại (mới + không đổi): chunk không đổi không được
+    # upsert lại ở lần này nên KHÔNG được dựng keep-set từ danh sách vừa upsert.
     stale_ids: list[str] | None = None
     if not reset:
         if failed:
@@ -686,15 +811,27 @@ async def _run_async_pipeline(
                 "Ingest project=%s: bỏ qua dọn point cũ vì có batch lỗi — chạy lại /ingest sau.",
                 project,
             )
+        elif not collection_exists:
+            stale_ids = []  # không có collection → không có point cũ nào để dọn
         else:
-            stale_ids = _delete_stale_points(
-                sync_client, collection_name, {pid for _, pid in all_pairs})
+            stale_ids = _delete_stale_points(sync_client, collection_name, set(all_ids))
             if stale_ids:
                 logger.info("Ingest project=%s: đã xóa %d point cũ (chunk đã sửa/xóa).",
                             project, len(stale_ids))
 
-    count = sync_client.count(collection_name=collection_name, exact=True)
-    return all_pairs, count.count, stale_ids
+    points_count = (
+        sync_client.count(collection_name=collection_name, exact=True).count
+        if collection_exists else 0
+    )
+    return _PipelineResult(
+        all_ids=all_ids,
+        upserted=upserted,
+        unchanged=unchanged,
+        points_count=points_count,
+        stale_ids=stale_ids,
+        failed_batches=len(failed),
+        batch_error=f"{type(failed[0]).__name__}: {failed[0]}" if failed else None,
+    )
 
 
 # ── Helpers suy luận metadata chunk ──────────────────────────────────────────
@@ -808,6 +945,36 @@ def _ensure_collection(client: QdrantClient, collection_name: str, vector_size: 
     )
 
 
+def _plan_graph_writes(
+    graph_module: ModuleType,
+    project: str,
+    pairs: list[tuple],
+    reset: bool,
+) -> tuple[list[tuple], list[tuple]]:
+    """Ingest tăng dần cho Neo4j — trả về (pairs cần ghi, pairs mới cần trích xuất thực thể).
+
+    - reset=True: graph của project vừa bị xóa → ghi + trích xuất toàn bộ như trước.
+    - Không-reset: hỏi Neo4j chunk hiện tại nào ĐÃ có node (existing_chunk_ids). Chunk
+      thiếu là chunk mới/đã sửa — hoặc mọi chunk khi project chưa có graph (vd. vừa bật
+      GRAPH_ENABLED) hay graph dở dang do lần ingest trước lỗi → dựng bù đủ. Chỉ chunk
+      thiếu được trích xuất thực thể; chunk đã có giữ nguyên node + MENTIONS.
+    - save_project_graph chỉ nối NEXT_CHUNK giữa các pair được truyền vào (nhóm theo
+      source_file) → với file có chunk thiếu, ghi lại CẢ chunk không đổi của file đó
+      (MERGE idempotent) để chuỗi NEXT_CHUNK không đứt quanh chunk mới. File không có
+      chunk thiếu không được ghi lại.
+    """
+    if reset:
+        return pairs, pairs
+    existing = graph_module.existing_chunk_ids(project, [pid for _, pid in pairs])
+    missing = [(chunk, pid) for chunk, pid in pairs if pid not in existing]
+    touched = {chunk.metadata.get("source_file", "unknown") for chunk, _ in missing}
+    to_write = [
+        (chunk, pid) for chunk, pid in pairs
+        if chunk.metadata.get("source_file", "unknown") in touched
+    ]
+    return to_write, missing
+
+
 def _ingest_project(project: str, reset: bool = False) -> dict:
     # F6: kiểm tra tên project TRƯỚC mọi thao tác filesystem/Qdrant/Neo4j.
     project_dir = str(project_dir_for(project))
@@ -837,34 +1004,45 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
         except Exception as exc:
             logger.warning("Graph delete failed (non-fatal): %s", exc)
 
-    # Async pipeline: embed + upsert INGEST_EMBED_WORKERS batch đồng thời
-    all_pairs, points_count, stale_ids = asyncio.run(
+    # Async pipeline: embed + upsert INGEST_EMBED_WORKERS batch đồng thời (chỉ chunk mới
+    # khi không-reset).
+    result = asyncio.run(
         _run_async_pipeline(chunks, collection_name, project, reset)
     )
-    logger.info("Project '%s' done. Points: %s", project, points_count)
+    logger.info(
+        "Project '%s' done. Points: %s | upserted: %s | không đổi: %s",
+        project, result.points_count, len(result.upserted), len(result.unchanged),
+    )
 
     # ── Tích hợp Neo4j graph ──────────────────────────────────────────────────
     graph_chunks_saved = 0
     if GRAPH_ENABLED and _graph_module is not None:
         try:
             _graph_module.setup_schema()
+            # Chỉ chunk ĐANG có trong Qdrant (không đổi + vừa upsert thành công) mới được
+            # phản chiếu sang Neo4j — chunk của batch lỗi chưa có vector thì chưa ghi.
+            graph_pairs, new_graph_pairs = _plan_graph_writes(
+                _graph_module, project, result.unchanged + result.upserted, reset)
             graph_chunks_saved = _graph_module.save_project_graph(
-                project, all_pairs)
+                project, graph_pairs)
             # F11: Qdrant vừa dọn point cũ → xóa Chunk/Document/Entity tương ứng
             # trong Neo4j để graph enrichment không trả lại nội dung đã bị xóa.
-            if stale_ids is not None:
-                _graph_module.delete_stale_chunks(
-                    project, [pid for _, pid in all_pairs])
+            # Tập giữ lại = MỌI chunk hiện tại (mới + không đổi) — nếu chỉ giữ chunk vừa
+            # ghi thì Chunk node của chunk không đổi sẽ bị xóa oan.
+            if result.stale_ids is not None:
+                _graph_module.delete_stale_chunks(project, result.all_ids)
 
-            if GRAPH_ENTITY_EXTRACTION and CHAT_MODEL:
+            if GRAPH_ENTITY_EXTRACTION and CHAT_MODEL and new_graph_pairs:
                 logger.info(
-                    "Entity extraction enabled for project '%s'", project)
+                    "Entity extraction enabled for project '%s' (%d chunk mới)",
+                    project, len(new_graph_pairs))
                 # Timeout thật qua client_kwargs (xem make_chat_model) — trước đây không
                 # có timeout nên một lời gọi treo làm /ingest treo vô hạn.
                 llm = make_chat_model(CHAT_MODEL, temperature=0)
-                # Mỗi Document gọi LLM một lần (không phải mỗi Chunk) — nhanh hơn nhiều
+                # Mỗi Document gọi LLM một lần (không phải mỗi Chunk) — nhanh hơn nhiều.
+                # Chỉ chunk mới: chunk không đổi giữ nguyên quan hệ MENTIONS đã có.
                 doc_pairs: dict[str, list[tuple]] = {}
-                for chunk, pid in all_pairs:
+                for chunk, pid in new_graph_pairs:
                     sf = chunk.metadata.get("source_file", "unknown")
                     doc_pairs.setdefault(sf, []).append((chunk, pid))
                 for sf, pairs in doc_pairs.items():
@@ -890,11 +1068,18 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
         "status": "ok",
         "documents": len(docs),
         "chunks": len(chunks),
-        "upserted": len(all_pairs),
-        "points_count": points_count,
+        # Số chunk vừa embed + upsert (mới/đã sửa). Ingest lại khi không có gì đổi → 0.
+        "upserted": len(result.upserted),
+        # Số chunk đã có sẵn trong Qdrant (cùng point_id) → bỏ qua, không embed lại.
+        "skipped_unchanged": len(result.unchanged),
+        # R1: số batch embed/upsert lỗi (đã bỏ qua) + lỗi đầu tiên để thấy ngay nguyên
+        # nhân (Ollama down, lệch dimension...) mà không cần đọc log.
+        "failed_batches": result.failed_batches,
+        "batch_error": result.batch_error,
+        "points_count": result.points_count,
         "graph_chunks_saved": graph_chunks_saved,
         # F11: số point cũ (chunk đã sửa/xóa) đã bị xóa khỏi Qdrant ở lần ingest này.
-        "stale_removed": len(stale_ids or []),
+        "stale_removed": len(result.stale_ids or []),
         "idempotent": True,
         "reset": reset,
     }
@@ -931,6 +1116,8 @@ def ingest(project: str | None = None, reset: bool = False) -> dict:
         "projects_ingested": list(results.keys()),
         "total_documents": sum(r.get("documents", 0) for r in results.values()),
         "total_chunks": sum(r.get("chunks", 0) for r in results.values()),
+        "total_upserted": sum(r.get("upserted", 0) for r in results.values()),
+        "total_skipped_unchanged": sum(r.get("skipped_unchanged", 0) for r in results.values()),
         "reset": reset,
         "details": results,
     }
