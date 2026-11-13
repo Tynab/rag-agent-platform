@@ -6,7 +6,8 @@ Mô tả
 -----
 FastAPI application điều phối toàn bộ quy trình SDLC 15 bước thông qua LangGraph.
 Mỗi bước là một AI agent độc lập với model, system prompt và dependency riêng biệt.
-Workflow chạy bất đồng bộ (BackgroundTasks) và cập nhật trạng thái real-time.
+Workflow chạy bất đồng bộ trong thread worker của hàng đợi FIFO (WORKFLOW_CONCURRENCY slot)
+và cập nhật trạng thái real-time.
 
 Danh sách endpoint
 ------------------
@@ -30,13 +31,21 @@ POST /agent/{role}
     Hữu ích để test từng agent riêng lẻ hoặc ghép pipeline thủ công.
 
 POST /workflow/run
-    Xếp hàng workflow SDLC 15 bước chạy nền, trả về workflow_id ngay lập tức.
-    Nhận WorkflowRunRequest (user_input, project, rag_enabled, rag_top_k, tech_stack).
-    Trạng thái chuyển đổi: pending → running → completed | failed.
+    Xếp hàng workflow SDLC 15 bước chạy nền, trả về ngay {workflow_id, status="pending",
+    queue_position, message}. Nhận WorkflowRunRequest (user_input, project, rag_enabled,
+    rag_top_k, tech_stack).
+    Trạng thái chuyển đổi: pending → running → completed | failed | cancelled.
 
 GET  /workflow/{workflow_id}
     Kiểm tra trạng thái hoặc lấy toàn bộ kết quả workflow đã hoàn thành.
-    Trả về WorkflowRecord bao gồm step_outputs, completed_steps, artifacts, error.
+    Trả về WorkflowRecord bao gồm step_outputs, completed_steps, artifacts, error,
+    queue_position (vị trí hàng đợi khi pending, null nếu không xếp hàng) và cancel_requested.
+
+POST /workflow/{workflow_id}/cancel
+    Hủy workflow → 200 {workflow_id, status}. Run đang chờ (pending) bị hủy ngay
+    (status="cancelled", không bao giờ chạy); run đang chạy nhận cancel_requested=True và
+    dừng sau node hiện tại (status trả về vẫn "running"). 404 nếu id không tồn tại,
+    409 nếu workflow đã kết thúc (completed / failed / cancelled).
 
 GET  /workflows
     Liệt kê tối đa 50 workflow gần nhất (?limit= tối đa 500), mới nhất trước.
@@ -52,15 +61,32 @@ GET  /workflow/{workflow_id}/artifacts/{role}/{path}
 Vòng đời workflow
 -----------------
     POST /workflow/run
-        → WorkflowRecord tạo với status=pending, lưu vào SQLite (store.py)
-        → BackgroundTasks.add_task(_run_workflow_task)
+        → WorkflowRecord tạo với status=pending, lưu vào SQLite (store.py) và xếp vào
+          hàng đợi FIFO (_WorkflowRunQueue) — cả hai trong cùng một lock
+        → Worker rảnh lấy run đầu hàng khi còn slot → _run_workflow_task
             → status=running, LangGraph StateGraph.stream() bắt đầu
             → Mỗi node hoàn thành: cập nhật step_outputs, completed_steps, artifacts
               rồi ghi lại record vào SQLite (GET /workflow/{id} thấy tiến trình)
+            → Giữa hai node: kiểm tra yêu cầu hủy (C1) rồi ngân sách thời gian (W1)
             → Sau node cuối cùng (clarifier): chạy Clarifier Regen Loop nếu được bật
-            → status=completed (hoặc failed nếu có lỗi không xử lý được)
+            → status=completed (failed nếu có lỗi không xử lý được, cancelled nếu bị hủy)
     agent-api khởi động lại giữa chừng → lúc startup (lifespan) mọi run còn
     pending/running bị chuyển sang failed với lỗi "Bị gián đoạn do agent-api khởi động lại".
+
+Hàng đợi (C2) và hủy (C1)
+-------------------------
+- WORKFLOW_CONCURRENCY (mặc định 1) = số workflow chạy đồng thời = số thread worker.
+  Ollama chỉ có một slot và một model nạp sẵn (OLLAMA_MAX_LOADED_MODELS=1) nên chạy
+  song song chỉ làm model bị swap liên tục. Run vượt slot nằm "pending" trong hàng đợi
+  FIFO; queue_position (1 = chạy kế tiếp) được tính trực tiếp từ hàng đợi lúc đọc nên
+  luôn chính xác (không lưu bản cũ vào SQLite).
+- Worker là thread daemon riêng (không dùng BackgroundTasks): run đang chờ không chiếm
+  thread-pool của endpoint sync, và hàng đợi không phụ thuộc request còn sống hay không.
+- Hủy run đang chờ: bỏ khỏi hàng đợi + ghi cancelled ngay — không bao giờ chiếm slot.
+  Hủy run đang chạy: đặt cờ; node đang chạy (LLM call) chạy nốt, sau đó workflow dừng.
+  Trạng thái cuối được CHỐT dưới lock của hàng đợi: yêu cầu hủy được chấp nhận (200)
+  trước thời điểm chốt ⇒ kết quả luôn là cancelled; sau thời điểm chốt ⇒ 409. Không bao
+  giờ có run completed bị lật thành cancelled hay run đã hủy vẫn chạy tiếp.
 
 Clarifier Regen Loop
 --------------------
@@ -78,8 +104,9 @@ Concurrency và thread-safety
 - get_workflow() dùng double-checked locking: kiểm tra trước lock, kiểm tra lại
   sau lock, đảm bảo LangGraph StateGraph chỉ được compile đúng một lần dù
   nhiều request đến đồng thời lúc khởi động.
-- _run_workflow_task chạy trong thread-pool của FastAPI BackgroundTasks. Task giữ
-  bản WorkflowRecord của riêng nó và ghi lại (_persist) sau mỗi thay đổi đáng kể.
+- _run_workflow_task chạy trong thread worker của hàng đợi. Task giữ bản
+  WorkflowRecord của riêng nó và ghi lại (_persist) sau mỗi thay đổi đáng kể; endpoint
+  hủy KHÔNG ghi record đang chạy (chỉ đặt cờ trong hàng đợi) → không ghi đè lẫn nhau.
 - Artifact extraction chạy ngay sau mỗi node hoàn thành (non-fatal: exception
   trong extraction chỉ ghi warning log, không dừng workflow).
 
@@ -99,7 +126,8 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections import deque
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
@@ -111,7 +139,7 @@ from artifacts import ARTIFACT_ROLES as _ARTIFACT_ROLES
 from artifacts import extract_and_save as _extract_artifacts
 from artifacts import list_artifacts as _list_artifacts
 from artifacts import read_artifact as _read_artifact
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -278,6 +306,14 @@ class WorkflowStatus(str, Enum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    # C1: bị hủy theo yêu cầu (POST /workflow/{id}/cancel) — trạng thái kết thúc.
+    cancelled = "cancelled"
+
+
+# Trạng thái kết thúc: không đổi nữa, POST /workflow/{id}/cancel trả 409.
+_TERMINAL_STATUSES = frozenset({WorkflowStatus.completed, WorkflowStatus.failed, WorkflowStatus.cancelled})
+# Lỗi gán cho run bị hủy (cả lúc đang chờ lẫn đang chạy).
+CANCELLED_ERROR = "Đã hủy theo yêu cầu người dùng"
 
 
 class WorkflowRecord(BaseModel):
@@ -295,6 +331,11 @@ class WorkflowRecord(BaseModel):
     artifacts: dict[str, list] = Field(default_factory=dict)
     created_at: str
     completed_at: str | None = None
+    # C2: vị trí trong hàng đợi khi đang pending chờ slot (1 = chạy kế tiếp); None khi
+    # không xếp hàng. Tính trực tiếp từ hàng đợi lúc GET — SQLite luôn lưu None.
+    queue_position: int | None = None
+    # C1: đã có yêu cầu hủy cho run đang chạy — dừng sau node hiện tại.
+    cancel_requested: bool = False
 
 
 # Số workflow tối đa GET /workflows trả về mặc định (UI render mọi dòng).
@@ -306,6 +347,228 @@ _CLARIFIER_REGEN_LOOPS: int = int(os.environ.get("CLARIFIER_REGEN_LOOPS", "1"))
 # Được kiểm tra giữa các node — node đang chạy không bị hủy giữa chừng, nhưng
 # stream dừng sớm sau khi node hiện tại trả về nếu đã vượt ngân sách.
 _WORKFLOW_MAX_SECONDS: int = int(os.environ.get("WORKFLOW_MAX_SECONDS", "0"))
+
+
+def _concurrency_from_env() -> int:
+    """C2 — số workflow chạy đồng thời từ env WORKFLOW_CONCURRENCY (rỗng/không đặt → 1).
+
+    Giá trị không phải số nguyên hoặc < 1 → cảnh báo và dùng 1 (không chặn khởi động).
+    """
+    raw = os.environ.get("WORKFLOW_CONCURRENCY", "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("WORKFLOW_CONCURRENCY=%r không phải số nguyên — dùng 1.", raw)
+        return 1
+    if value < 1:
+        logger.warning("WORKFLOW_CONCURRENCY=%d < 1 — dùng 1.", value)
+        return 1
+    return value
+
+
+# C2: số workflow chạy đồng thời (= số thread worker của hàng đợi). Mặc định 1: Ollama chỉ
+# có một slot và một model nạp sẵn — chạy song song chỉ làm model bị swap liên tục.
+_WORKFLOW_CONCURRENCY: int = _concurrency_from_env()
+
+
+# ── Hàng đợi workflow (C2) + hủy (C1) ───────────────────────────────────────────
+
+class _ActiveRun:
+    """Trạng thái của một run đang giữ slot — chỉ đọc/ghi dưới lock của hàng đợi."""
+
+    __slots__ = ("cancel_requested", "decided")
+
+    def __init__(self) -> None:
+        self.cancel_requested = False  # C1: đã có yêu cầu hủy
+        self.decided = False  # đã chốt trạng thái cuối → yêu cầu hủy mới bị từ chối (409)
+
+
+_Runner = Callable[[str, WorkflowRunRequest, "_WorkflowRunQueue"], None]
+
+
+class _WorkflowRunQueue:
+    """Hàng đợi FIFO + slot chạy workflow (C2) và cờ hủy (C1); mọi trạng thái dưới MỘT lock.
+
+    - ``concurrency`` thread worker daemon (tạo lười ở lần ``submit`` đầu) lấy run ĐẦU
+      hàng khi còn slot, gọi ``runner(workflow_id, req, queue)`` rồi trả slot trong
+      ``finally``. Worker bắt mọi exception để không bao giờ chết (mất slot vĩnh viễn).
+    - Không dùng BackgroundTasks: run đang chờ không chiếm thread-pool của endpoint sync
+      (anyio mặc định 40 thread — vài chục run xếp hàng sẽ làm treo GET/health/cancel),
+      và hàng đợi không phụ thuộc việc background task của request có được chạy hay không.
+    - Không dùng threading.Semaphore trần: semaphore không bảo đảm FIFO, không cho biết vị
+      trí hàng đợi và không loại được run bị hủy khi đang chờ.
+    - ``lock`` (Condition trên RLock — re-entrant) được endpoint giữ cho thao tác ghép
+      "kiểm tra hàng đợi + đọc/ghi SQLite" để không đan xen với worker.
+
+    Trạng thái của một workflow_id (``state()``):
+        "waiting"   — trong hàng đợi, chưa có slot
+        "running"   — đang giữ slot, chưa chốt trạng thái cuối
+        "finishing" — đã chốt trạng thái cuối (``decide()``), đang ghi DB/log rồi trả slot
+        None        — hàng đợi này không quản lý (đã xong, chưa từng submit, process cũ)
+    """
+
+    def __init__(self, concurrency: int, runner: _Runner) -> None:
+        self.concurrency = max(1, int(concurrency))
+        self._runner = runner
+        self._cond = threading.Condition()
+        self._waiting: deque[tuple[str, WorkflowRunRequest]] = deque()
+        self._active: dict[str, _ActiveRun] = {}
+        self._workers: list[threading.Thread] = []
+        self._closed = False
+
+    @property
+    def lock(self) -> threading.Condition:
+        """Lock của hàng đợi (re-entrant) — giữ khi cần ghép thao tác hàng đợi + SQLite."""
+        return self._cond
+
+    @property
+    def closed(self) -> bool:
+        with self._cond:
+            return self._closed
+
+    # ── Xếp hàng + worker ─────────────────────────────────────────────────────
+
+    def submit(self, workflow_id: str, req: WorkflowRunRequest) -> int | None:
+        """Thêm run vào cuối hàng; trả queue_position ngay sau khi xếp (None = chạy ngay)."""
+        with self._cond:
+            if self._closed:
+                raise RuntimeError("Hàng đợi workflow đã đóng")
+            self._waiting.append((workflow_id, req))
+            while len(self._workers) < self.concurrency:
+                worker = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"workflow-worker-{len(self._workers) + 1}",
+                    daemon=True,
+                )
+                self._workers.append(worker)
+                worker.start()  # worker chờ lock tới khi submit trả về
+            self._cond.notify_all()
+            return self._position_locked(workflow_id)
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._cond:
+                while not self._closed and not (self._waiting and len(self._active) < self.concurrency):
+                    self._cond.wait()
+                if self._closed:
+                    return
+                workflow_id, req = self._waiting.popleft()
+                self._active[workflow_id] = _ActiveRun()
+                self._cond.notify_all()
+            try:
+                self._runner(workflow_id, req, self)
+            except BaseException:  # worker không được chết — mất worker = mất slot vĩnh viễn
+                logger.exception("Workflow %s: lỗi không xử lý được trong worker hàng đợi", workflow_id)
+            finally:
+                with self._cond:
+                    self._active.pop(workflow_id, None)
+                    self._cond.notify_all()
+
+    def close(self, timeout: float | None = None) -> bool:
+        """Đóng hàng đợi: worker rảnh thoát ngay, worker đang chạy thoát sau run hiện tại;
+        run còn chờ KHÔNG được chạy. Chờ worker thoát tối đa *timeout* giây.
+
+        Trả True nếu mọi worker đã thoát. Dùng cho test; production để process thoát
+        (worker là daemon, run dở dang được recovery lúc khởi động lại).
+        """
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+            workers = list(self._workers)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for worker in workers:
+            worker.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        return not any(worker.is_alive() for worker in workers)
+
+    # ── Truy vấn ──────────────────────────────────────────────────────────────
+
+    def state(self, workflow_id: str) -> str | None:
+        """"waiting" | "running" | "finishing" | None — xem docstring của lớp."""
+        with self._cond:
+            if any(wid == workflow_id for wid, _ in self._waiting):
+                return "waiting"
+            run = self._active.get(workflow_id)
+            if run is None:
+                return None
+            return "finishing" if run.decided else "running"
+
+    def _position_locked(self, workflow_id: str) -> int | None:
+        for idx, (wid, _) in enumerate(self._waiting):
+            if wid == workflow_id:
+                # Slot đang rảnh sẽ được các run đầu hàng lấy ngay → chúng không "xếp hàng".
+                free_slots = max(0, self.concurrency - len(self._active))
+                position = idx + 1 - free_slots
+                return position if position > 0 else None
+        return None
+
+    def live_state(self, workflow_id: str) -> tuple[int | None, bool]:
+        """(queue_position, cancel_requested) hiện tại — một snapshot nhất quán."""
+        with self._cond:
+            run = self._active.get(workflow_id)
+            return self._position_locked(workflow_id), bool(run and run.cancel_requested)
+
+    # ── Hủy ───────────────────────────────────────────────────────────────────
+
+    def remove_waiting(self, workflow_id: str) -> bool:
+        """Bỏ run khỏi hàng đợi (hủy khi đang chờ) — run sẽ không bao giờ nhận slot."""
+        with self._cond:
+            for idx, (wid, _) in enumerate(self._waiting):
+                if wid == workflow_id:
+                    del self._waiting[idx]
+                    self._cond.notify_all()
+                    return True
+            return False
+
+    def request_cancel(self, workflow_id: str) -> bool:
+        """Đặt cờ hủy cho run đang chạy chưa chốt trạng thái cuối; False nếu không áp dụng."""
+        with self._cond:
+            run = self._active.get(workflow_id)
+            if run is None or run.decided:
+                return False
+            run.cancel_requested = True
+            return True
+
+    def is_cancel_requested(self, workflow_id: str) -> bool:
+        with self._cond:
+            run = self._active.get(workflow_id)
+            return bool(run and run.cancel_requested)
+
+    def decide(self, workflow_id: str) -> bool:
+        """Chốt trạng thái cuối của run đang chạy; True nếu đã có yêu cầu hủy.
+
+        Sau lời gọi này mọi yêu cầu hủy bị từ chối (409) → kết quả đã chốt không đổi nữa.
+        """
+        with self._cond:
+            run = self._active.get(workflow_id)
+            if run is None:
+                return False
+            run.decided = True
+            return run.cancel_requested
+
+
+_run_queue: _WorkflowRunQueue | None = None
+_run_queue_lock = threading.Lock()
+
+
+def _get_run_queue() -> _WorkflowRunQueue:
+    """Hàng đợi dùng chung, tạo lười với _WORKFLOW_CONCURRENCY slot (thread-safe).
+
+    Không tạo thread nào cho tới lần submit đầu. Hàng đợi đã close() được thay bằng cái mới.
+    """
+    global _run_queue
+    queue = _run_queue
+    if queue is None or queue.closed:
+        with _run_queue_lock:
+            if _run_queue is None or _run_queue.closed:
+                # Lambda → tra _run_workflow_task lúc chạy (định nghĩa bên dưới, test patch được).
+                _run_queue = _WorkflowRunQueue(
+                    _WORKFLOW_CONCURRENCY,
+                    lambda wid, req, q: _run_workflow_task(wid, req, q),
+                )
+            queue = _run_queue
+    return queue
 
 # ── Đường dẫn bộ nhớ episodic và giới hạn input ────────────────────────────
 
@@ -478,18 +741,35 @@ def _reconstruct_from_disk(workflow_id: str) -> WorkflowRecord | None:
     )
 
 
-# ── Task nền chạy toàn bộ SDLC workflow ────────────────────────────────────────────────────
+# ── Task chạy toàn bộ SDLC workflow (trong thread worker của hàng đợi) ─────────────────────
 
-def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
-    """Task nền thực thi toàn bộ SDLC LangGraph workflow và cập nhật WorkflowRecord.
+def _mark_cancelled(record: WorkflowRecord) -> None:
+    """Đưa *record* về trạng thái kết thúc cancelled (C1)."""
+    record.status = WorkflowStatus.cancelled
+    record.cancel_requested = True
+    record.queue_position = None
+    record.error = CANCELLED_ERROR
+    record.completed_at = datetime.now(timezone.utc).isoformat()
 
-    Được gọi bởi FastAPI BackgroundTasks — chạy trong thread-pool thread riêng biệt.
+
+def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest, queue: _WorkflowRunQueue) -> None:
+    """Thực thi toàn bộ SDLC LangGraph workflow và cập nhật WorkflowRecord.
+
+    Được gọi bởi thread worker của *queue* SAU KHI run đã nhận slot; worker trả slot khi
+    hàm này kết thúc (kể cả khi raise).
 
     Thread-safety:
-    - Chỉ một background task tồn tại cho mỗi workflow_id; task giữ bản WorkflowRecord
-      riêng (đọc từ store) và là nơi DUY NHẤT ghi record này cho tới khi kết thúc.
+    - Chỉ một worker chạy mỗi workflow_id; task giữ bản WorkflowRecord riêng (đọc từ store)
+      và là nơi DUY NHẤT ghi record này cho tới khi kết thúc — endpoint hủy chỉ đặt cờ
+      trong hàng đợi, không ghi record đang chạy.
     - Sau mỗi thay đổi đáng kể (running, mỗi node, mỗi bước regen, kết thúc) record được
       ghi lại vào SQLite qua _persist() → GET /workflow/{id} phản ánh tiến trình.
+
+    Hủy (C1): cờ hủy được kiểm tra ngay khi nhận slot, giữa hai node (trước kiểm tra ngân
+    sách W1) và trước mỗi bước của Clarifier regen loop — LLM call đang chạy không ngắt
+    được nên node hiện tại luôn chạy nốt. Trạng thái cuối được chốt bằng queue.decide()
+    dưới lock: yêu cầu hủy đã được chấp nhận trước thời điểm đó luôn cho kết quả
+    cancelled, kể cả khi nó đến lúc node cuối đang chạy.
     """
     try:
         record = _load_workflow(workflow_id)
@@ -497,11 +777,11 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
         logger.exception("Workflow %s: không đọc được record từ store", workflow_id)
         return
     if record is None:
+        logger.warning("Workflow %s: không có record hợp lệ trong store — bỏ qua.", workflow_id)
         return
 
-    record.status = WorkflowStatus.running
-    _persist(record)
-    logger.info("Workflow %s started", workflow_id)
+    def _cancel_requested() -> bool:
+        return queue.is_cancel_requested(workflow_id)
 
     # user_input đã được sanitize lúc enqueue và lưu vào record — tái sử dụng trực tiếp
     # thay vì sanitize lại từ req.user_input để đảm bảo nhất quán.
@@ -524,45 +804,68 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
     try:
         _node_errors: list[str] = []
         _timed_out = False
-        for chunk in get_workflow().stream(initial_state, stream_mode="updates"):
-            # chunk = {ten_node: partial_state_dict} với stream_mode="updates".
-            # Mỗi chunk cập nhật được ngay lập tức vào record để GET /workflow/{id}
-            # phản ánh tiến trình real-time.
-            for node_output in chunk.values():
-                if isinstance(node_output, dict):
-                    # Cập nhật real-time để GET /workflow/{id} phản ánh tiến trình
-                    if "step_outputs" in node_output:
-                        record.step_outputs.update(node_output["step_outputs"])
-                        for _role, _out in node_output["step_outputs"].items():
-                            # W6: node trả về marker [LỖI ...] → ghi nhận failed_steps,
-                            # KHÔNG flip cả workflow sang 'failed' và vẫn cho regen chạy.
-                            if _out and _out.startswith("[LỖI"):
-                                if _role not in record.failed_steps:
-                                    record.failed_steps.append(_role)
-                            # Trích xuất artifact ngay sau mỗi coding node thành công.
-                            # Non-fatal: lỗi extraction chỉ ghi log, không dừng workflow.
-                            elif _role in _ARTIFACT_ROLES and _out:
-                                _arts = _extract_artifacts(_role, _out, workflow_id)
-                                if _arts:
-                                    record.artifacts[_role] = _arts
-                    if "completed_steps" in node_output:
-                        record.completed_steps = list(
-                            dict.fromkeys(
-                                record.completed_steps + node_output["completed_steps"]
-                            )
-                        )
-                    if node_output.get("error"):
-                        _node_errors.append(str(node_output["error"]))
-            # Ghi tiến trình sau mỗi node để GET /workflow/{id} (đọc từ SQLite) thấy ngay.
+        # Hủy được yêu cầu trong khoảnh khắc giữa lúc nhận slot và lúc bắt đầu → không chạy gì.
+        _cancelled = _cancel_requested()
+        if _cancelled:
+            logger.info("Workflow %s bị hủy ngay khi nhận slot — không chạy node nào.", workflow_id)
+        else:
+            record.status = WorkflowStatus.running
             _persist(record)
-            # W1: kiểm tra ngân sách thời gian SAU mỗi node (không mất output node vừa xong).
-            if _WORKFLOW_MAX_SECONDS and (time.monotonic() - _start) > _WORKFLOW_MAX_SECONDS:
-                _timed_out = True
-                logger.warning(
-                    "Workflow %s vượt ngân sách %ds — dừng sớm sau %d node.",
-                    workflow_id, _WORKFLOW_MAX_SECONDS, len(record.completed_steps),
-                )
-                break
+            logger.info("Workflow %s started", workflow_id)
+            stream = get_workflow().stream(initial_state, stream_mode="updates")
+            try:
+                for chunk in stream:
+                    # chunk = {ten_node: partial_state_dict} với stream_mode="updates".
+                    # Mỗi chunk cập nhật được ngay lập tức vào record để GET /workflow/{id}
+                    # phản ánh tiến trình real-time.
+                    for node_output in chunk.values():
+                        if isinstance(node_output, dict):
+                            # Cập nhật real-time để GET /workflow/{id} phản ánh tiến trình
+                            if "step_outputs" in node_output:
+                                record.step_outputs.update(node_output["step_outputs"])
+                                for _role, _out in node_output["step_outputs"].items():
+                                    # W6: node trả về marker [LỖI ...] → ghi nhận failed_steps,
+                                    # KHÔNG flip cả workflow sang 'failed' và vẫn cho regen chạy.
+                                    if _out and _out.startswith("[LỖI"):
+                                        if _role not in record.failed_steps:
+                                            record.failed_steps.append(_role)
+                                    # Trích xuất artifact ngay sau mỗi coding node thành công.
+                                    # Non-fatal: lỗi extraction chỉ ghi log, không dừng workflow.
+                                    elif _role in _ARTIFACT_ROLES and _out:
+                                        _arts = _extract_artifacts(_role, _out, workflow_id)
+                                        if _arts:
+                                            record.artifacts[_role] = _arts
+                            if "completed_steps" in node_output:
+                                record.completed_steps = list(
+                                    dict.fromkeys(
+                                        record.completed_steps + node_output["completed_steps"]
+                                    )
+                                )
+                            if node_output.get("error"):
+                                _node_errors.append(str(node_output["error"]))
+                    # Ghi tiến trình sau mỗi node để GET /workflow/{id} (đọc từ SQLite) thấy ngay.
+                    _persist(record)
+                    # C1: có yêu cầu hủy → dừng sau node vừa xong (ưu tiên hơn ngân sách W1).
+                    if _cancel_requested():
+                        _cancelled = True
+                        logger.info(
+                            "Workflow %s bị hủy — dừng sau %d node.",
+                            workflow_id, len(record.completed_steps),
+                        )
+                        break
+                    # W1: kiểm tra ngân sách thời gian SAU mỗi node (không mất output node vừa xong).
+                    if _WORKFLOW_MAX_SECONDS and (time.monotonic() - _start) > _WORKFLOW_MAX_SECONDS:
+                        _timed_out = True
+                        logger.warning(
+                            "Workflow %s vượt ngân sách %ds — dừng sớm sau %d node.",
+                            workflow_id, _WORKFLOW_MAX_SECONDS, len(record.completed_steps),
+                        )
+                        break
+            finally:
+                # Đóng generator ngay (không đợi GC) → chắc chắn không node nào chạy tiếp.
+                _close = getattr(stream, "close", None)
+                if callable(_close):
+                    _close()
         # Stream hoàn tất (hoặc dừng do timeout) ⇒ 'completed'. Lỗi từng node nằm trong
         # failed_steps + record.error (tóm tắt); chỉ outer-except mới là 'failed' thật sự.
         if _node_errors:
@@ -571,16 +874,25 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
             record.error = (record.error + " | " if record.error else "") + \
                 f"[Timeout: vượt {_WORKFLOW_MAX_SECONDS}s, dừng sớm]"
         # Chưa ghi 'completed' vào store ở đây: regen loop có thể chạy tiếp → client poll
-        # không được thấy 'completed' sớm rồi dừng. finally ghi trạng thái cuối + completed_at.
-        record.status = WorkflowStatus.completed
+        # không được thấy 'completed' sớm rồi dừng. finally chốt + ghi trạng thái cuối.
+        if not _cancelled:
+            record.status = WorkflowStatus.completed
 
         # ── Clarifier Regen Loop ───────────────────────────────────────────────────────────────────
-        # Chỉ chạy khi workflow hoàn thành thành công và CLARIFIER_REGEN_LOOPS > 0.
-        # Clarifier phân tích §10 để lấy danh sách agent cần re-gen, re-run từng agent,
-        # sau đó re-run Clarifier để đánh giá lại — lặp tối đa CLARIFIER_REGEN_LOOPS lần.
-        if record.status == WorkflowStatus.completed and not _timed_out and _CLARIFIER_REGEN_LOOPS > 0:
+        # Chỉ chạy khi workflow hoàn thành (không timeout, không bị hủy) và
+        # CLARIFIER_REGEN_LOOPS > 0. Clarifier phân tích §10 để lấy danh sách agent cần
+        # re-gen, re-run từng agent, sau đó re-run Clarifier để đánh giá lại — lặp tối đa
+        # CLARIFIER_REGEN_LOOPS lần. C1: kiểm tra yêu cầu hủy trước mỗi lần chạy agent.
+        if (
+            record.status == WorkflowStatus.completed
+            and not _timed_out
+            and not _cancelled
+            and _CLARIFIER_REGEN_LOOPS > 0
+        ):
             _live_outputs: dict[str, str] = dict(record.step_outputs)
             for _loop_idx in range(_CLARIFIER_REGEN_LOOPS):
+                if _cancel_requested():
+                    break
                 regen_roles = _parse_clarifier_regen_list(
                     _live_outputs.get("clarifier", "")
                 )
@@ -600,6 +912,8 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
 
                 # Re-run từng agent được đề xuất theo thứ tự WORKFLOW_STEPS (dependency order).
                 for _role in regen_roles:
+                    if _cancel_requested():
+                        break
                     try:
                         _new_output = run_single_step(
                             role=_role,
@@ -633,6 +947,11 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
                             "Clarifier regen loop %d: re-gen '%s' thất bại (non-fatal): %s",
                             _loop_idx + 1, _role, _regen_exc,
                         )
+
+                # C1: bị hủy giữa vòng regen → không re-run clarifier nữa.
+                if _cancel_requested():
+                    logger.info("Workflow %s bị hủy trong Clarifier regen loop — dừng.", workflow_id)
+                    break
 
                 # Re-run clarifier với outputs đã cập nhật
                 try:
@@ -670,8 +989,15 @@ def _run_workflow_task(workflow_id: str, req: WorkflowRunRequest) -> None:
         record.status = WorkflowStatus.failed
         record.error = str(exc)
     finally:
-        record.completed_at = datetime.now(timezone.utc).isoformat()
-        # _persist không raise → không che exception gốc (nếu có).
+        # C1: CHỐT trạng thái cuối dưới lock hàng đợi. Yêu cầu hủy đã được chấp nhận trước
+        # thời điểm này (kể cả khi node cuối / regen đang chạy) ⇒ cancelled; yêu cầu đến
+        # sau ⇒ 409 và trạng thái completed/failed giữ nguyên.
+        if queue.decide(workflow_id):
+            _mark_cancelled(record)
+        else:
+            record.completed_at = datetime.now(timezone.utc).isoformat()
+        # Thứ tự: chốt → ghi DB → ghi log → worker trả slot. _persist không raise → không
+        # che exception gốc (nếu có).
         _persist(record)
         _duration = time.monotonic() - _start
         logger.info("Workflow %s hoàn thành với status=%s",
@@ -759,11 +1085,12 @@ def run_agent_step(role: str, req: AgentStepRequest) -> AgentStepResponse:
 
 
 @app.post("/workflow/run")
-def start_workflow(req: WorkflowRunRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+def start_workflow(req: WorkflowRunRequest) -> dict[str, Any]:
     """
     Gửi workflow SDLC 15 agent để chạy bất đồng bộ.
 
-    Trả về ngay với workflow_id. Poll GET /workflow/{id} để kiểm tra trạng thái.
+    Trả về ngay với workflow_id và queue_position (vị trí hàng đợi, null nếu chạy ngay).
+    Poll GET /workflow/{id} để kiểm tra trạng thái; POST /workflow/{id}/cancel để hủy.
     Workflow chạy tuần tự: BA → PM → SA → TA → Designer → Team Lead → FE → Mobile → DBA → BE → DA → Tech Lead → Tester → DevSecOps → Clarifier.
     Mỗi bước nhận output đã cắt ngắn của các bước phụ thuộc làm context.
     """
@@ -778,19 +1105,38 @@ def start_workflow(req: WorkflowRunRequest, background_tasks: BackgroundTasks) -
         tech_stack=req.tech_stack,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
-    _store_workflow(record)
-    background_tasks.add_task(_run_workflow_task, workflow_id, req)
-    logger.info("Workflow %s đã được xếp hàng", workflow_id)
+    queue = _get_run_queue()
+    # Ghi record pending + xếp hàng NGUYÊN TỬ (cùng lock hàng đợi): worker không bao giờ lấy
+    # run chưa có record, endpoint hủy không bao giờ thấy record pending mà hàng đợi chưa biết.
+    with queue.lock:
+        _store_workflow(record)
+        queue_position = queue.submit(workflow_id, req)
+    logger.info("Workflow %s đã được xếp hàng (queue_position=%s)", workflow_id, queue_position)
     return {
         "workflow_id": workflow_id,
         "status": "pending",
+        "queue_position": queue_position,
         "message": f"Workflow đã được xếp hàng. Poll GET /workflow/{workflow_id} để kiểm tra trạng thái.",
     }
 
 
+def _with_live_queue_state(record: WorkflowRecord) -> WorkflowRecord:
+    """Gắn queue_position / cancel_requested hiện tại từ hàng đợi (C1/C2) cho run chưa kết thúc.
+
+    Hai field này sống trong RAM của hàng đợi (worker đang chạy là nơi duy nhất ghi record
+    vào SQLite) nên được tính lúc đọc → luôn chính xác.
+    """
+    if record.status in _TERMINAL_STATUSES:
+        return record
+    queue_position, cancel_requested = _get_run_queue().live_state(record.workflow_id)
+    record.queue_position = queue_position if record.status == WorkflowStatus.pending else None
+    record.cancel_requested = record.cancel_requested or cancel_requested
+    return record
+
+
 @app.get("/workflow/{workflow_id}", response_model=WorkflowRecord)
 def get_workflow_status(workflow_id: str) -> WorkflowRecord:
-    """Trả về trạng thái hiện tại của một lần chạy workflow (pending / running / completed / failed)."""
+    """Trả về trạng thái hiện tại của một lần chạy workflow (pending / running / completed / failed / cancelled)."""
     record = _load_workflow(workflow_id)
     if record is None:
         # W2: không có trong SQLite (run cũ / đã bị retention xóa) → dựng lại từ disk.
@@ -800,7 +1146,71 @@ def get_workflow_status(workflow_id: str) -> WorkflowRecord:
             status_code=404,
             detail=f"Workflow '{workflow_id}' không tìm thấy. Có thể đã bị xóa khỏi store hoặc chưa bắt đầu.",
         )
-    return record
+    return _with_live_queue_state(record)
+
+
+@app.post("/workflow/{workflow_id}/cancel")
+def cancel_workflow(workflow_id: str) -> dict[str, str]:
+    """
+    C1 — hủy một workflow chưa kết thúc.
+
+    - pending (đang xếp hàng): hủy NGAY — bỏ khỏi hàng đợi, không bao giờ nhận slot/chạy.
+      Trả {"workflow_id", "status": "cancelled"}.
+    - running: đặt cancel_requested; node đang chạy (LLM call) chạy nốt rồi workflow dừng
+      với status cancelled. Trả {"workflow_id", "status": "running"}.
+    - 404: workflow_id không tồn tại. 409: workflow đã kết thúc (completed / failed /
+      cancelled) hoặc đang chốt trạng thái cuối.
+    """
+    queue = _get_run_queue()
+    # Toàn bộ quyết định + ghi SQLite dưới lock hàng đợi → không đan xen với worker
+    # (nhận slot / chốt trạng thái cuối) hay submit.
+    with queue.lock:
+        state = queue.state(workflow_id)
+        if state == "running":
+            queue.request_cancel(workflow_id)
+            logger.info("Workflow %s: nhận yêu cầu hủy — dừng sau node hiện tại.", workflow_id)
+            return {"workflow_id": workflow_id, "status": WorkflowStatus.running.value}
+        if state == "finishing":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Workflow '{workflow_id}' vừa kết thúc — không thể hủy.",
+            )
+
+        record = _load_workflow(workflow_id)
+        if record is None:
+            if state == "waiting":
+                # Record hỏng/mất nhưng run vẫn trong hàng đợi: bỏ khỏi hàng là đủ.
+                queue.remove_waiting(workflow_id)
+                return {"workflow_id": workflow_id, "status": WorkflowStatus.cancelled.value}
+            # W2: run cũ chỉ còn trên disk luôn đã kết thúc.
+            if _reconstruct_from_disk(workflow_id) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Workflow '{workflow_id}' đã kết thúc — không thể hủy.",
+                )
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' không tìm thấy.")
+        if record.status in _TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Workflow '{workflow_id}' đã kết thúc (status={record.status.value}) — không thể hủy.",
+            )
+
+        # Còn lại: run đang xếp hàng, hoặc record pending/running mà không worker nào giữ
+        # (ghi trạng thái cuối thất bại) — không có gì đang chạy nên hủy ngay được.
+        _mark_cancelled(record)
+        _store_workflow(record)  # lỗi DB → 500 và hàng đợi giữ nguyên (chưa bỏ run)
+        queue.remove_waiting(workflow_id)
+    logger.info("Workflow %s đã bị hủy khi chưa chạy (state=%s).", workflow_id, state)
+    _log_workflow_run(
+        workflow_id=workflow_id,
+        project=record.project,
+        user_input=record.user_input,
+        completed_steps=record.completed_steps,
+        status=record.status.value,
+        error=record.error,
+        duration_seconds=0.0,
+    )
+    return {"workflow_id": workflow_id, "status": WorkflowStatus.cancelled.value}
 
 
 @app.get("/workflows")

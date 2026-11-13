@@ -9,7 +9,7 @@ xếp/liệt kê mà không phải parse JSON lớn (step_outputs của 15 agent
 Schema bảng ``workflows``
 -------------------------
     workflow_id      TEXT PRIMARY KEY  — id workflow (uuid4)
-    status           TEXT  (index)     — pending | running | completed | failed
+    status           TEXT  (index)     — pending | running | completed | failed | cancelled
     created_at       TEXT  (index)     — ISO-8601 UTC; sắp xếp mới nhất trước
     completed_at     TEXT              — ISO-8601 UTC hoặc NULL
     project          TEXT              — RAG project filter hoặc NULL
@@ -21,7 +21,7 @@ Cột tóm tắt và ``data`` luôn được ghi trong CÙNG một câu lệnh �
 Thread-safety
 -------------
 - Connection-per-call: mỗi thao tác mở một connection riêng rồi đóng ngay — dùng được
-  từ event-loop thread (lifespan), threadpool của endpoint sync và BackgroundTasks.
+  từ event-loop thread (lifespan), threadpool của endpoint sync và thread worker hàng đợi.
 - WAL mode: reader không chặn writer và ngược lại (UI poll liên tục trong lúc workflow ghi).
 - ``_write_lock`` tuần tự hóa mọi thao tác ghi trong process → không có SQLITE_BUSY giữa
   các thread; ``busy_timeout`` phòng trường hợp process khác (sqlite3 CLI) đang giữ lock.
@@ -31,7 +31,8 @@ Thread-safety
 Retention
 ---------
 Giữ tối đa ``MAX_STORED_WORKFLOWS`` (500) bản ghi mới nhất. Chỉ xóa bản ghi đã KẾT THÚC
-(completed/failed) — không bao giờ xóa run đang pending/running (giữ quy tắc C4 cũ).
+(``FINISHED_STATUSES``: completed/failed/cancelled) — không bao giờ xóa run đang
+pending/running (giữ quy tắc C4 cũ).
 
 Module không làm I/O lúc import: đường dẫn DB đọc từ env WORKFLOW_DB_PATH khi tạo
 ``WorkflowStore`` và file/thư mục chỉ được tạo khi gọi ``init()``.
@@ -59,7 +60,8 @@ MAX_STORED_WORKFLOWS = 500
 INTERRUPTED_ERROR = "Bị gián đoạn do agent-api khởi động lại"
 
 ACTIVE_STATUSES: tuple[str, ...] = ("pending", "running")
-FINISHED_STATUSES: tuple[str, ...] = ("completed", "failed")
+# Trạng thái KẾT THÚC (không bao giờ đổi nữa) — ứng viên retention. cancelled = bị hủy (C1).
+FINISHED_STATUSES: tuple[str, ...] = ("completed", "failed", "cancelled")
 
 _SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 30_000
@@ -91,10 +93,11 @@ ON CONFLICT(workflow_id) DO UPDATE SET
 """
 
 # Xóa bản ghi đã kết thúc nằm ngoài top-N mới nhất (tính trên TOÀN BỘ bảng, kể cả run
-# đang chạy) — run pending/running không bao giờ bị xóa.
-_PRUNE_SQL = """
+# đang chạy) — run pending/running không bao giờ bị xóa. Danh sách status sinh từ
+# FINISHED_STATUSES (hằng số nội bộ, không phải input người dùng).
+_PRUNE_SQL = f"""
 DELETE FROM workflows
-WHERE status IN ('completed', 'failed')
+WHERE status IN ({", ".join(f"'{s}'" for s in FINISHED_STATUSES)})
   AND workflow_id NOT IN (
       SELECT workflow_id FROM workflows ORDER BY created_at DESC, rowid DESC LIMIT ?
   )
@@ -174,8 +177,8 @@ class WorkflowStore:
         """Chuyển mọi run pending/running sang failed (gọi MỘT lần lúc khởi động).
 
         Run còn pending/running trong DB lúc process mới khởi động chắc chắn thuộc process
-        đã chết (BackgroundTasks không sống sót qua restart) → không bao giờ hoàn tất.
-        Bản ghi completed/failed không bị đụng tới. ``error`` được đặt ĐÚNG bằng *error*
+        đã chết (hàng đợi + thread worker chỉ sống trong RAM) → không bao giờ hoàn tất.
+        Bản ghi completed/failed/cancelled không bị đụng tới. ``error`` được đặt ĐÚNG bằng *error*
         (lỗi từng node trước đó vẫn còn trong failed_steps / output ``[LỖI ...]``).
         Trả về danh sách workflow_id đã chuyển trạng thái.
         """

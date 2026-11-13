@@ -10,6 +10,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -76,6 +77,8 @@ def env(tmp_path, monkeypatch):
     db_path = tmp_path / "db" / "workflows.sqlite3"
     monkeypatch.setenv("WORKFLOW_DB_PATH", str(db_path))
     monkeypatch.setattr(app_mod, "_store", None)
+    # Hàng đợi + worker mới cho mỗi test (C2) — không dùng lại worker của test khác.
+    monkeypatch.setattr(app_mod, "_run_queue", None)
     monkeypatch.setattr(app_mod, "MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.setattr(artifacts, "ARTIFACT_BASE", str(tmp_path / "artifacts"))
     monkeypatch.setattr(app_mod, "_validate_models_on_startup", lambda: None)
@@ -100,16 +103,37 @@ def env(tmp_path, monkeypatch):
 
     e.use_graph = use_graph
     yield e
+    # Đóng hàng đợi và chờ worker thoát TRƯỚC khi monkeypatch hoàn nguyên get_workflow/_store/
+    # MEMORY_DIR — worker sống sót sẽ chạy graph thật và ghi vào /data.
+    queue = app_mod._run_queue
+    if queue is not None:
+        assert queue.close(timeout=WAIT_TIMEOUT), "worker hàng đợi vẫn còn chạy sau test"
     # Không test nào được chạm vào DB mặc định.
     assert app_mod._store is None or app_mod._store.db_path == db_path
 
 
+# Trần chờ (giây) cho mọi thao tác đồng bộ với worker — test treo sẽ fail thay vì treo suite.
+WAIT_TIMEOUT = 10.0
+
+
+def _wait_finished(wid, timeout=WAIT_TIMEOUT):
+    """Chờ run *wid* rời hàng đợi (đã chốt, ghi DB, ghi log JSONL và trả slot)."""
+    deadline = time.monotonic() + timeout
+    queue = app_mod._get_run_queue()
+    while queue.state(wid) is not None:
+        assert time.monotonic() < deadline, f"workflow {wid} chưa kết thúc sau {timeout}s"
+        time.sleep(0.005)
+
+
 def _run(client, **body):
+    """POST /workflow/run rồi chờ worker chạy xong (POST trả về ngay, run chạy trong worker)."""
     payload = {"user_input": "Xây app quản lý đơn hàng", "project": "crm", **body}
     r = client.post("/workflow/run", json=payload)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "pending"
-    return r.json()["workflow_id"]
+    wid = r.json()["workflow_id"]
+    _wait_finished(wid)
+    return wid
 
 
 # ── Chạy workflow ──────────────────────────────────────────────────────────────
