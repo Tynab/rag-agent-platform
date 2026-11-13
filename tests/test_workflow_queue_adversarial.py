@@ -284,6 +284,29 @@ def test_stress_concurrent_submits_and_cancels_keep_every_invariant(aenv, concur
     aenv.set_concurrency(concurrency)
     graph = aenv.use_graph(_TrackingGraph(seed=seed, max_sleep=0.001))
     runner_calls = _record_runner_calls(aenv)
+    # Cửa sổ "finishing" (đã chốt trạng thái cuối, đã ghi DB, chưa trả slot): worker ghi JSONL
+    # ở đây — một số run nhận yêu cầu hủy (từ thread khác) ĐÚNG lúc này; phải là 409.
+    real_log = app_mod._log_workflow_run
+    log_rng = random.Random(seed + 5)
+    finishing_cancels = []
+
+    def log_with_cancel_in_finishing_window(**kw):
+        worker = threading.current_thread().name.startswith("workflow-worker")
+        if worker and (not finishing_cancels or log_rng.random() < 0.3):
+            wid = kw["workflow_id"]
+
+            def cancel_now():
+                result = _cancel(wid)
+                with lock:
+                    outcomes.setdefault(wid, []).append(result)
+                    finishing_cancels.append(result[0])
+
+            t = threading.Thread(target=cancel_now)
+            t.start()
+            t.join(WAIT_TIMEOUT)
+        return real_log(**kw)
+
+    aenv.monkeypatch.setattr(app_mod, "_log_workflow_run", log_with_cancel_in_finishing_window)
     queue = app_mod._get_run_queue()
 
     # Ghi thứ tự submit DƯỚI lock hàng đợi (start_workflow gọi submit trong `with queue.lock`).
@@ -348,6 +371,13 @@ def test_stress_concurrent_submits_and_cancels_keep_every_invariant(aenv, concur
         # đúng lúc chốt trạng thái cuối, hoặc vừa xong → 409) — đường "running" và race chốt.
         local = random.Random(seed + 3)
         seen = set()
+
+        def cancel_after(wid, delay):
+            time.sleep(delay)
+            result = _cancel(wid)
+            with lock:
+                outcomes.setdefault(wid, []).append(result)
+
         try:
             while not stop_checker.is_set():
                 with queue.lock:
@@ -355,10 +385,9 @@ def test_stress_concurrent_submits_and_cancels_keep_every_invariant(aenv, concur
                 seen.update(fresh)
                 for wid in fresh:
                     if local.random() < 0.5:
-                        time.sleep(local.uniform(0, 0.004))
-                        result = _cancel(wid)
-                        with lock:
-                            outcomes.setdefault(wid, []).append(result)
+                        t = threading.Thread(target=cancel_after, args=(wid, local.uniform(0, 0.015)))
+                        t.start()
+                        snipes.append(t)
                 time.sleep(0.0002)
         except BaseException as exc:  # pragma: no cover
             errors.append(exc)
@@ -375,6 +404,7 @@ def test_stress_concurrent_submits_and_cancels_keep_every_invariant(aenv, concur
 
     submitters = [threading.Thread(target=submitter, args=(k,)) for k in range(n_submitters)]
     cancellers = [threading.Thread(target=canceller) for _ in range(3)]
+    snipes = []
     check = threading.Thread(target=checker)
     snipe = threading.Thread(target=sniper)
     for t in [check, snipe, *submitters, *cancellers]:
@@ -390,10 +420,14 @@ def test_stress_concurrent_submits_and_cancels_keep_every_invariant(aenv, concur
     stop_checker.set()
     check.join(WAIT_TIMEOUT)
     snipe.join(WAIT_TIMEOUT)
-    assert not any(t.is_alive() for t in [check, snipe, *submitters, *cancellers])
+    for t in snipes:
+        t.join(WAIT_TIMEOUT)
+    assert not any(t.is_alive() for t in [check, snipe, *snipes, *submitters, *cancellers])
     assert not errors, errors
     assert not violations, violations[:5]
     assert len(ids) == n_submitters * per_submitter == len(submit_order)
+    # Đã chốt trạng thái cuối ⇒ mọi yêu cầu hủy đến trong cửa sổ "finishing" đều bị từ chối.
+    assert finishing_cancels and set(finishing_cancels) == {409}, finishing_cancels
 
     # ≤ N run chạy node cùng lúc; mỗi run chạy trong thread worker của hàng đợi.
     assert graph.max_active <= concurrency
