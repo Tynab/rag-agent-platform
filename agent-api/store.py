@@ -175,7 +175,8 @@ class WorkflowStore:
 
         Run còn pending/running trong DB lúc process mới khởi động chắc chắn thuộc process
         đã chết (BackgroundTasks không sống sót qua restart) → không bao giờ hoàn tất.
-        Bản ghi completed/failed không bị đụng tới. Lỗi cũ (nếu có) được giữ sau *error*.
+        Bản ghi completed/failed không bị đụng tới. ``error`` được đặt ĐÚNG bằng *error*
+        (lỗi từng node trước đó vẫn còn trong failed_steps / output ``[LỖI ...]``).
         Trả về danh sách workflow_id đã chuyển trạng thái.
         """
         now = _utc_now_iso()
@@ -198,9 +199,8 @@ class WorkflowStore:
                         "SELECT created_at FROM workflows WHERE workflow_id = ?", (workflow_id,)
                     ).fetchone()
                     record["created_at"] = created[0] if created else now
-                prev_error = record.get("error")
                 record["status"] = "failed"
-                record["error"] = f"{error} | {prev_error}" if prev_error else error
+                record["error"] = error
                 record["completed_at"] = record.get("completed_at") or now
                 conn.execute(_UPSERT_SQL, _summary_row(record))
                 recovered.append(workflow_id)

@@ -11,6 +11,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -273,7 +274,7 @@ def test_restart_marks_unfinished_runs_failed_and_leaves_finished_untouched(env)
     after = raw()
 
     assert p["status"] == "failed" and p["error"] == INTERRUPTED_ERROR
-    assert r["status"] == "failed" and r["error"] == f"{INTERRUPTED_ERROR} | fe: timeout"
+    assert r["status"] == "failed" and r["error"] == INTERRUPTED_ERROR
     assert p["completed_at"] and r["completed_at"]
     assert (c["status"], c["error"]) == ("completed", None)
     assert (f["status"], f["error"]) == ("failed", "boom")
@@ -399,7 +400,7 @@ def test_static_mount_serves_every_file_under_static(env):
     with TestClient(app_mod.app) as client:
         for f in files:
             rel = f.relative_to(STATIC_DIR).as_posix()
-            r = client.get(f"/ui/static/{rel}")
+            r = client.get(f"/ui/static/{quote(rel)}")
             assert r.status_code == 200, rel
             assert r.content == f.read_bytes(), rel
         assert client.get("/ui/static/vendor/khong-ton-tai.js").status_code == 404

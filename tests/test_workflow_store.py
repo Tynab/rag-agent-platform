@@ -142,7 +142,7 @@ def test_recover_interrupted_only_touches_active_runs(db):
     p, r = db.get("p"), db.get("r")
     assert p["status"] == r["status"] == "failed"
     assert p["error"] == INTERRUPTED_ERROR == "Bị gián đoạn do agent-api khởi động lại"
-    assert r["error"] == f"{INTERRUPTED_ERROR} | ba: timeout"
+    assert r["error"] == INTERRUPTED_ERROR  # đúng chuỗi, không ghép lỗi cũ
     assert p["completed_at"] and r["completed_at"]
     # Cột tóm tắt đồng bộ với JSON.
     statuses = {row["workflow_id"]: row["status"] for row in db.list_recent(10)}
