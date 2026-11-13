@@ -23,7 +23,7 @@ Vòng đời mỗi node — 3 giai đoạn
        - tech_stack bắt buộc nếu được cung cấp
        - output rút gọn từ các agent phụ thuộc (dep_max_chars per dep)
        - gợi ý ngày hiện tại cho planning roles (ba, pm, sa, ta)
-       - gợi ý kiểu DB (nosql/sql/both) cho dba và da
+       - gợi ý kiểu DB (nosql/sql/both) cho dba và da (cả hai đều có gợi ý 'both')
        - extra_context tùy chọn
 
   2. Bổ sung RAG (tùy chọn, khi rag_enabled=True)
@@ -35,10 +35,17 @@ Vòng đời mỗi node — 3 giai đoạn
        Artifact roles (fe, mobile, be, dba, da, tech_lead, devsecops):
            _generate_artifacts_multi_turn() — 2 pha sinh code:
            Pha 1: CODING_PLANNER_MODEL lập kế hoạch danh sách file,
-                  tham chiếu TL task board để không bỏ sót task.
-           Pha 2: coding model sinh từng file độc lập với context tập trung.
-                  Nếu còn TL task chưa cover → follow-up pass sinh thêm file.
+                  tham chiếu TOÀN BỘ TL task board để không bỏ sót task
+                  (_format_tl_task_lines: cắt chữ từng task theo ngân sách
+                  _TL_TASKS_PROMPT_CHARS, không cắt danh sách). Context gửi planner
+                  rút gọn bằng _compact_context (đề bài + tech stack + đuôi context).
+           Pha 2: coding model sinh từng file độc lập với context tập trung
+                  (review roles tech_lead/devsecops nhận thêm context rút gọn
+                  bằng _compact_context). Nếu còn TL task chưa cover → follow-up
+                  pass sinh thêm file.
            Kết thúc: _build_task_checklist() tạo bảng ✅/⏳ đối chiếu TL tasks.
+           Planner không trả kế hoạch → fallback _call_agent() một lần với context
+           rút gọn + toàn bộ TL task board.
        Các role còn lại:
            _call_agent() — gọi LLM một lần với toàn bộ context.
            Nếu output < 30 ký tự → retry với context rút gọn 1.500 ký tự
@@ -89,8 +96,10 @@ Lỗi sinh file (artifact roles)
 
 Chống vòng lặp output
 ----------------------
-    _deloop(): cắt các dòng lặp liên tiếp quá giới hạn. Phòng ngừa
-    coding model nhỏ có xu hướng lặp lại boilerplate vô tận.
+    _deloop(text, language, filename=...): cắt các dòng lặp liên tiếp quá giới hạn.
+    Phòng ngừa coding model nhỏ có xu hướng lặp lại boilerplate vô tận. Marker cắt
+    dùng cú pháp comment đúng ngôn ngữ (// · # · -- · /* */ · <!-- -->); JSON và
+    ngôn ngữ không rõ cú pháp comment → cắt nhưng KHÔNG chèn marker (file vẫn hợp lệ).
 
 TL Task Tracking
 ----------------
@@ -351,6 +360,11 @@ _PER_DEP_CHARS: dict[str, int] = {
 }
 
 
+# Ngân sách ký tự context (đã _compact_context: đề bài + tech stack + đuôi context)
+# gửi planner và gửi kèm mỗi lần sinh file của review roles (tech_lead, devsecops).
+_PLAN_CTX_CHARS = 2_000
+_REVIEW_CTX_CHARS = 1_500
+
 # Tập hợp các role sử dụng quy trình sinh code 2 pha (lập kế hoạch → sinh từng file).
 # "da" được loại trừ khỏi đây vì DA agent chạy qua _call_agent (sinh báo cáo một lần),
 # không phải vòng lặp per-file. Tuy nhiên artifacts.py vẫn trích xuất code block
@@ -600,6 +614,51 @@ def _extract_tl_tasks(role: str, context: str) -> list[dict]:
                 break
         tasks.append({"id": tid or str(len(tasks) + 1), "task": task_text, "priority": priority})
     return tasks
+
+
+# Ngân sách ký tự cho danh sách TL task chèn vào prompt planner / fallback single-call.
+# Planner chạy num_ctx 8.192 token với PLANNER_NUM_PREDICT mặc định 2.048 (×2 headroom
+# khi CODING_PLANNER_MODEL là reasoning model) → prompt còn ~4.000 token; 3.000 ký tự
+# task ≈ 800–1.000 token, cộng phần còn lại của prompt (~3.500 ký tự) vẫn dư.
+_TL_TASKS_PROMPT_CHARS = 3_000
+# Mỗi task giữ tối thiểu / tối đa bấy nhiêu ký tự. Coverage (_find_uncovered_tasks)
+# khớp từ khóa của TOÀN BỘ chữ task với filename + description planner trả về → cắt
+# quá ngắn khiến planner không thấy từ khóa và task bị coi là chưa cover.
+_TL_TASK_MIN_CHARS = 40
+_TL_TASK_MAX_CHARS = 200
+
+
+def _format_tl_task_lines(
+    tasks: list[dict], budget: int = _TL_TASKS_PROMPT_CHARS, bullet: str = "  - ",
+) -> str:
+    """Định dạng TOÀN BỘ *tasks* thành danh sách bullet vừa ngân sách *budget* ký tự.
+
+    Cắt CHỮ của từng task (độ rộng chia đều theo số task, kẹp trong
+    [_TL_TASK_MIN_CHARS, _TL_TASK_MAX_CHARS], đánh dấu "…") thay vì cắt DANH SÁCH:
+    tl_tasks[:15] cũ làm board > 15 task luôn "chưa hoàn thành" vì checklist và
+    follow-up đối chiếu với mọi task nhưng planner chỉ thấy 15 task đầu.
+
+    Board quá lớn (độ rộng chạm sàn _TL_TASK_MIN_CHARS) có thể vượt *budget*; chỉ khi
+    vượt gấp đôi — vài trăm task, ngoài khả năng của một lần plan — mới bỏ các task
+    cuối và ghi rõ số task bị lược để prompt planner không tràn num_ctx.
+    """
+    if not tasks:
+        return ""
+    width = budget // len(tasks) - len(bullet) - 1
+    width = max(_TL_TASK_MIN_CHARS, min(_TL_TASK_MAX_CHARS, width))
+    lines: list[str] = []
+    used = 0
+    for i, task in enumerate(tasks):
+        text = " ".join(str(task.get("task", "")).split())
+        if len(text) > width:
+            text = text[: width - 1].rstrip() + "…"
+        line = bullet + text
+        if used + len(line) + 1 > 2 * budget:
+            lines.append(f"{bullet}… (+{len(tasks) - i} more Team Lead tasks not listed)")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
 
 
 def _find_uncovered_tasks(tl_tasks: list[dict], file_infos: list[dict]) -> list[dict]:
@@ -1052,13 +1111,73 @@ def _file_errors_section(failed: dict[str, str]) -> str:
     return FILE_GEN_ERRORS_HEADER + "\n".join(lines) + "\n"
 
 
-def _deloop(text: str, max_repeats: int = 8) -> str:
+# Cú pháp comment (mở, đóng) cho marker cắt lặp của _deloop(), tra theo language của
+# planner hoặc đuôi file. None = định dạng không có comment (JSON) hoặc không có một cú
+# pháp an toàn cho cả file (Vue/Svelte trộn HTML + script, MDX) → cắt lặp nhưng KHÔNG
+# chèn marker. Ngôn ngữ không có trong bảng (kể cả "text") cũng không chèn marker.
+_CMT_SLASH = ("// ", "")
+_CMT_HASH = ("# ", "")
+_CMT_DASH = ("-- ", "")
+_CMT_CSS = ("/* ", " */")
+_CMT_HTML = ("<!-- ", " -->")
+_COMMENT_STYLES: dict[str, tuple[str, str] | None] = {
+    **dict.fromkeys((
+        "typescript", "ts", "tsx", "mts", "cts", "javascript", "js", "jsx", "mjs", "cjs",
+        "java", "kotlin", "kt", "kts", "swift", "dart", "go", "golang", "rust", "rs",
+        "c", "h", "cpp", "c++", "cc", "hpp", "cs", "csharp", "c#", "scala", "groovy",
+        "gradle", "scss", "less", "proto", "protobuf", "prisma", "php",
+    ), _CMT_SLASH),
+    **dict.fromkeys((
+        "python", "py", "yaml", "yml", "bash", "sh", "shell", "zsh", "dockerfile", "docker",
+        "toml", "ini", "cfg", "conf", "nginx", "env", "dotenv", "properties", "ruby", "rb",
+        "perl", "pl", "r", "hcl", "terraform", "tf", "tfvars", "makefile", "make", "mk",
+        "cmake", "powershell", "ps1", "graphql", "gql", "elixir", "ex", "exs",
+    ), _CMT_HASH),
+    **dict.fromkeys((
+        "sql", "psql", "pgsql", "plsql", "mysql", "postgresql", "postgres", "tsql", "sqlite",
+        "lua", "haskell", "hs", "elm",
+    ), _CMT_DASH),
+    "css": _CMT_CSS,
+    **dict.fromkeys(("html", "htm", "xml", "svg", "xaml", "xsd", "markdown", "md"), _CMT_HTML),
+    **dict.fromkeys(("json", "jsonc", "json5", "jsonl", "ndjson", "ipynb", "vue", "svelte", "mdx"), None),
+}
+_TRUNCATED_MARKER = "... (repeated pattern truncated)"
+
+
+def _comment_style(language: str, filename: str = "") -> tuple[str, str] | None:
+    """Cú pháp comment cho marker của _deloop: theo *language*, rồi tới tên/đuôi *filename*.
+
+    language của planner là chuỗi tự do (mặc định "text") nên khi không nhận ra thì tra
+    theo tên file (Dockerfile, Makefile, .env, đuôi .yml...). File đuôi JSON không bao
+    giờ có marker dù language nói gì — JSON không có comment.
+    """
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    ext = name.rsplit(".", 1)[-1] if "." in name.lstrip(".") else ""
+    if ext in ("json", "jsonc", "json5", "jsonl", "ndjson", "ipynb"):
+        return None
+    words = language.strip().lower().split()
+    lang = words[0] if words else ""
+    if lang in _COMMENT_STYLES:
+        return _COMMENT_STYLES[lang]
+    if name in ("dockerfile", "makefile") or name.startswith(("dockerfile.", ".env")) \
+            or name.endswith(".dockerfile") or name in (".gitignore", ".dockerignore"):
+        return _CMT_HASH
+    return _COMMENT_STYLES.get(ext)
+
+
+def _deloop(text: str, language: str = "", max_repeats: int = 8, *, filename: str = "") -> str:
     """Cắt ngắn các đoạn dòng lặp lại liên tiếp để giảm thiểu lỗi vòng lặp của model.
 
     Một số coding model nhỏ có xu hướng lặp lại cùng một dòng code (thường là
     import hoặc boilerplate) hàng trăm lần. Hàm này giới hạn tối đa max_repeats
-    lần lặp liên tiếp rồi thêm dấu hiệu truncation.
+    lần lặp liên tiếp rồi thêm một dòng marker truncation.
+
+    Marker là COMMENT đúng cú pháp của *language* (fallback theo *filename*), thụt lề
+    như dòng bị lặp: "# ..." cho YAML/Python, "-- ..." cho SQL, "<!-- ... -->" cho
+    Markdown/HTML... — marker "//" cố định cũ làm hỏng file YAML/Python/SQL/Markdown.
+    JSON / ngôn ngữ không rõ → không chèn marker (chỉ cắt), file vẫn hợp lệ.
     """
+    style = _comment_style(language, filename)
     lines = text.split("\n")
     out: list[str] = []
     prev: str | None = None
@@ -1069,8 +1188,9 @@ def _deloop(text: str, max_repeats: int = 8) -> str:
             count += 1
             if count <= max_repeats:
                 out.append(ln)
-            elif count == max_repeats + 1:
-                out.append("// ... (repeated pattern truncated)")
+            elif count == max_repeats + 1 and style is not None:
+                indent = ln[: len(ln) - len(ln.lstrip())]
+                out.append(f"{indent}{style[0]}{_TRUNCATED_MARKER}{style[1]}")
         else:
             prev  = key
             count = 1
@@ -1223,13 +1343,13 @@ def _plan_code_files(
         num_predict=num_predict_for("planner", CODING_PLANNER_MODEL, num_ctx=planner_ctx),
     )
     stack_str = ", ".join(tech_stack) if tech_stack else "not specified"
-    # Nếu có TL task board, chèn danh sách task vào planning prompt
-    # để model biết cần tạo file nào để cover hết task (tối đa 15 task đầu tiên).
+    # Nếu có TL task board, chèn TOÀN BỘ danh sách task vào planning prompt để model biết
+    # cần tạo file nào để cover hết task — cắt chữ từng task theo ngân sách ký tự chứ
+    # không cắt danh sách (checklist / follow-up đối chiếu với mọi task).
     if tl_tasks:
-        task_lines = "\n".join(f"  - {t['task']}" for t in tl_tasks[:15])
         tl_tasks_section = (
             "IMPORTANT — Team Lead Task Board: your file list MUST cover all of these tasks:\n"
-            + task_lines
+            + _format_tl_task_lines(tl_tasks)
         )
     else:
         tl_tasks_section = ""
@@ -1238,7 +1358,8 @@ def _plan_code_files(
         max_files=_MAX_FILES_PER_ROLE,
         user_input=user_input[:500],
         tech_stack=stack_str,
-        context_summary=context_summary[:1000],
+        # Idempotent khi caller đã rút gọn; context_summary[:1000] cũ cắt mất đuôi context.
+        context_summary=_compact_context(context_summary, _PLAN_CTX_CHARS),
         tl_tasks_section=tl_tasks_section,
         extra=f"Constraint: {extra_instruction}" if extra_instruction else "",
     )
@@ -1323,7 +1444,7 @@ def _generate_one_file(
     if is_reasoning_model(agent.model):
         result = _strip_thinking(result)
     result = _strip_code_fence(result, language, filename)   # chỉ bóc fence bọc ngoài
-    result = _deloop(result)                        # remove infinite loops
+    result = _deloop(result, language, filename=filename)   # cắt vòng lặp, marker đúng ngôn ngữ
     if not result.strip():
         # Rỗng: model không trả gì, hoặc chạm trần num_predict giữa lúc suy luận
         # (_strip_thinking bỏ <think> chưa đóng) — không có gì để lưu.
@@ -1373,7 +1494,9 @@ def _generate_artifacts_multi_turn(
         checklist cuối. Nếu KHÔNG file nào sinh được: chuỗi bắt đầu
         "[LỖI trong {role}]" kèm section lỗi.
     """
-    context_summary = context[-1200:]
+    # Giữ đề bài + tech stack ở đầu context và lấp phần còn lại bằng đuôi (output agent
+    # gần nhất / RAG / gợi ý DB) — context[-1200:] cũ chỉ còn đuôi, mất đề bài và stack.
+    context_summary = _compact_context(context, _PLAN_CTX_CHARS)
 
     # Trích xuất danh sách TL task (ưu tiên TL output thô) để tracking coverage và lập kế hoạch.
     tl_tasks = _extract_tl_tasks(role, tl_output or context)
@@ -1392,8 +1515,8 @@ def _generate_artifacts_multi_turn(
         # board đã parse — context[-2000:] cũ chỉ còn đuôi RAG/output agent gần nhất.
         task_block = ""
         if tl_tasks:
-            task_block = "\n\n## TL Task Board — bắt buộc cover\n" + "\n".join(
-                f"- {t['task'][:100]}" for t in tl_tasks[:15]
+            task_block = "\n\n## TL Task Board — bắt buộc cover\n" + _format_tl_task_lines(
+                tl_tasks, bullet="- ",
             )
         fallback_ctx = _compact_context(context, max(1_000, 2_000 - len(task_block))) + task_block
         output = _call_agent(agent, ollama_base_url, fallback_ctx)
@@ -1409,7 +1532,7 @@ def _generate_artifacts_multi_turn(
     parts: list[str] = [f"## {agent.name}\n"]
     # Review roles benefit from seeing previous agent outputs
     _review_roles = {"tech_lead", "devsecops"}
-    ctx_snippet = context[-1500:] if role in _review_roles else ""
+    ctx_snippet = _compact_context(context, _REVIEW_CTX_CHARS) if role in _review_roles else ""
 
     # generated: file sinh THÀNH CÔNG — chỉ nhóm này được tính là cover TL task
     # (uncovered-task + checklist). failed: filename → lỗi ngắn, phản ánh trạng thái
@@ -1662,6 +1785,16 @@ def _build_context_parts(
                     "\n## Data Analysis: SQL\n"
                     "Tech stack dùng relational DB. Phân tích bằng SQL queries với "
                     "GROUP BY, window functions, aggregates, CTEs."
+                )
+            elif db_type == "both":
+                parts.append(
+                    "\n## Data Analysis: Mixed (SQL + NoSQL)\n"
+                    "Tech stack dùng cả SQL và NoSQL (MongoDB). Phân tích dữ liệu quan hệ bằng "
+                    "SQL queries (GROUP BY, window functions, CTEs) và dữ liệu document bằng "
+                    "MongoDB aggregation pipeline ($match, $group, $project, $lookup). "
+                    "Ghi rõ mỗi query chạy trên data store nào; KHÔNG trộn cú pháp SQL vào "
+                    "aggregation pipeline. Cần phân tích chéo hai store: export CSV rồi "
+                    "join bằng Python/pandas."
                 )
 
     return parts
