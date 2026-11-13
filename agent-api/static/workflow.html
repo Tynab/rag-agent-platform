@@ -29,9 +29,16 @@
       --err:       #ef4444;
       --run:       #3b82f6;
       --radius:    10px;
+      /* Chiều cao thật của header sticky — trackHeaderHeight() cập nhật (≤640px header gập
+         2 hàng). Thanh tab dính ngay dưới header dùng giá trị này. */
+      --header-h:  56px;
     }
 
-    html { font-size: 14px; }
+    html {
+      font-size: 14px;
+      /* Cuộn tới anchor / scrollIntoView không bị header + thanh tab sticky che mất */
+      scroll-padding-top: calc(var(--header-h) + 48px);
+    }
 
     body {
       background: var(--bg);
@@ -114,6 +121,11 @@
     .btn-secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
     .btn-danger    { background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.45); color: var(--err); }
     .btn-sm { padding: 4px 10px; font-size: 11px; }
+    /* Viền focus rõ ràng khi dùng bàn phím (:focus-visible — click chuột không hiện viền) */
+    .btn:focus-visible, a:focus-visible {
+      outline: 2px solid var(--accent-l);
+      outline-offset: 2px;
+    }
 
     .poll-indicator {
       font-size: 11px;
@@ -386,15 +398,23 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
+      /* clip (không phải hidden): overflow:hidden biến card thành scroll container nên
+         position:sticky của thanh tab bên trong không bao giờ dính. hidden là đường lui cho
+         trình duyệt cũ không hiểu clip (tab chỉ không dính, không vỡ gì). */
       overflow: hidden;
+      overflow: clip;
     }
 
-    /* Tabs */
+    /* Tabs — dính ngay dưới header khi cuộn output dài (đổi tab không phải cuộn ngược lên).
+       z-index: trên ô tiêu đề bảng / nút copy trong tab-body, dưới header (50). */
     .tabs-nav {
       display: flex;
       overflow-x: auto;
       background: var(--surface2);
       border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: var(--header-h);
+      z-index: 20;
     }
     .tabs-nav::-webkit-scrollbar { height: 3px; }
     .tabs-nav::-webkit-scrollbar-thumb { background: var(--border); }
@@ -416,6 +436,8 @@
       transition: color .15s;
     }
     .tab-btn:hover   { color: var(--text); }
+    /* outline vẽ vào trong: .tabs-nav cuộn ngang nên viền ngoài bị cắt */
+    .tab-btn:focus-visible, .sub-tab-btn:focus-visible { outline: 2px solid var(--accent-l); outline-offset: -2px; }
     .tab-btn.active  { color: var(--accent-l); border-bottom-color: var(--accent); }
     .tab-btn.t-done  { color: var(--ok); }
     .tab-btn.t-run   { color: var(--run); }
@@ -535,18 +557,43 @@
     }
     .md pre code { background: none; border: none; padding: 0; color: var(--text); font-size: 1em;
       font-family: inherit; /* keep the same stack — don't inherit from .md code */ }
-    /* Wrap tables so wide content scrolls horizontally instead of overflowing */
-    .md table { border-collapse: collapse; width: max-content; min-width: 100%; margin: 0; }
-    .md .table-wrap { overflow-x: auto; width: 100%; margin: 1em 0;
+    /* Bảng: ô được xuống dòng — trước đây th/td nowrap + width:max-content làm bảng yêu cầu
+       rộng ~2× màn hình. Bảng vừa khung (width 100%); chỉ khi tổng độ rộng tối thiểu của các
+       cột (mỗi cột ≥ 8em, cột đầu + hàng tiêu đề giữ một dòng) vượt khung thì .table-wrap mới
+       cuộn ngang. Bảng cao bị giới hạn 70vh, cuộn dọc bên trong với hàng tiêu đề dính trên. */
+    .md .table-wrap { overflow: auto; width: 100%; max-height: 70vh; margin: 1em 0;
       /* thin custom scrollbar */
       scrollbar-width: thin;
       scrollbar-color: var(--border) transparent;
     }
-    .md .table-wrap::-webkit-scrollbar { height: 6px; }
+    .md .table-wrap::-webkit-scrollbar { width: 6px; height: 6px; }
     .md .table-wrap::-webkit-scrollbar-track { background: transparent; }
     .md .table-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-    .md th, .md td { border: 1px solid var(--border); padding: 7px 12px; text-align: left; font-size: 13px; white-space: nowrap; }
-    .md th { background: var(--surface2); font-weight: 700; }
+    /* separate (không collapse): với border-collapse, viền của ô sticky ở lại chỗ cũ khi cuộn.
+       Viền vẽ ở cạnh phải/dưới của từng ô + cạnh trái của bảng + cạnh trên của hàng tiêu đề. */
+    .md table { border-collapse: separate; border-spacing: 0; width: 100%; margin: 0;
+                border-left: 1px solid var(--border); }
+    .md th, .md td {
+      border-right: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 7px 12px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+      min-width: 8em;
+      max-width: 40em;
+      overflow-wrap: anywhere;   /* URL / định danh dài không đẩy cột rộng ra */
+    }
+    .md th {
+      background: var(--surface2);
+      font-weight: 700;
+      white-space: nowrap;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .md thead tr:first-child > * { border-top: 1px solid var(--border); }
+    .md td:first-child { white-space: nowrap; }
     .md tr:nth-child(even) { background: rgba(255,255,255,.02); }
 
     /* ── Toast ───────────────────────────────────────────────── */
@@ -741,7 +788,7 @@
 <body>
 
 <!-- ── HEADER ────────────────────────────────────────────────────────── -->
-<header class="header">
+<header class="header" id="app-header">
   <div class="logo">rag-agent-platform <em>SDLC</em></div>
 
   <div class="search-row">
@@ -835,7 +882,7 @@
     </div>
 
     <!-- Tab content card -->
-    <div class="content-card">
+    <div class="content-card" id="content-card">
       <div class="tabs-nav" id="tabs-nav"></div>
       <div class="tab-body" id="tab-body"></div>
     </div>
@@ -952,6 +999,7 @@ let _artLoadAt   = 0;      // Date.now() của lần tải /artifacts gần nh�
   // Cấu hình marked TRƯỚC khi theo dõi: nếu thư viện thiếu, setupMarkdown() chỉ trả false
   // (render dùng text thô) chứ không ném lỗi làm hỏng cả init.
   setupMarkdown();
+  trackHeaderHeight();
 
   const p = new URLSearchParams(window.location.search);
   const id = p.get('id');
@@ -1338,6 +1386,7 @@ function renderProgress(data) {
     });
   }
 
+  let newlyRunning = null;   // node vừa chuyển sang 'active' (bước đang chạy đổi) ở lượt này
   STEPS.forEach((step, i) => {
     const el         = _stepEls[i];
     const state      = stepState(data, step.role);
@@ -1352,6 +1401,7 @@ function renderProgress(data) {
 
     // toggle(cls, bool) không đụng DOM khi class đã đúng → animation/transition giữ nguyên
     const wasSelected = el.node.classList.contains('selected');
+    if (state === 'active' && !el.node.classList.contains('active')) newlyRunning = el.node;
     el.node.classList.toggle('done',     state === 'done');
     el.node.classList.toggle('warn',     state === 'warn');
     el.node.classList.toggle('failed',   state === 'failed');
@@ -1374,6 +1424,9 @@ function renderProgress(data) {
       }
     }
   });
+  // Bước đang chạy vừa đổi → cuộn nó vào khung của dải tiến trình (trên màn hẹp bước 9+
+  // nằm ngoài vùng thấy). Chạy sau reveal của bước được chọn nên bước đang chạy thắng.
+  if (newlyRunning) revealInStrip(track, newlyRunning);
 }
 
 /* ── Tabs ───────────────────────────────────────────────────────────── */
@@ -1687,7 +1740,34 @@ function selectTab(role) {
     renderProgress(lastData);
     renderTabs(lastData);
     renderTabBody(lastData);
+    revealTabStart();
   }
+}
+
+// Đổi tab khi thanh tab đang dính (đã cuộn sâu trong output dài) → cuộn về đầu nội dung tab
+// mới (ngay dưới header) thay vì để người dùng ở giữa một output khác.
+function revealTabStart() {
+  const card   = document.getElementById('content-card');
+  const header = document.getElementById('app-header');
+  if (!card || !card.getBoundingClientRect || !header) return;
+  const top = card.getBoundingClientRect().top;
+  const hh  = header.offsetHeight || 0;
+  if (typeof top === 'number' && top < hh) window.scrollBy(0, top - hh);
+}
+
+// --header-h = chiều cao thật của header sticky (56px; ≤640px gập 2 hàng → cao hơn), để
+// thanh tab dính ngay dưới header chứ không chui xuống dưới nó.
+function trackHeaderHeight() {
+  const header = document.getElementById('app-header');
+  const root   = document.documentElement;
+  if (!header || !root || !root.style) return;
+  const update = () => {
+    const h = header.offsetHeight;
+    if (h) root.style.setProperty('--header-h', h + 'px');
+  };
+  update();
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(update).observe(header);
+  else window.addEventListener('resize', update);
 }
 
 /* ────────────────────────────────────────────────────────────────────────

@@ -908,3 +908,39 @@ def test_download_all_attaches_anchor_revokes_later_and_reports_missing_files():
     s = res["out"][2]
     assert s["toasts"][-1].startswith("⚠") and "1/2" in s["toasts"][-1]
     assert "alert(" not in _inline_script()
+
+
+def test_running_step_change_is_revealed_in_the_progress_strip():
+    """Bước đang chạy đổi → cuộn nó vào khung dải tiến trình (sau reveal của bước được chọn)."""
+    spy = ("window.__rev = []; revealInStrip = (strip, el) => "
+           "window.__rev.push(strip.id + ':' + (_stepEls ? _stepEls.findIndex(e => e.node === el) : -1)); 0")
+    at_ta = _rec("running", completed_steps=ROLES[:3], step_outputs={r: "x" for r in ROLES[:3]})
+    at_ops = _rec("running", completed_steps=ROLES[:13], step_outputs={r: "x" for r in ROLES[:13]})
+    res = _run_sm(
+        [["track", "wf-1"], ["eval", spy], ["tab", "ba"], ["eval", "window.__rev.splice(0)"],
+         ["tick"], ["eval", "window.__rev.splice(0)"], ["tick"], ["eval", "window.__rev.splice(0)"]],
+        [_ok(at_ta), _ok(at_ops), _ok(at_ops)],
+    )
+    picked, moved, same = res["out"][1:]
+    assert picked == ["steps-track:0", "tabs-nav:-1"]      # chọn tab BA: node BA + nút tab BA
+    assert moved == ["steps-track:13"], "bước đang chạy mới (DevSecOps) phải được cuộn vào khung"
+    assert same == [], "không đổi gì → không cuộn"
+
+
+def _css_rule(selector: str) -> str:
+    css = re.search(r"<style>(.*?)</style>", HTML.read_text(encoding="utf-8"), re.S).group(1)
+    m = re.search(r"(?:^|[}/])\s*" + re.escape(selector) + r"\s*\{([^}]*)\}", css, re.M)
+    assert m, f"không thấy rule {selector}"
+    return m.group(1)
+
+
+def test_tables_wrap_with_sticky_header_and_tabs_stick_below_header():
+    """Hợp đồng CSS (hành vi thật kiểm bằng Playwright): ô bảng xuống dòng, tiêu đề bảng và thanh tab dính."""
+    cells = _css_rule(".md th, .md td")
+    assert "nowrap" not in cells and "min-width" in cells
+    assert "max-content" not in _css_rule(".md table") and "separate" in _css_rule(".md table")
+    assert "sticky" in _css_rule(".md th") and "nowrap" in _css_rule(".md td:first-child")
+    assert "max-height" in _css_rule(".md .table-wrap")
+    tabs = _css_rule(".tabs-nav")
+    assert "position: sticky" in tabs and "top: var(--header-h)" in tabs
+    assert "overflow: clip" in _css_rule(".content-card")   # overflow:hidden làm sticky không dính
