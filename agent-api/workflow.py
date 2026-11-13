@@ -66,7 +66,13 @@ Giới hạn context window
 ------------------------
     MAX_PREV_OUTPUT_CHARS (3.000): giới hạn mặc định per dep output.
     _PER_DEP_CHARS: ghi đè per-role — tech_lead: 800, devsecops: 1.000,
-    tester: 3.000, clarifier: 1.500.
+    tester: 3.000, clarifier: 1.500 (dẫn xuất từ AgentConfig.per_dep_chars).
+
+Bảng per-role (role registry)
+------------------------------
+    _ARTIFACT_ROLES, _PER_DEP_CHARS, _TL_ROLE_SECTIONS, _REGEN_ELIGIBLE_ROLES,
+    _DATE_HINT_ROLES, _DB_HINT_ROLES, _REVIEW_ROLES được dẫn xuất từ các field
+    hành vi của AgentConfig (agents.py) lúc import — xem "Role registry" trong agents.py.
     OLLAMA_NUM_CTX: context window Ollama, mặc định 32.768 token.
 
 Gọi LLM — llm.py
@@ -346,18 +352,26 @@ def _get_num_ctx(model: str) -> int:
     return OLLAMA_NUM_CTX
 
 
+# ── Bảng per-role — DẪN XUẤT từ AgentConfig (agents.py là nguồn sự thật duy nhất) ──
+
 # Giới hạn ký tự tối đa lấy từ mỗi dep output theo role, để tránh overflow
-# context window khi role có nhiều phụ thuộc. Tính toán ước lượng:
-#   tech_lead:  5 deps × 800  = 4.000 chars ≈ 1.000 tokens
-#   devsecops:  4 deps × 1000 = 4.000 chars ≈ 1.000 tokens
-#   tester:     5 deps × 3000 = 15.000 chars ≈ 3.700 tokens
-#   clarifier: 14 deps × 1500 = 21.000 chars ≈ 5.250 tokens
+# context window khi role có nhiều phụ thuộc (AgentConfig.per_dep_chars; role không
+# có trong bảng dùng MAX_PREV_OUTPUT_CHARS). Ước lượng ghi cạnh từng role trong agents.py.
 _PER_DEP_CHARS: dict[str, int] = {
-    "tech_lead":  800,
-    "devsecops": 1_000,
-    "tester":    3_000,
-    "clarifier": 1_500,
+    role: cfg.per_dep_chars for role, cfg in AGENTS.items() if cfg.per_dep_chars is not None
 }
+
+# Planning roles nhận gợi ý ngày hiện tại (AgentConfig.wants_date_hint) — role sinh
+# timeline/sprint/milestone, tránh dùng ngày trong quá khứ.
+_DATE_HINT_ROLES: frozenset[str] = frozenset(
+    role for role, cfg in AGENTS.items() if cfg.wants_date_hint
+)
+
+# Role nhận gợi ý kiểu DB nosql/sql/both (AgentConfig.wants_db_hint) để chọn đúng
+# dialect schema/query. Câu chữ gợi ý theo từng role nằm trong _build_context_parts.
+_DB_HINT_ROLES: frozenset[str] = frozenset(
+    role for role, cfg in AGENTS.items() if cfg.wants_db_hint
+)
 
 
 # Ngân sách ký tự context (đã _compact_context: đề bài + tech stack + đuôi context)
@@ -365,12 +379,18 @@ _PER_DEP_CHARS: dict[str, int] = {
 _PLAN_CTX_CHARS = 2_000
 _REVIEW_CTX_CHARS = 1_500
 
-# Tập hợp các role sử dụng quy trình sinh code 2 pha (lập kế hoạch → sinh từng file).
-# "da" được loại trừ khỏi đây vì DA agent chạy qua _call_agent (sinh báo cáo một lần),
-# không phải vòng lặp per-file. Tuy nhiên artifacts.py vẫn trích xuất code block
-# từ output của DA và lưu vào disk sau khi node hoàn thành.
+# Review roles (AgentConfig.review_context): mỗi lần sinh file nhận thêm context
+# rút gọn _REVIEW_CTX_CHARS của các agent trước.
+_REVIEW_ROLES: frozenset[str] = frozenset(
+    role for role, cfg in AGENTS.items() if cfg.review_context
+)
+
+# Tập hợp các role sử dụng quy trình sinh code 2 pha (lập kế hoạch → sinh từng file),
+# tức AgentConfig.mode == "codegen". "da" không thuộc tập này vì DA agent chạy qua
+# _call_agent (sinh báo cáo một lần), không phải vòng lặp per-file. Tuy nhiên
+# artifacts.py vẫn trích xuất code block từ output của DA (extract_artifacts=True).
 _ARTIFACT_ROLES: frozenset[str] = frozenset(
-    {"fe", "mobile", "be", "dba", "devsecops", "tech_lead"}
+    role for role, cfg in AGENTS.items() if cfg.mode == "codegen"
 )
 
 # Template prompt gửi cho CODING_PLANNER_MODEL để lập kế hoạch danh sách file.
@@ -413,13 +433,10 @@ Strict rules:
 
 # ── Trích xuất TL task board và tạo checklist hoàn thành cho engineer agents ────
 
-# Ánh xạ từ role engineer sang các từ khóa tiêu đề section trong TL output.
-# Dùng để định vị bảng task board tương ứng trong context khi parse.
+# Ánh xạ từ role engineer sang các từ khóa tiêu đề section trong TL output
+# (AgentConfig.tl_sections). Dùng để định vị bảng task board tương ứng khi parse.
 _TL_ROLE_SECTIONS: dict[str, list[str]] = {
-    "fe":     ["FE Task Board", "4. FE Task", "§4 FE", "4. FE"],
-    "mobile": ["Mobile Task Board", "5. Mobile Task", "§5 Mobile", "5. Mobile"],
-    "be":     ["BE Task Board", "6. BE Task", "§6 BE", "6. BE"],
-    "dba":    ["DBA Task Board", "7. DBA Task", "§7 DBA", "7. DBA"],
+    role: list(cfg.tl_sections) for role, cfg in AGENTS.items() if cfg.tl_sections
 }
 
 # Nhận diện dòng heading section trong TL output:
@@ -756,11 +773,11 @@ def _build_task_checklist(tl_tasks: list[dict], file_infos: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# Tập hợp role được phép re-generate trong Clarifier Regen Loop.
+# Tập hợp role được phép re-generate trong Clarifier Regen Loop (AgentConfig.regen_eligible).
 # Loại trừ planning roles (ba, pm, sa, ta, designer, tl, tester) để tránh
 # thay đổi foundation phân tích nghiệp vụ, và loại clarifier để ngăn vòng lặp vô tận.
 _REGEN_ELIGIBLE_ROLES: frozenset[str] = frozenset(
-    {"fe", "mobile", "dba", "be", "da", "tech_lead", "devsecops"}
+    role for role, cfg in AGENTS.items() if cfg.regen_eligible
 )
 
 
@@ -1554,8 +1571,7 @@ def _generate_artifacts_multi_turn(
 
     parts: list[str] = [f"## {agent.name}\n"]
     # Review roles benefit from seeing previous agent outputs
-    _review_roles = {"tech_lead", "devsecops"}
-    ctx_snippet = _compact_context(context, _REVIEW_CTX_CHARS) if role in _review_roles else ""
+    ctx_snippet = _compact_context(context, _REVIEW_CTX_CHARS) if role in _REVIEW_ROLES else ""
 
     # generated: file sinh THÀNH CÔNG — chỉ nhóm này được tính là cover TL task
     # (uncovered-task + checklist). failed: filename → lỗi ngắn, phản ánh trạng thái
@@ -1737,8 +1753,8 @@ def _build_context_parts(
     ]
 
     # Chèn ngày hiện tại cho planning roles để tránh sinh timeline có ngày quá khứ.
-    # Chỉ áp dụng cho ba, pm, sa, ta — các role sinh timeline và sprint plan.
-    if role in {"pm", "ba", "sa", "ta"}:
+    # Chỉ áp dụng cho _DATE_HINT_ROLES (ba, pm, sa, ta) — các role sinh timeline và sprint plan.
+    if role in _DATE_HINT_ROLES:
         now = datetime.now()
         parts.append(
             f"\n## Ngày hiện tại\n"
@@ -1771,8 +1787,8 @@ def _build_context_parts(
         if rag_text:
             parts.append(f"\n## Context từ Knowledge Base\n{_truncate(rag_text)}")
 
-    # DB-type hints steer DBA/DA to the correct schema dialect.
-    if role in {"dba", "da"} and tech_stack:
+    # DB-type hints steer DBA/DA (_DB_HINT_ROLES) to the correct schema dialect.
+    if role in _DB_HINT_ROLES and tech_stack:
         db_type = _detect_db_type(tech_stack)
         if role == "dba":
             if db_type == "nosql":

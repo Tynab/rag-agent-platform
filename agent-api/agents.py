@@ -8,8 +8,40 @@ Module này là nguồn cấu hình duy nhất (single source of truth) cho toà
 pipeline SDLC. Mỗi agent được định nghĩa bằng AgentConfig gồm: step_id (thứ tự
 thực thi), role (định danh), name (tên hiển thị), model (LLM sử dụng),
 system_prompt (hướng dẫn chi tiết cho LLM), depends_on (danh sách role cần
-chạy trước) và rag_query_hint (gợi ý truy vấn RAG riêng để tăng độ chính xác
-retrieval).
+chạy trước), rag_query_hint (gợi ý truy vấn RAG riêng để tăng độ chính xác
+retrieval) và các field hành vi per-role (xem "Role registry" bên dưới).
+
+Role registry — hành vi per-role
+---------------------------------
+  Field              Ý nghĩa                                      Bảng dẫn xuất
+  ------------------ -------------------------------------------- -------------------------------
+  mode               "codegen" (2 pha planner → từng file) hoặc   workflow._ARTIFACT_ROLES
+                     "report" (_call_agent một lần)
+  extract_artifacts  trích code block trong output ra disk        artifacts.ARTIFACT_ROLES
+  regen_eligible     được re-gen trong Clarifier Regen Loop       workflow._REGEN_ELIGIBLE_ROLES
+  tl_sections        từ khóa heading TL task board của role       workflow._TL_ROLE_SECTIONS
+  per_dep_chars      giới hạn ký tự mỗi dep output (None → mặc    workflow._PER_DEP_CHARS
+                     định MAX_PREV_OUTPUT_CHARS)
+  wants_date_hint    chèn "## Ngày hiện tại" vào context          workflow._DATE_HINT_ROLES
+  wants_db_hint      chèn gợi ý kiểu DB (nosql/sql/both)          workflow._DB_HINT_ROLES
+  review_context     codegen review role: kèm context rút gọn     workflow._REVIEW_ROLES
+                     mỗi lần sinh file
+
+  Giá trị hiện tại:
+    ba, pm, sa, ta     report, wants_date_hint
+    designer, tl       report
+    fe, mobile, be     codegen, extract_artifacts, regen_eligible, tl_sections
+    dba                codegen, extract_artifacts, regen_eligible, tl_sections, wants_db_hint
+    da                 report, extract_artifacts, regen_eligible, wants_db_hint
+    tech_lead          codegen, extract_artifacts, regen_eligible, review_context, per_dep_chars=800
+    tester             report, per_dep_chars=3.000
+    devsecops          codegen, extract_artifacts, regen_eligible, review_context, per_dep_chars=1.000
+    clarifier          report, per_dep_chars=1.500
+
+  Các bảng dẫn xuất được tính MỘT LẦN lúc import từ AGENTS và giữ nguyên tên cũ —
+  code khác (app.py, test) vẫn import/tra cứu như trước. Nội dung extra instruction
+  theo framework (_compute_extra_instruction) và câu chữ gợi ý DB theo từng role
+  vẫn nằm trong workflow.py.
 
 Thứ tự thực thi và phụ thuộc
 -----------------------------
@@ -62,6 +94,7 @@ Thay đổi model chỉ cần sửa .env rồi `docker compose restart agent-api
 Hằng số xuất khẩu
 -----------------
 - AGENTS:         dict[str, AgentConfig] — tra cứu cấu hình theo role name
+- AgentMode:      Literal["report", "codegen"] — kiểu của AgentConfig.mode
 - WORKFLOW_STEPS: list[str]             — thứ tự thực thi chuẩn của 15 role
 - MAX_PREV_OUTPUT_CHARS: int            — giới hạn ký tự mỗi dep output khi
                                          xây dựng context (tránh overflow window)
@@ -70,7 +103,12 @@ Hướng dẫn thêm role mới
 -----------------------
 1. Khai báo hằng model: MODEL_XXX = os.environ.get("XXX_MODEL", "<default>")
 2. Thêm AgentConfig vào AGENTS với step_id, role, name, model, depends_on,
-   rag_query_hint và system_prompt đầy đủ.
+   rag_query_hint và system_prompt đầy đủ; đặt các field hành vi (mode,
+   extract_artifacts, regen_eligible, tl_sections, per_dep_chars,
+   wants_date_hint, wants_db_hint, review_context) — mặc định là role "report"
+   không có hành vi đặc biệt. Role regen_eligible mới cần thêm alias vào
+   workflow._REGEN_ROLE_RE (test kiểm tra hai nơi khớp nhau); role
+   wants_db_hint mới cần câu chữ gợi ý trong workflow._build_context_parts.
 3. Chèn role vào WORKFLOW_STEPS đúng vị trí theo thứ tự phụ thuộc.
 4. Thêm XXX_MODEL vào .env và vào khối environment của agent-api trong
    docker-compose.yml.
@@ -78,6 +116,7 @@ Hướng dẫn thêm role mới
 
 import os
 from dataclasses import dataclass, field
+from typing import Literal
 
 # ── Hằng số Model — đọc từ biến môi trường tương ứng lúc import ──────────────
 # Nhóm agent phân tích nghiệp vụ: sử dụng model reasoning mạnh để phân tích
@@ -106,6 +145,10 @@ MODEL_DESIGNER: str  = os.environ.get("DESIGNER_MODEL",  "gemma4:31b")
 MODEL_CLARIFIER: str = os.environ.get("CLARIFIER_MODEL", "qwen3.6:35b")
 
 
+# Kiểu sinh output của một agent — xem AgentConfig.mode.
+AgentMode = Literal["report", "codegen"]
+
+
 @dataclass
 class AgentConfig:
     step_id: int
@@ -120,6 +163,37 @@ class AgentConfig:
     # rag-api sẽ nhận chuỗi này để lấy context chính xác hơn cho từng vai trò SDLC.
     rag_query_hint: str = ""
 
+    # ── Hành vi per-role — nguồn sự thật duy nhất ─────────────────────────────
+    # Các bảng module-level trong workflow.py (_ARTIFACT_ROLES, _PER_DEP_CHARS,
+    # _TL_ROLE_SECTIONS, _REGEN_ELIGIBLE_ROLES, _DATE_HINT_ROLES, _DB_HINT_ROLES,
+    # _REVIEW_ROLES) và artifacts.ARTIFACT_ROLES đều được DẪN XUẤT từ các field
+    # dưới đây lúc import — thêm/sửa role chỉ cần sửa AgentConfig trong AGENTS.
+
+    # "codegen": sinh code 2 pha (planner lập danh sách file → sinh từng file) qua
+    # _generate_artifacts_multi_turn. "report": gọi LLM một lần (_call_agent).
+    mode: AgentMode = "report"
+    # Trích code block trong output ra file trên disk (artifacts.extract_and_save).
+    # Độc lập với mode: DA là "report" nhưng output có SQL/pandas cần lưu thành file.
+    extract_artifacts: bool = False
+    # Được phép re-generate trong Clarifier Regen Loop (§10 của Clarifier).
+    # Planning roles và clarifier luôn False: giữ nguyên foundation phân tích
+    # nghiệp vụ và chặn vòng lặp vô tận.
+    regen_eligible: bool = False
+    # Từ khóa tiêu đề section TL task board dành cho role (rỗng → role không có board).
+    tl_sections: tuple[str, ...] = ()
+    # Số ký tự tối đa lấy từ output mỗi dep khi build context; None → dùng
+    # MAX_PREV_OUTPUT_CHARS (role nhiều dep cần giới hạn nhỏ hơn để vừa context window).
+    per_dep_chars: int | None = None
+    # Chèn "## Ngày hiện tại" vào context — role sinh timeline/sprint/milestone,
+    # tránh LLM dùng ngày trong quá khứ.
+    wants_date_hint: bool = False
+    # Chèn gợi ý kiểu DB (nosql/sql/both, suy từ tech stack) vào context để chọn
+    # đúng dialect schema/query. Nội dung gợi ý theo từng role nằm trong workflow.py.
+    wants_db_hint: bool = False
+    # Review role (chỉ có nghĩa khi mode="codegen"): mỗi lần sinh file nhận thêm
+    # context rút gọn (đề bài + tech stack + đuôi output các agent trước).
+    review_context: bool = False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -133,6 +207,7 @@ AGENTS: dict[str, AgentConfig] = {
         model=MODEL_BA,
         depends_on=[],
         rag_query_hint="business requirement, user story, acceptance criteria, business rules, scope, gap analysis, WBS, RTM, platform architecture pattern, three-seam pattern, scope=platform, module naming convention, non-negotiable invariant, platform constraints",
+        wants_date_hint=True,
         system_prompt="""\
 You are the Business Analyst (BA) Agent for a software delivery team.
 Your responsibility is to analyze the business goal, product requirements, and source documents,
@@ -173,6 +248,7 @@ Structure your output with these sections:
         model=MODEL_PM,
         depends_on=["ba"],
         rag_query_hint="roadmap, sprint plan, milestone, RAID log, risk register, dependency, timeline, OKR, delivery plan",
+        wants_date_hint=True,
         system_prompt="""\
 You are the Project Manager (PM) Agent.
 Using the BA output, create a complete project management plan covering delivery,
@@ -210,6 +286,7 @@ Structure your output with these sections:
         model=MODEL_SA,
         depends_on=["ba", "pm"],
         rag_query_hint="system architecture, service boundary, API contracts, data model, integration flow, NFR, security, deployment architecture, three-seam pattern, scope=platform rows, internal endpoint, platform service naming, microservice port, Module Federation topology, codebase structure guide, Kafka topic naming convention",
+        wants_date_hint=True,
         system_prompt="""\
 You are the Solution Architect (SA) Agent.
 Design the technical solution from the BA requirements and PM plan — precise enough for TA, DBA, BE, and DevOps to implement from. Mark unconfirmed decisions [Draft] or [Proposed]. Never document a service in isolation: every boundary shows its upstream callers and downstream dependencies, and EVERY external touchpoint (payment, OAuth, notification, storage, analytics, third-party API) appears in the diagrams.
@@ -242,6 +319,7 @@ Output these sections, each concise:
         model=MODEL_TA,
         depends_on=["ba", "sa"],
         rag_query_hint="tech stack, framework comparison, database selection, cache, queue, cloud option, build vs buy, architecture trade-off",
+        wants_date_hint=True,
         system_prompt="""\
 You are the Technical Architect (TA) / Technology Advisor Agent.
 Your role is to decide and justify the technology stack, compare options,
@@ -351,6 +429,10 @@ Structure your output with these sections:
         model=MODEL_FE,
         depends_on=["ba", "sa", "ta", "designer", "tl"],
         rag_query_hint="frontend architecture, React component, TypeScript interface, state management, API integration, form validation, UI library, platform UI component library, Module Federation subapp, federated remote, host shell, shared singleton, TanStack Query, Zustand, useForm, shared helpdesk editor, shared workflow editor, subapp port, federation name, platform frontend conventions",
+        mode="codegen",
+        extract_artifacts=True,
+        regen_eligible=True,
+        tl_sections=("FE Task Board", "4. FE Task", "§4 FE", "4. FE"),
         system_prompt="""\
 You are the Frontend Engineer (FE) Agent.
 Your job: SCAFFOLD a runnable frontend codebase that developers then build feature-by-feature in their IDE ("vibe coding"). Do NOT implement business logic — set up the skeleton and leave clear `// TODO:` markers where each feature goes.
@@ -379,6 +461,10 @@ Then output the FE scaffold: real project structure + config + base setup, and s
         model=MODEL_MOBILE,
         depends_on=["ba", "sa", "ta", "designer", "tl"],
         rag_query_hint="mobile architecture, Flutter, React Native, navigation flow, screen component, API integration, offline cache, push notification, local storage, app state, mobile UX, permission, third-party SDK, platform shared packages, platform mobile conventions, shared editor component mobile",
+        mode="codegen",
+        extract_artifacts=True,
+        regen_eligible=True,
+        tl_sections=("Mobile Task Board", "5. Mobile Task", "§5 Mobile", "5. Mobile"),
         system_prompt="""\
 You are the Mobile Engineer Agent.
 Your job: SCAFFOLD a runnable mobile codebase (Flutter or React Native per TA) that developers then build feature-by-feature in their IDE ("vibe coding"). Do NOT implement feature logic — build the skeleton and leave clear `// TODO:` markers.
@@ -407,6 +493,11 @@ Then output the mobile scaffold: project structure + config + base setup + stub 
         model=MODEL_DBA,
         depends_on=["ba", "sa", "ta", "tl"],
         rag_query_hint="ERD, SQL schema, NoSQL schema, database design, index, migration plan, query optimization, backup restore, data retention, task estimate, tenantId compound index invariant, multi-tenant data isolation, partition key, tenancy rule, platform schema convention, text index scope, tenant prefix index",
+        mode="codegen",
+        extract_artifacts=True,
+        regen_eligible=True,
+        tl_sections=("DBA Task Board", "7. DBA Task", "§7 DBA", "7. DBA"),
+        wants_db_hint=True,
         system_prompt="""\
 You are the Database (DBA) Agent.
 Your job: SCAFFOLD the database layer that developers build features on — the schema/models, indexes, and connection + migration setup. Produce the REAL entity schema (it is the foundation devs need), but stay focused: structure over exhaustive tuning/ops analysis.
@@ -434,6 +525,10 @@ Output the schema/model files + indexes + connection/migration setup as real cod
         model=MODEL_BE,
         depends_on=["ba", "sa", "ta", "fe", "mobile", "dba", "tl"],
         rag_query_hint="backend API, business logic, service layer, DTO, validation, error handling, authentication, unit test, database access, external service integration, webhook, third-party API, platform common library, shared guard decorator, AuthMethod decorator, TenantGuard, PlatformGuard, base repository, OutboxModule, AuditTrailModule, KafkaModule from common-lib, safeSearchRegex, platform service naming convention, internal endpoint route prefix, three-seam pattern, scope=platform",
+        mode="codegen",
+        extract_artifacts=True,
+        regen_eligible=True,
+        tl_sections=("BE Task Board", "6. BE Task", "§6 BE", "6. BE"),
         system_prompt="""\
 You are the Backend Engineer (BE) Agent.
 Your job: SCAFFOLD a runnable backend codebase that developers then build feature-by-feature in their IDE ("vibe coding"). Build the skeleton — project setup, module structure, controllers wired to EMPTY service stubs, DB connection, auth wiring, DTO/type stubs — and leave `// TODO:` markers for business logic. Do NOT implement feature logic.
@@ -462,6 +557,10 @@ Then output the backend scaffold: project structure + config + DB/auth setup + c
         model=MODEL_DA,
         depends_on=["ba", "sa", "dba"],
         rag_query_hint="KPI, metric definition, dashboard, reporting logic, SQL analysis, data quality, analytics event, data mapping",
+        # DA chạy report một lần (_call_agent) nhưng output có SQL/pandas → vẫn trích file.
+        extract_artifacts=True,
+        regen_eligible=True,
+        wants_db_hint=True,
         system_prompt="""\
 You are the Data Analyst (DA) Agent.
 Define all KPIs, metrics, dashboard requirements, reporting rules, and analytics
@@ -503,6 +602,12 @@ Structure your output with these sections:
         model=MODEL_TECH_LEAD,
         depends_on=["sa", "fe", "mobile", "be", "dba"],
         rag_query_hint="code review, refactor, clean architecture, coding standard, performance optimization, technical debt, security review, platform coding standards, tenantId index invariant, common-lib usage, AuthMethod decorator, safeSearchRegex, cross-tenant data isolation, Dockerfile security, pino logger, non-negotiable platform invariant",
+        mode="codegen",
+        extract_artifacts=True,
+        regen_eligible=True,
+        review_context=True,
+        # per_dep_chars: 5 deps × 800 = 4.000 chars ≈ 1.000 tokens
+        per_dep_chars=800,
         system_prompt="""\
 You are the Tech Lead Agent.
 Review the FE, Mobile, and BE work for code quality, architecture compliance, performance, security, and coding standards across all layers. Your output sets the quality bar before Tester.
@@ -541,6 +646,8 @@ Output these sections, each concise:
         model=MODEL_TESTER,
         depends_on=["be", "fe", "mobile", "tech_lead", "designer"],
         rag_query_hint="test scenario, test case, UAT checklist, regression, edge case, bug report, acceptance criteria, release readiness",
+        # per_dep_chars: 5 deps × 3.000 = 15.000 chars ≈ 3.700 tokens (ghi rõ dù bằng mặc định)
+        per_dep_chars=3_000,
         system_prompt="""\
 You are the Tester (QA) Agent, covering Frontend, Mobile, and Backend.
 Produce a concrete, usable test plan — real test cases derived from the APIs, screens, and user stories in the previous agent outputs. Be CONCISE and never leave a section empty. If requirement IDs are not given, generate your own (TC-001, TC-002...).
@@ -568,6 +675,12 @@ Output these sections:
         model=MODEL_DEVSECOPS,
         depends_on=["sa", "ta", "tech_lead", "tester"],
         rag_query_hint="Docker, Kubernetes, Helm, CI/CD pipeline, security gates, SAST, DAST, SCA, container security, secrets management, IAM, RBAC, network policy, monitoring, rollback, deployment plan, runbook, Dockerfile platform convention, pino logger config, service name convention, non-root user Dockerfile, npmrc bake risk, platform deployment standard",
+        mode="codegen",
+        extract_artifacts=True,
+        regen_eligible=True,
+        review_context=True,
+        # per_dep_chars: 4 deps × 1.000 = 4.000 chars ≈ 1.000 tokens
+        per_dep_chars=1_000,
         system_prompt="""\
 You are the DevSecOps Agent — infrastructure automation + security hardening.
 Produce executable infra: Dockerfiles, K8s manifests (or docker-compose), a CI/CD pipeline with security gates, and a deploy/rollback/monitoring runbook — based on the architecture and the Tester-cleared release. Mark unconfirmed items [Proposed]. Be concise: real config, no padding.
@@ -601,6 +714,8 @@ Output these sections, each concise:
         model=MODEL_CLARIFIER,
         depends_on=["ba", "pm", "sa", "ta", "designer", "tl", "fe", "mobile", "dba", "be", "da", "tech_lead", "tester", "devsecops"],
         rag_query_hint="assumption, estimate, open question, gap, contradiction, missing requirement, unresolved decision, integration risk, undefined behavior, vague specification, missing data model, missing API contract, missing acceptance criteria",
+        # per_dep_chars: 14 deps × 1.500 = 21.000 chars ≈ 5.250 tokens
+        per_dep_chars=1_500,
         system_prompt="""\
 You are the Project Clarifier & Quality-Gate Agent. You audit ALL prior agent outputs, find every assumption / gap / contradiction / vague or missing item, and decide whether the team is ready to build. You do not write code. Be rigorous but concise.
 

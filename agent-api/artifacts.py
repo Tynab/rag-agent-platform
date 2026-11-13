@@ -69,6 +69,7 @@ _sanitize_relpath() chuẩn hóa và làm sạch mọi đường dẫn do LLM si
 Hằng số xuất khẩu
 -----------------
 - ARTIFACT_ROLES:  frozenset[str] — các role có artifact được trích xuất
+                   (dẫn xuất từ AgentConfig.extract_artifacts trong agents.py)
 - extract_and_save(role, output, workflow_id) → list[dict] — hàm chính
 - list_artifacts(workflow_id) → dict[str, list[dict]] — liệt kê artifacts
 - read_artifact(workflow_id, role, path) → str | None — đọc nội dung file
@@ -93,14 +94,17 @@ from collections.abc import Container
 from pathlib import Path
 from typing import NamedTuple
 
+from agents import AGENTS
+
 logger = logging.getLogger("artifacts")
 
 ARTIFACT_BASE: str = os.environ.get("ARTIFACT_DIR", "/data/artifacts")
 
-# Chỉ trích xuất và lưu artifact cho các role coding này.
+# Chỉ trích xuất và lưu artifact cho các role coding này (AgentConfig.extract_artifacts
+# trong agents.py: fe, mobile, be, dba, da, tech_lead, devsecops).
 # Planning roles (ba, pm, sa, ta...) và tester không sinh code file nên không cần trích xuất.
 ARTIFACT_ROLES: frozenset[str] = frozenset(
-    {"fe", "mobile", "be", "dba", "da", "tech_lead", "devsecops"}
+    role for role, cfg in AGENTS.items() if cfg.extract_artifacts
 )
 
 # Bảng ánh xạ từ tên ngôn ngữ code fence sang phần mở rộng file (không có dấu chấm).
