@@ -79,6 +79,12 @@ Các biến môi trường sử dụng
     CHUNK_OVERLAP         — overlap giữa chunk kề nhau (ký tự)
     UPSERT_BATCH_SIZE     — số vector upsert vào Qdrant mỗi batch
     INGEST_EMBED_WORKERS  — số request embed asyncio đồng thời
+    INGEST_EMBED_RETRIES  — số lần thử embed một batch lúc ingest (mặc định 3)
+    RAG_TIMEOUT           — timeout httpx (giây) mỗi lần gọi Ollama /api/embed, cả
+                            batch ingest lẫn embed câu hỏi (mặc định 600)
+    OLLAMA_REQUEST_TIMEOUT — timeout httpx (giây) mỗi lần gọi CHAT_MODEL: entity
+                            extraction lúc ingest và /ask của app.py (mặc định 600;
+                            <= 0 = không giới hạn)
     GRAPH_ENABLED         — true/false bật Neo4j
     GRAPH_ENTITY_EXTRACTION — true/false bật LLM entity extraction
     NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD / NEO4J_DATABASE
@@ -86,6 +92,7 @@ Các biến môi trường sử dụng
 
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -95,14 +102,15 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 
 import httpx
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
 from langchain_core.documents import Document
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.http.models import Distance, PointIdsList, PointStruct, VectorParams
+from qdrant_client.http.models import Distance, ExtendedPointId, PointIdsList, PointStruct, VectorParams
 
 
 def _require_env(name: str) -> str:
@@ -140,11 +148,37 @@ GRAPH_ENABLED: bool = os.environ.get("GRAPH_ENABLED", "true").lower() == "true"
 GRAPH_ENTITY_EXTRACTION: bool = os.environ.get(
     "GRAPH_ENTITY_EXTRACTION", "false").lower() == "true"
 CHAT_MODEL: str | None = os.environ.get("CHAT_MODEL")
+# Timeout (giây) httpx cho mỗi lời gọi CHAT_MODEL (entity extraction lúc ingest, /ask ở
+# app.py). Mặc định khớp `${OLLAMA_REQUEST_TIMEOUT:-600}` của rag-api trong
+# docker-compose.yml; <= 0 = không giới hạn (cùng quy ước với agent-api/llm.py).
+# ChatOllama gọi Ollama ở chế độ stream nên đây là giới hạn thời gian tới token đầu
+# tiên (gồm load/swap model) và khoảng lặng giữa hai chunk — không phải tổng thời gian.
+OLLAMA_REQUEST_TIMEOUT: float = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "600"))
 
-_graph_module = None
+
+def make_chat_model(model: str, *, temperature: float) -> ChatOllama:
+    """Tạo ChatOllama với timeout httpx THẬT cho rag-api (dùng chung ingest + app.py).
+
+    langchain-ollama 0.3.x KHÔNG có field `request_timeout`: kwarg đó bị pydantic bỏ qua
+    im lặng → httpx client chạy với timeout=None (vô hạn), một lời gọi treo sẽ chiếm
+    slot Ollama duy nhất mãi mãi. Timeout phải đi qua `client_kwargs={"timeout": ...}`
+    (chuyển thẳng vào httpx.Client bên trong ollama.Client). Dict `client_kwargs` tạo MỚI
+    mỗi lần vì ChatOllama ghi thêm header vào dict này.
+    """
+    timeout = OLLAMA_REQUEST_TIMEOUT if OLLAMA_REQUEST_TIMEOUT > 0 else None
+    return ChatOllama(
+        model=model,
+        base_url=OLLAMA_BASE_URL,
+        temperature=temperature,
+        client_kwargs={"timeout": timeout},
+    )
+
+_graph_module: ModuleType | None = None
 if GRAPH_ENABLED:
     try:
-        import graph as _graph_module  # type: ignore[import-not-found]
+        # import_module (thay vì `import graph as ...`) để biến giữ kiểu ModuleType | None
+        # nhất quán cho mypy; hành vi y hệt — lỗi import (thiếu neo4j...) vẫn rơi vào except.
+        _graph_module = importlib.import_module("graph")
     except Exception as _graph_import_err:
         logger.warning(
             "Neo4j graph module unavailable, running Qdrant-only: %s", _graph_import_err)
@@ -425,7 +459,7 @@ def _extract_entities_for_document(doc_text: str, llm: ChatOllama) -> list[dict]
         f"Text:\n{doc_text[:2000]}"
     )
     try:
-        content = llm.invoke(prompt).content.strip()
+        content = str(llm.invoke(prompt).content).strip()
         start = content.find("[")
         end = content.rfind("]") + 1
         if 0 <= start < end:
@@ -435,15 +469,9 @@ def _extract_entities_for_document(doc_text: str, llm: ChatOllama) -> list[dict]
     return []
 
 
-def get_embeddings() -> OllamaEmbeddings:
-    """Trả về instance OllamaEmbeddings dùng *EMBEDDING_MODEL* hiện tại."""
-    return OllamaEmbeddings(
-        model=EMBEDDING_MODEL,
-        base_url=OLLAMA_BASE_URL,
-    )
-
-
-# A1: timeout cho lần embed đồng bộ (query path). Lấy theo RAG_TIMEOUT nếu có.
+# Timeout (giây) httpx cho MỌI lần gọi Ollama /api/embed của rag-api: embed câu hỏi
+# (embed_texts, dùng bởi /ask và /retrieve) lẫn từng batch lúc ingest
+# (_run_async_pipeline). Mặc định khớp `${RAG_TIMEOUT:-600}` trong docker-compose.yml.
 _EMBED_HTTP_TIMEOUT: float = float(os.environ.get("RAG_TIMEOUT", "600"))
 
 
@@ -464,8 +492,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         return resp.json()["embeddings"]
 
 
-# R2: số lần retry khi embed một batch lúc ingest thất bại (OOM/transient HTTP).
-_INGEST_EMBED_RETRIES: int = int(os.environ.get("INGEST_EMBED_RETRIES", "3"))
+# R2: số lần THỬ (gồm lần đầu) khi embed một batch lúc ingest (OOM/transient HTTP).
+# Mặc định khớp `${INGEST_EMBED_RETRIES:-3}` trong docker-compose.yml; kẹp tối thiểu 1
+# — giá trị 0 trước đây làm vòng lặp không chạy lần nào và batch lỗi vì vectors=None.
+_INGEST_EMBED_RETRIES: int = max(1, int(os.environ.get("INGEST_EMBED_RETRIES", "3")))
 
 
 async def _embed_and_upsert_batch_async(
@@ -505,6 +535,7 @@ async def _embed_and_upsert_batch_async(
                     batch_no, total_batches, _attempt, _INGEST_EMBED_RETRIES, _wait, exc,
                 )
                 await asyncio.sleep(_wait)
+        assert vectors is not None  # vòng lặp trên hoặc gán vectors hoặc raise
 
         _now = datetime.now(timezone.utc).isoformat()
         points = [
@@ -564,9 +595,10 @@ def _delete_stale_points(client: QdrantClient, collection_name: str, keep_ids: s
         if offset is None:
             break
     for start in range(0, len(stale), _STALE_PAGE_SIZE):
+        page: list[ExtendedPointId] = [*stale[start: start + _STALE_PAGE_SIZE]]
         client.delete(
             collection_name=collection_name,
-            points_selector=PointIdsList(points=stale[start: start + _STALE_PAGE_SIZE]),
+            points_selector=PointIdsList(points=page),
             wait=True,
         )
     return stale
@@ -591,7 +623,8 @@ async def _run_async_pipeline(
     Trả về (cặp (chunk, point_id) đã upsert, số point trong collection, ID point cũ đã
     xóa — None nếu KHÔNG chạy bước dọn: reset=True hoặc có batch lỗi).
     """
-    timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+    # read = RAG_TIMEOUT (trước đây hardcode 600 nên RAG_TIMEOUT không có tác dụng lúc ingest).
+    timeout = httpx.Timeout(connect=10.0, read=_EMBED_HTTP_TIMEOUT, write=60.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as http_client:
         # Phát hiện kích thước vector từ model embedding
         sample_resp = await http_client.post(
@@ -631,14 +664,16 @@ async def _run_async_pipeline(
     # R1: một batch lỗi KHÔNG làm hỏng cả project ingest. Bỏ qua batch lỗi và ghi
     # log số batch thất bại; các batch thành công vẫn được upsert. count phản ánh
     # đúng số point thực tế đã vào Qdrant (partial, thay vì mất sạch như asyncio.gather mặc định).
-    failed = [r for r in results if isinstance(r, Exception)]
+    # BaseException (không chỉ Exception): gather(return_exceptions=True) trả cả
+    # CancelledError — trước đây nó lọt vào nhánh "thành công" và bị iterate.
+    failed = [r for r in results if isinstance(r, BaseException)]
     if failed:
         logger.error(
             "Ingest project=%s: %d/%d batch thất bại (đã bỏ qua, phần còn lại vẫn upsert). Lỗi đầu tiên: %s",
             project, len(failed), len(tasks), failed[0],
         )
     all_pairs: list[tuple] = [
-        pair for r in results if not isinstance(r, Exception) for pair in r
+        pair for r in results if not isinstance(r, BaseException) for pair in r
     ]
 
     # F11: upsert không bao giờ xóa point của chunk đã sửa/file đã xóa → dọn sau khi
@@ -824,8 +859,9 @@ def _ingest_project(project: str, reset: bool = False) -> dict:
             if GRAPH_ENTITY_EXTRACTION and CHAT_MODEL:
                 logger.info(
                     "Entity extraction enabled for project '%s'", project)
-                llm = ChatOllama(model=CHAT_MODEL,
-                                 base_url=OLLAMA_BASE_URL, temperature=0)
+                # Timeout thật qua client_kwargs (xem make_chat_model) — trước đây không
+                # có timeout nên một lời gọi treo làm /ingest treo vô hạn.
+                llm = make_chat_model(CHAT_MODEL, temperature=0)
                 # Mỗi Document gọi LLM một lần (không phải mỗi Chunk) — nhanh hơn nhiều
                 doc_pairs: dict[str, list[tuple]] = {}
                 for chunk, pid in all_pairs:

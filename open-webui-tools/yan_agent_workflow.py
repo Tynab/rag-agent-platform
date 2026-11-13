@@ -79,6 +79,15 @@ import time
 import requests
 from pydantic import BaseModel, Field
 
+
+def _http_error_parts(exc: requests.exceptions.HTTPError) -> tuple[int | None, str]:
+    """(status_code, body) của HTTPError. `exc.response` có thể là None (HTTPError raise
+    tay không kèm response) → trả (None, str(exc)) thay vì AttributeError."""
+    resp = exc.response
+    if resp is None:
+        return None, str(exc)
+    return resp.status_code, resp.text
+
 # Danh sách role hợp lệ theo thứ tự thực thi chuẩn của SDLC pipeline.
 # Phải khớp chính xác với WORKFLOW_STEPS trong agent-api/agents.py.
 _VALID_ROLES = [
@@ -241,7 +250,8 @@ class Tools:
         except requests.exceptions.ConnectionError as exc:
             return self._handle_connection_error(exc)
         except requests.exceptions.HTTPError as exc:
-            return f"❌ agent-api lỗi HTTP {exc.response.status_code}: {exc.response.text}"
+            code, body = _http_error_parts(exc)
+            return f"❌ agent-api lỗi HTTP {code}: {body}"
         except Exception as exc:
             return f"❌ Lỗi khi submit workflow: {exc}"
 
@@ -372,7 +382,8 @@ class Tools:
                 "Tăng timeout trong Valves hoặc dùng run_sdlc_workflow cho async."
             )
         except requests.exceptions.HTTPError as exc:
-            return f"❌ agent-api lỗi HTTP {exc.response.status_code}: {exc.response.text}"
+            code, body = _http_error_parts(exc)
+            return f"❌ agent-api lỗi HTTP {code}: {body}"
         except Exception as exc:
             return f"❌ Lỗi: {exc}"
 
@@ -410,9 +421,10 @@ class Tools:
         except requests.exceptions.ConnectionError as exc:
             return self._handle_connection_error(exc)
         except requests.exceptions.HTTPError as exc:
-            if exc.response.status_code == 404:
+            code, body = _http_error_parts(exc)
+            if code == 404:
                 return f"❌ Workflow `{workflow_id}` không tìm thấy. ID có thể đã hết hạn."
-            return f"❌ agent-api lỗi HTTP {exc.response.status_code}: {exc.response.text}"
+            return f"❌ agent-api lỗi HTTP {code}: {body}"
         except Exception as exc:
             return f"❌ Lỗi: {exc}"
 

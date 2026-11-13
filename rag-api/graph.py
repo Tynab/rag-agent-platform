@@ -402,8 +402,8 @@ def get_graph_stats() -> dict:
         with driver.session(database=NEO4J_DATABASE) as session:
             counts = {}
             for label in ("Project", "Document", "Chunk", "Entity"):
-                res = session.run(f"MATCH (n:{label}) RETURN count(n) AS c")
-                counts[label.lower() + "s"] = res.single()["c"]
+                record = session.run(f"MATCH (n:{label}) RETURN count(n) AS c").single()
+                counts[label.lower() + "s"] = record["c"] if record is not None else 0
             return counts
     except Exception as exc:
         logger.warning("Graph stats failed: %s", exc)

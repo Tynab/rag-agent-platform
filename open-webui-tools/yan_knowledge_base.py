@@ -56,6 +56,15 @@ import requests
 from pydantic import BaseModel, Field
 
 
+def _http_error_parts(exc: requests.exceptions.HTTPError) -> tuple[int | None, str]:
+    """(status_code, body) của HTTPError. `exc.response` có thể là None (HTTPError raise
+    tay không kèm response) → trả (None, str(exc)) thay vì AttributeError."""
+    resp = exc.response
+    if resp is None:
+        return None, str(exc)
+    return resp.status_code, resp.text
+
+
 class Tools:
     class Valves(BaseModel):
         rag_api_url: str = Field(
@@ -131,7 +140,8 @@ class Tools:
         except requests.exceptions.Timeout:
             return f"❌ rag-api timeout sau {self.valves.timeout}s. Thử lại hoặc tăng timeout trong Valves."
         except requests.exceptions.HTTPError as exc:
-            return f"❌ rag-api trả lỗi HTTP {exc.response.status_code}: {exc.response.text}"
+            code, body = _http_error_parts(exc)
+            return f"❌ rag-api trả lỗi HTTP {code}: {body}"
         except Exception as exc:
             return f"❌ Lỗi không xác định: {exc}"
 
@@ -139,13 +149,9 @@ class Tools:
         sources = data.get("sources", [])
 
         if sources:
-            seen: set = set()
-            unique_files = [
-                s["source_file"]
-                for s in sources
-                # type: ignore[func-returns-value]
-                if s.get("source_file") and not (s["source_file"] in seen or seen.add(s["source_file"]))
-            ]
+            # dict.fromkeys: khử trùng lặp nhưng giữ thứ tự xuất hiện (thay cho mẹo
+            # `seen.add(...)` trong list comprehension — set.add trả None).
+            unique_files = list(dict.fromkeys(s["source_file"] for s in sources if s.get("source_file")))
             if unique_files:
                 answer += "\n\n---\n**Nguồn:** " + " · ".join(unique_files)
             # Hiển thị module/doc_type nếu có để người dùng biết context đến từ đâu

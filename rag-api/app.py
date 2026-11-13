@@ -14,7 +14,7 @@ Danh sách endpoint
 ------------------
 GET  /health
     Trả về trạng thái hoạt động: URL Qdrant, URL Ollama, tên embedding model,
-    tên chat model, giá trị RAG_TOP_K và trạng thái kết nối Neo4j.
+    tên chat model, giá trị RAG_TOP_K, OLLAMA_REQUEST_TIMEOUT và trạng thái kết nối Neo4j.
 
 GET  /projects
     Liệt kê tất cả project trong RAW_DATA_DIR, tên Qdrant collection tương ứng,
@@ -81,20 +81,24 @@ song song), rag-api tự retry tối đa _EMBED_MAX_RETRIES lần với delay ng
 trước khi báo lỗi. Từ khóa OOM được phát hiện qua _OOM_KEYWORDS.
 """
 
+import importlib
 import logging
 import os
 import time
+from types import ModuleType
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from ingest import (
     GRAPH_ENABLED,
+    OLLAMA_REQUEST_TIMEOUT,
     RAW_DATA_DIR,
     InvalidProjectError,
     embed_texts,
     get_collection_name,
     get_projects,
     ingest,
+    make_chat_model,
     validate_project_name,
 )
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -131,10 +135,10 @@ logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 logger = logging.getLogger("rag-api")
 
 # ── Import module graph tùy chọn — giảm cấp nhẹ nhàng nếu Neo4j không khả dụng ──────
-_graph_module = None
+_graph_module: ModuleType | None = None
 if GRAPH_ENABLED:
     try:
-        import graph as _graph_module  # type: ignore[import-not-found]
+        _graph_module = importlib.import_module("graph")
     except Exception as _graph_import_err:
         logger.warning("Graph module failed to load: %s", _graph_import_err)
 
@@ -144,10 +148,12 @@ COLLECTION_NAME = _require_env("COLLECTION_NAME")
 EMBEDDING_MODEL = _require_env("EMBEDDING_MODEL")
 CHAT_MODEL = _require_env("CHAT_MODEL")
 RAG_TOP_K = int(_require_env("RAG_TOP_K"))
-# Timeout (giây) cho mỗi lần gọi CHAT_MODEL trong /ask. F10: agent-api không còn gọi
-# /ask (dùng /retrieve, không sinh LLM) nên giá trị này chỉ cần nhỏ hơn timeout phía
-# client của /ask (Valve timeout của Open WebUI tool).
-OLLAMA_REQUEST_TIMEOUT: float = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "600"))
+# OLLAMA_REQUEST_TIMEOUT (timeout mỗi lần gọi CHAT_MODEL trong /ask) đọc ở ingest.py và
+# import ở trên — một nguồn cho cả /ask lẫn entity extraction. F10: agent-api không gọi
+# /ask (dùng /retrieve, không sinh LLM); client duy nhất của /ask là Open WebUI tool
+# yan_knowledge_base, nên Valve `timeout` của tool phải >= giá trị này (+ thời gian
+# embed/truy hồi). Client bỏ cuộc sớm KHÔNG hủy generation: Ollama vẫn sinh tiếp và
+# chiếm slot duy nhất (OLLAMA_MAX_LOADED_MODELS=1) tới khi xong.
 
 app = FastAPI(title="rag-agent-platform - API RAG cục bộ", version="1.0.0")
 
@@ -227,15 +233,10 @@ def get_chat_model() -> ChatOllama:
     """
     global _llm
     if _llm is None:
-        _llm = ChatOllama(
-            model=CHAT_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0.1,
-            request_timeout=OLLAMA_REQUEST_TIMEOUT,
-            # R9: ép timeout xuống httpx client của ollama để chắc chắn được áp dụng
-            # (request_timeout có thể bị bỏ qua tùy phiên bản langchain-ollama).
-            client_kwargs={"timeout": OLLAMA_REQUEST_TIMEOUT},
-        )
+        # R9: timeout OLLAMA_REQUEST_TIMEOUT đi qua client_kwargs (httpx) trong
+        # make_chat_model — langchain-ollama 0.3.x không có field request_timeout
+        # (kwarg đó bị bỏ qua im lặng → timeout vô hạn).
+        _llm = make_chat_model(CHAT_MODEL, temperature=0.1)
     return _llm
 
 
@@ -273,6 +274,9 @@ def health() -> dict[str, Any]:
         "embedding_model": EMBEDDING_MODEL,
         "chat_model": CHAT_MODEL,
         "rag_top_k": RAG_TOP_K,
+        # Timeout (giây) mỗi lần gọi CHAT_MODEL — để căn Valve `timeout` của Open WebUI
+        # tool yan_knowledge_base (phải >= giá trị này).
+        "ollama_request_timeout": OLLAMA_REQUEST_TIMEOUT,
         "graph": graph_info,
     }
 
@@ -495,7 +499,7 @@ def _retrieve_context(req: AskRequest, op: str) -> tuple[str, list[SourceItem]]:
 
         # Thêm context từ graph traversal (nếu có) sau context tìm kiếm vector
         if graph_extra:
-            graph_blocks = []
+            graph_blocks: list[str] = []
             for g in graph_extra:
                 idx = len(context_blocks) + len(graph_blocks) + 1
                 graph_blocks.append(
