@@ -164,6 +164,34 @@ def test_format_tl_task_lines_truncates_text_not_list():
     assert len(out) <= workflow._TL_TASKS_PROMPT_CHARS
 
 
+def test_format_tl_task_lines_does_not_cut_when_board_fits():
+    # Board nhỏ có task rất dài: vừa budget → gửi nguyên văn (không có trần độ rộng).
+    long_task = "Implement order export " + "with filters and pagination " * 10
+    assert len(long_task) > 250
+    tasks = [{"task": "Bootstrap service"}, {"task": long_task}, {"task": "Health check"}]
+    assert workflow._format_tl_task_lines(tasks).splitlines()[1] == f"  - {long_task.strip()}"
+
+    # 40 task lệch độ dài: task ngắn nhường ngân sách → task 150 ký tự vẫn nguyên văn.
+    mixed = [{"task": f"Short task {i:02d}"} for i in range(36)]
+    longs = [f"Long task {i} " + "covering several keywords " * 5 for i in range(4)]
+    mixed += [{"task": t} for t in longs]
+    out = workflow._format_tl_task_lines(mixed)
+    assert "…" not in out
+    for t in longs:
+        assert f"  - {t.strip()}" in out.splitlines()
+    assert len(out) <= workflow._TL_TASKS_PROMPT_CHARS
+
+
+def test_format_tl_task_lines_cuts_only_the_longest_tasks():
+    short = [{"task": f"Short task {i:02d}"} for i in range(30)]
+    huge = [{"task": f"Huge task {i} " + "x" * 2_000} for i in range(3)]
+    out = workflow._format_tl_task_lines(short + huge)
+    lines = out.splitlines()
+    assert lines[:30] == [f"  - Short task {i:02d}" for i in range(30)]
+    assert all(ln.endswith("…") and len(ln) > 200 for ln in lines[30:])
+    assert len(out) <= workflow._TL_TASKS_PROMPT_CHARS
+
+
 def test_format_tl_task_lines_pathological_board_stays_bounded():
     tasks = [{"task": f"Task number {i} " + "x" * 80} for i in range(1_000)]
     out = workflow._format_tl_task_lines(tasks)

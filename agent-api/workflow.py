@@ -621,11 +621,35 @@ def _extract_tl_tasks(role: str, context: str) -> list[dict]:
 # khi CODING_PLANNER_MODEL là reasoning model) → prompt còn ~4.000 token; 3.000 ký tự
 # task ≈ 800–1.000 token, cộng phần còn lại của prompt (~3.500 ký tự) vẫn dư.
 _TL_TASKS_PROMPT_CHARS = 3_000
-# Mỗi task giữ tối thiểu / tối đa bấy nhiêu ký tự. Coverage (_find_uncovered_tasks)
-# khớp từ khóa của TOÀN BỘ chữ task với filename + description planner trả về → cắt
-# quá ngắn khiến planner không thấy từ khóa và task bị coi là chưa cover.
+# Độ rộng sàn khi buộc phải cắt chữ task. Coverage (_find_uncovered_tasks) khớp từ
+# khóa của TOÀN BỘ chữ task với filename + description planner trả về → cắt quá ngắn
+# khiến planner không thấy từ khóa và task bị coi là chưa cover.
 _TL_TASK_MIN_CHARS = 40
-_TL_TASK_MAX_CHARS = 200
+
+
+def _tl_task_width(texts: list[str], budget: int, overhead: int) -> int:
+    """Độ rộng lớn nhất W sao cho Σ min(len(task), W) + overhead mỗi dòng <= *budget*.
+
+    Chỉ task DÀI HƠN W bị cắt — task ngắn giữ nguyên, phần ngân sách chúng không dùng
+    nhường cho task dài. Không cần cắt → trả về độ dài task dài nhất. Không W nào vừa
+    → _TL_TASK_MIN_CHARS (danh sách có thể vượt budget; xem _format_tl_task_lines).
+    """
+    def total(width: int) -> int:
+        return sum(min(len(t), width) + overhead for t in texts)
+
+    longest = max(len(t) for t in texts)
+    if total(longest) <= budget:
+        return longest
+    lo, hi = _TL_TASK_MIN_CHARS, longest      # tìm nhị phân W lớn nhất còn vừa budget
+    if total(lo) > budget:
+        return lo
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if total(mid) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def _format_tl_task_lines(
@@ -633,10 +657,10 @@ def _format_tl_task_lines(
 ) -> str:
     """Định dạng TOÀN BỘ *tasks* thành danh sách bullet vừa ngân sách *budget* ký tự.
 
-    Cắt CHỮ của từng task (độ rộng chia đều theo số task, kẹp trong
-    [_TL_TASK_MIN_CHARS, _TL_TASK_MAX_CHARS], đánh dấu "…") thay vì cắt DANH SÁCH:
-    tl_tasks[:15] cũ làm board > 15 task luôn "chưa hoàn thành" vì checklist và
-    follow-up đối chiếu với mọi task nhưng planner chỉ thấy 15 task đầu.
+    Cắt CHỮ của task thay vì cắt DANH SÁCH: tl_tasks[:15] cũ làm board > 15 task luôn
+    "chưa hoàn thành" vì checklist và follow-up đối chiếu với mọi task nhưng planner
+    chỉ thấy 15 task đầu. Danh sách vừa budget → giữ nguyên mọi task; không vừa → chỉ
+    cắt các task dài nhất về cùng một độ rộng (_tl_task_width, đánh dấu "…").
 
     Board quá lớn (độ rộng chạm sàn _TL_TASK_MIN_CHARS) có thể vượt *budget*; chỉ khi
     vượt gấp đôi — vài trăm task, ngoài khả năng của một lần plan — mới bỏ các task
@@ -644,12 +668,11 @@ def _format_tl_task_lines(
     """
     if not tasks:
         return ""
-    width = budget // len(tasks) - len(bullet) - 1
-    width = max(_TL_TASK_MIN_CHARS, min(_TL_TASK_MAX_CHARS, width))
+    texts = [" ".join(str(task.get("task", "")).split()) for task in tasks]
+    width = _tl_task_width(texts, budget, len(bullet) + 1)
     lines: list[str] = []
     used = 0
-    for i, task in enumerate(tasks):
-        text = " ".join(str(task.get("task", "")).split())
+    for i, text in enumerate(texts):
         if len(text) > width:
             text = text[: width - 1].rstrip() + "…"
         line = bullet + text
