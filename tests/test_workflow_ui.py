@@ -297,19 +297,23 @@ function makeEl(id) {
   return el;
 }
 
-const els = {}, listeners = {};
+const els = {}, listeners = {}, toasts = [];
 const document = {
   hidden: false,
   getElementById(id) { return els[id] || (els[id] = makeEl(id)); },
   createElement() { return makeEl(''); },
   addEventListener(type, fn) { listeners[type] = fn; },
-  body: makeEl('body'), head: makeEl('head'),
+  body: Object.assign(makeEl('body'), { appendChild(c) { toasts.push(c); return c; } }),
+  head: makeEl('head'),
 };
 
 const timers = [];
 let tid = 0;
 const queue = [...(input.responses || [])];
 const fetchLog = [];
+// {"defer": tên, "then": response}: request treo tới thao tác ["resolve", tên]. Như fetch
+// thật, abort() của AbortController làm nó reject AbortError ngay — trừ khi "ignoreAbort".
+const deferred = {};
 let confirmAnswer = true;
 function resp(r) {
   return { status: r.status, ok: r.status >= 200 && r.status < 300, statusText: r.statusText || '',
@@ -327,9 +331,20 @@ const ctx = {
   async fetch(url, opts = {}) {
     fetchLog.push((opts.method || 'GET') + ' ' + url);
     if (url.endsWith('/artifacts')) return resp({ status: 200, body: { artifacts: {} } });
+    if (url === '/workflows') return resp({ status: 200, body: { workflows: [] } });
     const r = url.endsWith('/cancel') ? input.cancel : queue.shift();
     if (!r) throw new Error('kịch bản hết response cho ' + url);
     if (r.network) throw new TypeError('Failed to fetch');
+    if (r.defer) {
+      return new Promise((resolve, reject) => {
+        deferred[r.defer] = () => resolve(resp(r.then));
+        if (opts.signal && !r.ignoreAbort) {
+          opts.signal.addEventListener('abort', () => {
+            const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+          });
+        }
+      });
+    }
     return resp(r);
   },
 };
@@ -345,6 +360,8 @@ function snap() {
   const stepEls = run('_stepEls'), tabEls = run('_tabEls');
   return {
     view: g('wf-view').style.display, empty: g('empty-state').style.display,
+    loading: g('wf-view').classList.contains('wf-loading'),
+    project: g('meta-project').textContent,
     errBox: g('err-box').style.display, errText: g('err-box').textContent,
     banner: g('conn-banner').style.display, bannerText: g('conn-banner-text').textContent,
     pill: g('status-pill').className, label: g('status-label').textContent,
@@ -360,6 +377,7 @@ function snap() {
     tabs: tabEls && tabEls.map(t => ({ cls: t.btn.className, icon: t.icon.textContent })),
     body: g('tab-body').innerHTML,
     fetches: fetchLog.length,
+    toasts: toasts.map(t => t.textContent),
   };
 }
 
@@ -380,6 +398,8 @@ function snap() {
     else if (op === 'confirm') confirmAnswer = arg;
     else if (op === 'cancel') { ctx.requestCancel(); await flush(); }
     else if (op === 'retry') { ctx.pollNow(); await flush(); }   // nút "Thử lại ngay"
+    else if (op === 'resolve') { deferred[arg](); await flush(); }
+    else if (op === 'recent') { ctx.showRecent(); await flush(); }
     else if (op === 'tab') ctx.selectTab(arg);
     else if (op === 'eval') out.push(run(arg));
     else if (op === 'snap') out.push(snap());
@@ -618,3 +638,77 @@ def test_hidden_tab_pauses_polling_and_resumes_immediately():
     hidden, shown = res["out"]
     assert hidden["fetches"] == 1 and hidden["timers"] == []   # bỏ lượt, không đặt timer mới
     assert shown["fetches"] == 2 and shown["timers"] == [2500]  # hiện lại → poll ngay
+
+
+def test_hidden_tab_first_load_failure_waits_for_visibility():
+    """Tab nền chưa từng tải được: lượt đầu vẫn chạy, lỗi thì chờ tab hiện lại (không retry nền)."""
+    res = _run_sm(
+        [["hide"], ["track", "wf-1"], ["tick"], ["snap"], ["show"], ["snap"]],
+        [{"status": 502}, _ok(_RUNNING)],
+    )
+    hidden, shown = res["out"]
+    assert hidden["fetches"] == 1 and hidden["timers"] == [] and hidden["loading"]
+    assert shown["fetches"] == 2 and not shown["loading"] and shown["banner"] == "none"
+
+
+# ── Chốt chặn thế hệ (pollGen / AbortController / single-flight) với request đang bay ──
+
+_A = _rec("running", project="A", completed_steps=["ba"], step_outputs={"ba": "A out"})
+_B = _rec("running", project="B", workflow_id="wf-2", completed_steps=["ba", "pm"],
+          step_outputs={"ba": "B out", "pm": "B pm"})
+
+
+def test_poll_now_while_in_flight_polls_again_right_after():
+    res = _run_sm(
+        [["track", "wf-1"], ["retry"], ["snap"], ["resolve", "g1"], ["snap"]],
+        [{"defer": "g1", "then": _ok(_A)}],
+    )
+    flying, done = res["out"]
+    assert flying["fetches"] == 1, "pollNow lúc đang bay không được mở request thứ hai"
+    assert done["timers"] == [0], "response về → poll lại ngay (pollAgain), không chờ 2.5s"
+
+
+@pytest.mark.parametrize("ignore_abort", [False, True], ids=["aborted", "late-response"])
+def test_switching_workflow_ignores_previous_in_flight_response(ignore_abort):
+    res = _run_sm(
+        [["track", "wf-1"], ["track", "wf-2"], ["resolve", "a"], ["snap"]],
+        [{"defer": "a", "then": _ok(_A), "ignoreAbort": ignore_abort}, _ok(_B)],
+    )
+    s = res["out"][0]
+    assert s["project"] == "B" and s["timers"] == [2500], "chỉ một vòng poll, dữ liệu của B"
+    assert not s["loading"]
+
+
+def test_new_workflow_failed_first_load_never_shows_previous_workflow():
+    res = _run_sm(
+        [["track", "wf-1"], ["track", "wf-2"], ["snap"], ["tick"], ["snap"]],
+        [_ok(_A), {"status": 502}, _ok(_B)],
+    )
+    failed, ok = res["out"]
+    # Khung build-once còn dữ liệu của A → phải bị ẩn (wf-loading) tới lần render đầu của B.
+    assert failed["loading"] and failed["view"] == "block"
+    assert "chưa tải được" in failed["bannerText"] and "giữ dữ liệu" not in failed["bannerText"]
+    assert not ok["loading"] and ok["project"] == "B" and ok["banner"] == "none"
+
+
+def test_recent_during_backoff_stops_polling_and_clears_banner():
+    res = _run_sm(
+        [["track", "wf-1"], ["tick"], ["snap"], ["recent"], ["snap"]],
+        [_ok(_A), {"status": 502}],
+    )
+    backoff, recent = res["out"]
+    assert backoff["banner"] == "" and backoff["timers"] == [2500]
+    assert recent["timers"] == [] and recent["banner"] == "none" and recent["poll"] == "none"
+
+
+def test_cancel_reply_after_switching_workflow_does_not_leak():
+    res = _run_sm(
+        [["track", "wf-1"], ["cancel"], ["track", "wf-2"], ["resolve", "c"], ["snap"]],
+        [_ok(_A), _ok(_B)],
+        cancel={"defer": "c", "then": {"status": 200, "body": {"workflow_id": "wf-1", "status": "running"}}},
+    )
+    s = res["out"][0]
+    assert s["project"] == "B" and s["label"] == "Running"
+    assert s["cancel"] == {"display": "", "disabled": False, "text": "✕ Hủy workflow"}
+    assert s["note"]["display"] == "none" and s["toasts"] == []
+    assert res["fetchLog"].count("GET /workflow/wf-2") == 1   # không poll thêm vì hủy của wf-1

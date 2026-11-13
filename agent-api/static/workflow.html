@@ -197,6 +197,14 @@
 
     /* ── Workflow view ───────────────────────────────────────── */
     .wf-view { display: none; }
+    /* trackWorkflow() → lần render thành công đầu tiên: ẩn các khung build-once (chúng còn
+       giữ dữ liệu của workflow theo dõi trước) — nếu không, lỗi mạng ở lần tải đầu sẽ để
+       lại badge/bước/output của workflow cũ dưới ID mới. */
+    .wf-view .wf-load-state { display: none; }
+    .wf-view.wf-loading .wf-load-state { display: flex; }
+    .wf-view.wf-loading .status-bar,
+    .wf-view.wf-loading .progress-card,
+    .wf-view.wf-loading .content-card { display: none; }
 
     /* Status bar */
     .status-bar {
@@ -760,6 +768,12 @@
       <button class="btn btn-secondary btn-sm" onclick="pollNow()">Thử lại ngay</button>
     </div>
 
+    <!-- Chưa tải được dữ liệu của workflow đang theo dõi (class wf-loading trên #wf-view) -->
+    <div class="state-box wf-load-state">
+      <div class="spinner"></div>
+      <p>Đang tải workflow…</p>
+    </div>
+
     <!-- Status bar — khung tĩnh, renderStatusBar() chỉ cập nhật class/text tại chỗ -->
     <div class="status-bar" id="status-bar">
       <div id="status-badge">
@@ -895,6 +909,7 @@ let pollAbort    = null;   // AbortController cho các request của thế hệ 
 let pollInFlight = false;  // GET /workflow/{id} của thế hệ hiện tại đang bay (pollNow single-flight)
 let pollAgain    = false;  // pollNow() gọi lúc đang bay → poll lại ngay khi response về
 let pollPaused   = false;  // đã bỏ lượt poll vì tab ẩn → visibilitychange poll lại ngay
+let pollTried    = false;  // thế hệ hiện tại đã gửi ít nhất một GET (lượt đầu chạy cả khi tab ẩn)
 let pollFailures = 0;      // số lần poll lỗi tạm thời liên tiếp (5xx / mạng) → backoff
 let cancelInFlight  = false; // POST /workflow/{id}/cancel đang bay → nút hủy bị khóa
 let cancelRequested = false; // server đã nhận yêu cầu hủy (200) — chờ poll xác nhận
@@ -945,6 +960,7 @@ function trackWorkflow(id) {
 
   pushUrl(id);
   showView('wf');
+  document.getElementById('wf-view').classList.add('wf-loading');
   document.getElementById('copy-btn').style.display = 'inline-flex';
   fetchAndUpdate();
 }
@@ -966,9 +982,10 @@ async function fetchAndUpdate() {
   const stale = () => gen !== pollGen;
   pollTimer = null;   // timer (nếu có) vừa bắn xong
   // Tab đang ẩn → bỏ lượt này (không tốn request khi để tab nền hàng giờ); handler
-  // visibilitychange gọi pollNow() ngay khi tab hiện lại. Lượt tải ĐẦU vẫn chạy để tab
-  // mở ở nền có sẵn dữ liệu.
-  if (document.hidden && lastData) { pollPaused = true; return; }
+  // visibilitychange gọi pollNow() ngay khi tab hiện lại. Lượt ĐẦU của mỗi lần theo dõi
+  // vẫn chạy (tab mở ở nền có sẵn dữ liệu); nếu lượt đó lỗi thì cũng chờ tab hiện lại.
+  if (document.hidden && pollTried) { pollPaused = true; return; }
+  pollTried    = true;
   pollPaused   = false;
   pollInFlight = true;
   pollAgain    = false;
@@ -1022,6 +1039,7 @@ async function fetchAndUpdate() {
   try {
     renderAll(data);
     document.getElementById('err-box').style.display = 'none';
+    document.getElementById('wf-view').classList.remove('wf-loading');
   } catch (e) {
     console.error('Render workflow lỗi:', e);
     showInlineError(`Lỗi hiển thị: ${e.message}`);
@@ -1062,7 +1080,9 @@ function onPollFailure(e) {
   pollFailures++;
   const delay = pollBackoffMs(pollFailures);
   const why   = e && e.status ? `HTTP ${e.status}` : 'không kết nối được';
-  showConnBanner(`Mất kết nối tới agent-api (${why}) — đang giữ dữ liệu lần cập nhật cuối. `
+  // Chỉ nói "giữ dữ liệu" khi thật sự có dữ liệu của workflow này đang hiển thị.
+  const kept  = lastData ? 'đang giữ dữ liệu lần cập nhật cuối' : 'chưa tải được dữ liệu workflow';
+  showConnBanner(`Mất kết nối tới agent-api (${why}) — ${kept}. `
     + `Thử lại sau ${delay / 1000} giây (lần ${pollFailures}).`);
   setPollIndicator('retry');
   schedulePoll(delay);
@@ -1700,6 +1720,7 @@ function stopAll() {
   pollInFlight = false;
   pollAgain    = false;
   pollPaused   = false;
+  pollTried    = false;
   pollFailures = 0;
   hideConnBanner();
   stopDur();
