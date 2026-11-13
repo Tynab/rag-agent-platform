@@ -11,10 +11,18 @@
   (không CDN); mọi file vendor được tham chiếu phải tồn tại, có LICENSE, khớp phiên bản.
   Thiếu thư viện (file vendor hỏng/bị chặn) → init không ném, output hiện text thô đã esc().
 
-F12 (race khi đổi workflow / poll trùng) cần DOM + fetch thật → kiểm bằng Playwright
-thủ công, không nằm trong pytest.
+- Trạng thái: bước lỗi (output "[LỖI…" / failed_steps) hiện ✗ đỏ + thông báo đầu tab,
+  bước có section "File generation errors" hiện ⚠ (không phải ✗); status "cancelled" là
+  trạng thái kết thúc; nút hủy (POST /workflow/{id}/cancel, 404/409 không xóa view);
+  queue_position khi pending. Poll bền bỉ: chỉ 404 là lỗi cuối cùng, lỗi tạm thời giữ
+  view + banner + backoff 2.5s → 30s, tab ẩn thì tạm dừng. Chạy bằng node với DOM giả,
+  fetch theo kịch bản và setTimeout giả (_SM_RUNNER).
+
+F12 (race khi đổi workflow / poll trùng) và layout/animation thật cần trình duyệt → kiểm
+bằng Playwright thủ công, không nằm trong pytest.
 """
 
+import ast
 import json
 import re
 import shutil
@@ -66,7 +74,7 @@ const LIBS = {
   hljs: { ok: { highlightElement(el) { calls.push(['hl', el.id]); if (el.id === 'bad') throw new Error('x'); } } },
 };
 const ctx = { window: { location: { search: '' } }, URLSearchParams, console: { warn() {} },
-  document: { getElementById: el } };
+  document: { getElementById: el, addEventListener() {} } };
 for (const [name, kind] of Object.entries(input.libs || { marked: 'ok' })) ctx[name] = LIBS[name][kind];
 vm.createContext(ctx);
 vm.runInContext(src, ctx);
@@ -255,3 +263,334 @@ def test_highlight_only_explicit_languages_and_never_throws(with_hljs):
         assert hl == [["sel", 'pre code[class*="language-"]'], ["hl", "a"], ["hl", "bad"], ["hl", "b"]]
     else:
         assert hl == []
+
+
+# ── Trạng thái bước (failed / warn), cancelled, hàng đợi, poll bền bỉ ─────────────
+#
+# Chạy chính mã JS của trang trong node với DOM giả tối thiểu (mỗi id một phần tử cố định,
+# classList thật), fetch theo kịch bản và setTimeout giả (không tự chạy — "tick" mới bắn
+# timer poll). Kịch bản là danh sách thao tác; "snap" chụp trạng thái giao diện.
+
+_SM_RUNNER = r"""
+const fs = require('fs'), vm = require('vm');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const src = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).join('\n');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+
+function makeEl(id) {
+  const cls = new Set();
+  let first = null;
+  const el = {
+    id, style: {}, textContent: '', innerHTML: '', disabled: false, title: '', value: '',
+    dataset: {}, scrollLeft: 0,
+    classList: {
+      toggle(c, on) { if (on === undefined) on = !cls.has(c); if (on) cls.add(c); else cls.delete(c); return on; },
+      add(c) { cls.add(c); }, remove(c) { cls.delete(c); }, contains(c) { return cls.has(c); },
+    },
+    get className() { return [...cls].join(' '); },
+    set className(v) { cls.clear(); String(v).split(/\s+/).filter(Boolean).forEach(c => cls.add(c)); },
+    get firstChild() { return first || (first = makeEl('')); },
+    appendChild(c) { return c; }, remove() {}, setAttribute() {}, addEventListener() {},
+    querySelector() { return makeEl(''); }, querySelectorAll() { return []; },
+    getBoundingClientRect() { return { left: 0, right: 0, width: 0 }; },
+  };
+  return el;
+}
+
+const els = {}, listeners = {};
+const document = {
+  hidden: false,
+  getElementById(id) { return els[id] || (els[id] = makeEl(id)); },
+  createElement() { return makeEl(''); },
+  addEventListener(type, fn) { listeners[type] = fn; },
+  body: makeEl('body'), head: makeEl('head'),
+};
+
+const timers = [];
+let tid = 0;
+const queue = [...(input.responses || [])];
+const fetchLog = [];
+let confirmAnswer = true;
+function resp(r) {
+  return { status: r.status, ok: r.status >= 200 && r.status < 300, statusText: r.statusText || '',
+    json: async () => { if (r.body === undefined) throw new SyntaxError('not json'); return JSON.parse(JSON.stringify(r.body)); } };
+}
+const ctx = {
+  window: { location: { search: '', href: 'http://agent.test/ui', toString() { return this.href; } },
+            history: { pushState() {} }, matchMedia: () => ({ matches: false }) },
+  document, URL, URLSearchParams, AbortController,
+  console: { warn() {}, error() {}, log() {} },
+  setTimeout(fn, ms) { const t = { id: ++tid, fn, ms, done: false }; timers.push(t); return t.id; },
+  clearTimeout(id) { const t = timers.find(x => x.id === id); if (t) t.done = true; },
+  setInterval() { return 0; }, clearInterval() {},
+  confirm() { return confirmAnswer; },
+  async fetch(url, opts = {}) {
+    fetchLog.push((opts.method || 'GET') + ' ' + url);
+    if (url.endsWith('/artifacts')) return resp({ status: 200, body: { artifacts: {} } });
+    const r = url.endsWith('/cancel') ? input.cancel : queue.shift();
+    if (!r) throw new Error('kịch bản hết response cho ' + url);
+    if (r.network) throw new TypeError('Failed to fetch');
+    return resp(r);
+  },
+};
+vm.createContext(ctx);
+vm.runInContext(src, ctx);
+const run = code => vm.runInContext(code, ctx);
+const flush = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };
+const pollFn = run('fetchAndUpdate');
+const pollTimers = () => timers.filter(t => !t.done && t.fn === pollFn);
+
+function snap() {
+  const g = id => document.getElementById(id);
+  const stepEls = run('_stepEls'), tabEls = run('_tabEls');
+  return {
+    view: g('wf-view').style.display, empty: g('empty-state').style.display,
+    errBox: g('err-box').style.display, errText: g('err-box').textContent,
+    banner: g('conn-banner').style.display, bannerText: g('conn-banner-text').textContent,
+    pill: g('status-pill').className, label: g('status-label').textContent,
+    poll: g('poll-indicator').style.display, pollCls: g('poll-indicator').className,
+    pollText: g('poll-text').textContent,
+    cancel: { display: g('cancel-btn').style.display, disabled: g('cancel-btn').disabled,
+              text: g('cancel-btn').textContent },
+    note: { display: g('status-note').style.display, text: g('status-note').textContent },
+    stepsFailed: g('meta-steps-failed').textContent,
+    timers: pollTimers().map(t => t.ms),
+    steps: stepEls && stepEls.map(e => ({ cls: e.node.className, state: e.state,
+      circle: e.circle.innerHTML || e.circle.textContent })),
+    tabs: tabEls && tabEls.map(t => ({ cls: t.btn.className, icon: t.icon.textContent })),
+    body: g('tab-body').innerHTML,
+    fetches: fetchLog.length,
+  };
+}
+
+(async () => {
+  const out = [];
+  for (const [op, arg] of input.script) {
+    if (op === 'track') { ctx.trackWorkflow(arg); await flush(); }
+    else if (op === 'tick') {
+      const t = pollTimers().pop();
+      if (!t) throw new Error('không có timer poll để tick');
+      t.done = true; t.fn(); await flush();
+    }
+    else if (op === 'hide' || op === 'show') {
+      document.hidden = op === 'hide';
+      listeners.visibilitychange();
+      await flush();
+    }
+    else if (op === 'confirm') confirmAnswer = arg;
+    else if (op === 'cancel') { ctx.requestCancel(); await flush(); }
+    else if (op === 'tab') ctx.selectTab(arg);
+    else if (op === 'eval') out.push(run(arg));
+    else if (op === 'snap') out.push(snap());
+    else throw new Error('op lạ: ' + op);
+  }
+  process.stdout.write(JSON.stringify({ out, fetchLog }));
+})().catch(e => { console.error((e && e.stack) || e); process.exit(1); });
+"""
+
+
+def _run_sm(script: list, responses: list | None = None, cancel: dict | None = None) -> dict:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("không có node trên PATH")
+    payload = {"script": script, "responses": responses or [], "cancel": cancel}
+    proc = subprocess.run(
+        [node, "-e", _SM_RUNNER, str(HTML)],
+        input=json.dumps(payload), capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _rec(status: str, **kw) -> dict:
+    rec = {
+        "workflow_id": "wf-1", "status": status, "project": "demo", "user_input": "x",
+        "step_outputs": {}, "completed_steps": [], "failed_steps": [], "error": None,
+        "created_at": "2026-11-13T10:00:00+00:00", "completed_at": None,
+    }
+    rec.update(kw)
+    return rec
+
+
+def _ok(rec: dict) -> dict:
+    return {"status": 200, "body": rec}
+
+
+_RUNNING = _rec("running", completed_steps=["ba"], step_outputs={"ba": "ok"})
+ROLES = ["ba", "pm", "sa", "ta", "designer", "tl", "fe", "mobile", "dba", "be", "da",
+         "tech_lead", "tester", "devsecops", "clarifier"]
+
+
+def _file_gen_errors_header() -> str:
+    """Đọc FILE_GEN_ERRORS_HEADER từ agent-api/workflow.py (không import — tránh dependency)."""
+    src = (ROOT / "agent-api" / "workflow.py").read_text(encoding="utf-8")
+    m = re.search(r"^FILE_GEN_ERRORS_HEADER\s*=\s*(.+)$", src, re.M)
+    assert m, "không thấy FILE_GEN_ERRORS_HEADER trong workflow.py"
+    return ast.literal_eval(m.group(1))
+
+
+def test_cancelled_is_a_terminal_status_with_its_own_badge():
+    html = HTML.read_text(encoding="utf-8")
+    assert re.search(r"cancelled:\s*\{\s*cls:\s*'badge-cancelled'", html)
+    assert ".badge-cancelled" in html
+    assert "cancelled:'⊘'" in html  # icon trong danh sách Recent
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_terminal_status_stops_polling_and_hides_cancel(status):
+    res = _run_sm([["track", "wf-1"], ["snap"]], [_ok(_rec(status, completed_steps=["ba"]))])
+    s = res["out"][0]
+    assert s["timers"] == [], f"{status}: vẫn còn timer poll"
+    assert s["poll"] == "none" and s["cancel"]["display"] == "none"
+    assert s["pill"] == f"badge badge-{status}"
+
+
+def test_step_states_failed_warn_done_with_output_as_source_of_truth():
+    header = _file_gen_errors_header()
+    outs = {r: f"# {r} ok" for r in ROLES[:11]}
+    del outs["sa"]   # failed_steps có 'sa' nhưng không có output → vẫn là failed
+    outs["pm"] = "[LỖI trong pm] Regen làm hỏng — không có trong failed_steps"
+    outs["dba"] = "# DBA đã được regen sửa"   # failed_steps cũ còn 'dba' nhưng output đã tốt
+    outs["fe"] = "### FILE: a.ts\n```ts\nx\n```" + header + "- b.ts: timeout"
+    # Lỗi toàn bộ file: tiền tố [LỖI + CŨNG có section lỗi → phải là failed, không phải warn.
+    outs["be"] = "[LỖI trong be] Không sinh được file nào (2 file lên kế hoạch đều thất bại).\n" + header + "- x"
+    rec = _rec("completed", step_outputs=outs, completed_steps=ROLES[:11],
+               failed_steps=["dba", "be", "sa"])
+    res = _run_sm([["track", "wf-1"], ["snap"],
+                   ["tab", "be"], ["snap"], ["tab", "fe"], ["snap"], ["tab", "ba"], ["snap"],
+                   ["tab", "sa"], ["snap"]],
+                  [_ok(rec)])
+    s = res["out"][0]
+    state = dict(zip(ROLES, (st["state"] for st in s["steps"])))
+    assert state["ba"] == "done" and state["dba"] == "done" and state["da"] == "done"
+    assert state["pm"] == "failed" and state["be"] == "failed" and state["sa"] == "failed"
+    assert state["fe"] == "warn"
+    assert state["tech_lead"] == "todo"
+    steps = dict(zip(ROLES, s["steps"]))
+    assert "icon-x" in steps["be"]["circle"] and "failed" in steps["be"]["cls"].split()
+    assert "done" not in steps["be"]["cls"].split()   # không còn ✓ xanh cho bước lỗi
+    assert "icon-check" in steps["fe"]["circle"] and "warn" in steps["fe"]["cls"].split()
+    tabs = dict(zip(ROLES, s["tabs"]))
+    assert tabs["be"]["icon"] == "✗" and "t-fail" in tabs["be"]["cls"].split()
+    assert tabs["fe"]["icon"] == "⚠" and "t-warn" in tabs["fe"]["cls"].split()
+    assert tabs["ba"]["icon"] == "✓" and "t-done" in tabs["ba"]["cls"].split()
+    assert s["stepsFailed"] == " · ✗ 3 lỗi"
+
+    be, fe, ba, sa = (o["body"] for o in res["out"][1:])
+    assert "step-notice-err" in be and "Bước này thất bại" in be
+    assert be.index("step-notice-err") < be.index('id="sub-output"')   # notice ở đầu tab
+    assert "step-notice-warn" in fe and "step-notice-err" not in fe
+    assert "step-notice" not in ba
+    assert "thất bại" in sa
+
+
+def test_pending_shows_queue_position_and_no_active_step():
+    res = _run_sm(
+        [["track", "wf-1"], ["snap"], ["tick"], ["snap"], ["tick"], ["snap"]],
+        [_ok(_rec("pending", queue_position=2)), _ok(_rec("pending", queue_position=0)),
+         _ok(_rec("pending"))],   # backend cũ: không có queue_position
+    )
+    s2, s0, old = res["out"]
+    assert s2["note"] == {"display": "", "text": "Đang chờ trong hàng đợi (vị trí 2)"}
+    assert "vị trí 2" in s2["body"]
+    assert s0["note"]["text"] == "Đang chờ trong hàng đợi (vị trí 0)"   # 0 không bị coi là "không có"
+    assert "vị trí 0" in s0["body"]
+    assert old["note"]["text"] == "Đang chờ bắt đầu…"
+    for s in (s2, s0, old):
+        assert all(st["state"] == "todo" for st in s["steps"]), "run còn xếp hàng không có bước 'active'"
+        assert s["cancel"] == {"display": "", "disabled": False, "text": "✕ Hủy workflow"}
+        assert s["timers"] == [2500]
+
+
+def test_cancel_running_then_cancel_requested_then_cancelled():
+    requested = {**_RUNNING, "cancel_requested": True}
+    done = _rec("cancelled", completed_steps=["ba", "pm"], step_outputs={"ba": "ok", "pm": "ok"},
+                cancel_requested=True, completed_at="2026-11-13T10:05:00+00:00")
+    res = _run_sm(
+        [["track", "wf-1"], ["confirm", False], ["cancel"], ["snap"],
+         ["confirm", True], ["cancel"], ["tab", "pm"], ["snap"], ["tick"], ["snap"]],
+        [_ok(_RUNNING), _ok(requested), _ok(done)],
+        cancel={"status": 200, "body": {"workflow_id": "wf-1", "status": "running"}},
+    )
+    log = res["fetchLog"]
+    declined, requested_s, done_s = res["out"]
+    assert declined["fetches"] == 1, "confirm bị từ chối vẫn gửi POST?"
+    assert log.count("POST /workflow/wf-1/cancel") == 1
+    # Sau POST: poll lại NGAY (không chờ timer 2.5s) → thấy cancel_requested.
+    assert log[log.index("POST /workflow/wf-1/cancel") + 1] == "GET /workflow/wf-1"
+    assert requested_s["label"] == "Cancelling…"
+    assert requested_s["note"] == {"display": "", "text": "Đang hủy — sẽ dừng sau bước hiện tại"}
+    assert requested_s["cancel"] == {"display": "", "disabled": True, "text": "Đang hủy…"}
+    assert "Đã yêu cầu hủy" in requested_s["body"]   # tab của bước đang chạy
+    assert requested_s["timers"] == [2500]
+    assert done_s["pill"] == "badge badge-cancelled" and done_s["label"] == "Cancelled"
+    assert done_s["timers"] == [] and done_s["cancel"]["display"] == "none"
+    assert done_s["note"]["display"] == "none"
+
+
+def test_cancel_pending_run_is_cancelled_immediately():
+    res = _run_sm(
+        [["track", "wf-1"], ["cancel"], ["snap"]],
+        [_ok(_rec("pending", queue_position=1)), _ok(_rec("cancelled", cancel_requested=True))],
+        cancel={"status": 200, "body": {"workflow_id": "wf-1", "status": "cancelled"}},
+    )
+    s = res["out"][0]
+    assert s["pill"] == "badge badge-cancelled" and s["timers"] == []
+    assert "đã bị hủy" in s["body"]
+
+
+@pytest.mark.parametrize("code", [404, 409, 500])
+def test_cancel_error_keeps_view_and_reenables_button(code):
+    """404/409 của POST /cancel chỉ báo toast + poll lại — không xóa view, không dừng theo dõi."""
+    res = _run_sm([["track", "wf-1"], ["cancel"], ["snap"]], [_ok(_RUNNING), _ok(_RUNNING)],
+                  cancel={"status": code, "body": {"detail": "x"}})
+    s = res["out"][0]
+    assert s["view"] == "block" and s["errBox"] == "none"
+    assert s["cancel"] == {"display": "", "disabled": False, "text": "✕ Hủy workflow"}
+    assert s["timers"] == [2500]
+    assert res["fetchLog"][-1] == "GET /workflow/wf-1"   # đã poll lại để lấy trạng thái thật
+
+
+def test_poll_backoff_sequence():
+    res = _run_sm([["eval", "[1, 2, 3, 4, 5, 6, 9].map(pollBackoffMs)"]])
+    assert res["out"][0] == [2500, 5000, 10000, 20000, 30000, 30000, 30000]
+
+
+def test_transient_errors_keep_view_back_off_and_recover():
+    res = _run_sm(
+        [["track", "wf-1"], ["tick"], ["snap"], ["tick"], ["snap"], ["tick"], ["snap"],
+         ["tick"], ["snap"]],
+        [_ok(_RUNNING), {"status": 502, "statusText": "Bad Gateway"}, {"network": True},
+         {"status": 503, "body": {"detail": "down"}}, _ok(_RUNNING)],
+    )
+    e502, enet, e503, ok = res["out"]
+    for s, ms in ((e502, 2500), (enet, 5000), (e503, 10000)):
+        assert s["view"] == "block" and s["errBox"] == "none", "lỗi tạm thời không được xóa view"
+        assert s["banner"] == "" and s["timers"] == [ms]
+        assert s["pill"] == "badge badge-running"   # dữ liệu lần cuối vẫn hiển thị
+        assert "retry" in s["pollCls"].split() and s["pollText"] == "Mất kết nối…"
+    assert "HTTP 502" in e502["bannerText"] and "không kết nối được" in enet["bannerText"]
+    assert ok["banner"] == "none" and ok["timers"] == [2500]
+    assert "retry" not in ok["pollCls"].split() and ok["pollText"] == "Polling…"
+
+
+def test_404_is_fatal_and_visibility_does_not_resurrect_polling():
+    res = _run_sm(
+        [["track", "wf-1"], ["tick"], ["snap"], ["hide"], ["show"], ["snap"]],
+        [_ok(_RUNNING), {"status": 404, "body": {"detail": "Workflow 'wf-1' không tồn tại"}}],
+    )
+    s, after = res["out"]
+    assert s["view"] == "none" and s["empty"] == "flex" and s["errBox"] == "block"
+    assert "không tồn tại" in s["errText"]
+    assert s["timers"] == [] and s["poll"] == "none" and s["banner"] == "none"
+    assert after["fetches"] == s["fetches"]
+
+
+def test_hidden_tab_pauses_polling_and_resumes_immediately():
+    res = _run_sm(
+        [["track", "wf-1"], ["hide"], ["tick"], ["snap"], ["show"], ["snap"]],
+        [_ok(_RUNNING), _ok(_RUNNING)],
+    )
+    hidden, shown = res["out"]
+    assert hidden["fetches"] == 1 and hidden["timers"] == []   # bỏ lượt, không đặt timer mới
+    assert shown["fetches"] == 2 and shown["timers"] == [2500]  # hiện lại → poll ngay

@@ -108,8 +108,11 @@
     }
     .btn:hover  { opacity: .85; }
     .btn:active { transform: scale(.97); }
+    .btn:disabled, .btn:disabled:hover { opacity: .55; cursor: not-allowed; }
+    .btn:disabled:active { transform: none; }
     .btn-primary   { background: var(--accent); color: #fff; }
     .btn-secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+    .btn-danger    { background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.45); color: var(--err); }
     .btn-sm { padding: 4px 10px; font-size: 11px; }
 
     .poll-indicator {
@@ -128,6 +131,10 @@
       animation: blink 1.2s ease-in-out infinite;
     }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
+    /* Poll lỗi tạm thời (5xx / mất mạng) → chấm chuyển vàng, chữ "Mất kết nối…" (header sticky
+       nên luôn thấy, kể cả khi đang cuộn đọc output dài) */
+    .poll-indicator.retry { color: var(--warn); }
+    .poll-indicator.retry .blink-dot { background: var(--warn); }
 
     /* ── Main layout ─────────────────────────────────────────── */
     .main {
@@ -218,11 +225,33 @@
     .badge-running   { background: rgba(59,130,246,.15);  color: var(--run); }
     .badge-completed { background: rgba(34,197,94,.15);   color: var(--ok); }
     .badge-failed    { background: rgba(239,68,68,.15);   color: var(--err); }
+    .badge-cancelled { background: rgba(139,148,158,.15); color: var(--muted); }
 
     .status-meta { display: flex; gap: 24px; flex-wrap: wrap; flex: 1; }
     .meta-item { display: flex; flex-direction: column; gap: 2px; }
     .meta-item .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
     .meta-item .val { font-size: 13px; font-weight: 600; }
+    .meta-item .meta-failed { color: var(--err); }
+
+    .status-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+    /* Dòng ghi chú trạng thái (vị trí hàng đợi / đang hủy) — chiếm nguyên một hàng của status bar */
+    .status-note { flex: 1 1 100%; font-size: 12px; font-weight: 600; color: var(--warn); }
+
+    /* Banner mất kết nối: giữ dữ liệu lần cập nhật cuối, thử lại với backoff */
+    .conn-banner {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      background: rgba(245,158,11,.08);
+      border: 1px solid rgba(245,158,11,.35);
+      border-radius: var(--radius);
+      padding: 8px 14px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      color: var(--warn);
+    }
+    .conn-banner .cb-text { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
 
     /* ── Progress tracker ────────────────────────────────────── */
     .progress-card {
@@ -290,6 +319,17 @@
       color: var(--run);
       animation: ring-pulse 1.6s ease-in-out infinite;
     }
+    /* Bước lỗi (output "[LỖI …]") — đỏ ✗ thay vì ✓ xanh; bước có file sinh lỗi — ✓ vàng */
+    .step-node.failed .step-circle {
+      background: rgba(239,68,68,.12);
+      border-color: var(--err);
+      color: var(--err);
+    }
+    .step-node.warn .step-circle {
+      background: rgba(245,158,11,.12);
+      border-color: var(--warn);
+      color: var(--warn);
+    }
     .step-node.selected .step-circle {
       box-shadow: 0 0 0 3px rgba(99,102,241,.45);
     }
@@ -318,6 +358,8 @@
     }
     .step-node.done  .step-label { color: var(--ok); }
     .step-node.active .step-label { color: var(--run); }
+    .step-node.failed .step-label { color: var(--err); }
+    .step-node.warn  .step-label { color: var(--warn); }
 
     .step-connector {
       flex: 1;
@@ -370,8 +412,30 @@
     .tab-btn.t-done  { color: var(--ok); }
     .tab-btn.t-run   { color: var(--run); }
     .tab-btn.t-done.active, .tab-btn.t-run.active { color: var(--accent-l); }
+    .tab-btn.t-fail  { color: var(--err); }
+    .tab-btn.t-warn  { color: var(--warn); }
+    .tab-btn.t-fail.active, .tab-btn.t-warn.active { color: var(--accent-l); }
+    /* Icon ✗ / ⚠ giữ màu cả khi tab đang được chọn (chữ tab chuyển màu accent) */
+    .tab-btn.t-fail .tab-icon { color: var(--err); }
+    .tab-btn.t-warn .tab-icon { color: var(--warn); }
 
     .tab-icon { font-size: 13px; }
+
+    /* Thông báo đầu tab-body: bước lỗi (đỏ) / một số file sinh lỗi (vàng) */
+    .step-notice {
+      border: 1px solid;
+      border-radius: var(--radius);
+      padding: 10px 14px;
+      margin-bottom: 18px;
+      font-size: 12.5px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+    .step-notice strong { display: block; font-size: 13px; margin-bottom: 2px; }
+    .step-notice-err  { background: rgba(239,68,68,.08);  border-color: rgba(239,68,68,.35);  color: #fca5a5; }
+    .step-notice-err strong  { color: var(--err); }
+    .step-notice-warn { background: rgba(245,158,11,.08); border-color: rgba(245,158,11,.35); color: #fcd34d; }
+    .step-notice-warn strong { color: var(--warn); }
 
     /* Content area */
     .tab-body {
@@ -657,7 +721,7 @@
   </div>
 
   <div id="poll-indicator" class="poll-indicator" style="display:none">
-    <span class="blink-dot"></span><span class="poll-text">Polling…</span>
+    <span class="blink-dot"></span><span class="poll-text" id="poll-text">Polling…</span>
   </div>
   <button id="copy-btn" class="btn btn-secondary btn-sm" style="display:none" onclick="copyId()">Copy ID</button>
 </header>
@@ -684,6 +748,13 @@
   <!-- ── Workflow view ─────────────────────────────────────────────── -->
   <div id="wf-view" class="wf-view">
 
+    <!-- Banner mất kết nối — onPollFailure() bật khi poll lỗi tạm thời (5xx / mạng), dữ liệu
+         lần cập nhật cuối vẫn hiển thị bên dưới; poll thành công thì tự ẩn -->
+    <div id="conn-banner" class="conn-banner" role="status" style="display:none">
+      <span class="cb-text" id="conn-banner-text"></span>
+      <button class="btn btn-secondary btn-sm" onclick="pollNow()">Thử lại ngay</button>
+    </div>
+
     <!-- Status bar — khung tĩnh, renderStatusBar() chỉ cập nhật class/text tại chỗ -->
     <div class="status-bar" id="status-bar">
       <div id="status-badge">
@@ -704,13 +775,18 @@
         </div>
         <div class="meta-item">
           <span class="lbl">Steps</span>
-          <span class="val" id="meta-steps">—</span>
+          <span class="val"><span id="meta-steps">—</span><span class="meta-failed" id="meta-steps-failed"></span></span>
         </div>
         <div class="meta-item" id="meta-error" style="flex:1 1 100%; display:none">
           <span class="lbl">Error</span>
           <span class="val" id="meta-error-val" style="color:var(--err); font-size:12px"></span>
         </div>
       </div>
+      <!-- Nút hủy: chỉ hiện khi pending/running (renderCancelUi) -->
+      <div class="status-actions">
+        <button id="cancel-btn" class="btn btn-danger btn-sm" style="display:none" onclick="requestCancel()">✕ Hủy workflow</button>
+      </div>
+      <div class="status-note" id="status-note" role="status" style="display:none"></div>
     </div>
 
     <!-- Progress tracker -->
@@ -736,6 +812,10 @@
 <svg style="display:none">
   <symbol id="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor">
     <polyline points="20 6 9 17 4 12"/>
+  </symbol>
+  <symbol id="icon-x" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+    <line x1="18" y1="6" x2="6" y2="18"/>
+    <line x1="6" y1="6" x2="18" y2="18"/>
   </symbol>
   <symbol id="icon-loader" viewBox="0 0 24 24" fill="none" stroke="currentColor">
     <line x1="12" y1="2" x2="12" y2="6"/>
@@ -770,7 +850,25 @@ const STEPS = [
   { role: 'devsecops',    label: 'DevSecOps', name: 'CI/CD & Infra' },
   { role: 'clarifier',   label: 'Clarifier', name: 'Assumption & Gap Review' },
 ];
-const POLL_MS = 2500;
+const POLL_MS     = 2500;
+const POLL_MAX_MS = 30000;   // trần backoff khi poll lỗi tạm thời (xem pollBackoffMs)
+
+// Badge của từng status. 'cancelled' (POST /workflow/{id}/cancel) là trạng thái kết thúc
+// như completed/failed: badge xám, ngừng poll.
+const STATUS_MAP = {
+  pending:   { cls: 'badge-pending',   dot: true,  label: 'Pending' },
+  running:   { cls: 'badge-running',   dot: true,  label: 'Running' },
+  completed: { cls: 'badge-completed', dot: false, label: 'Completed' },
+  failed:    { cls: 'badge-failed',    dot: false, label: 'Failed' },
+  cancelled: { cls: 'badge-cancelled', dot: false, label: 'Cancelled' },
+};
+
+// HỢP ĐỒNG với agent-api: output của bước lỗi bắt đầu bằng "[LỖI" (app.py ghi role vào
+// failed_steps); coding role sinh lỗi MỘT SỐ file thì output có section
+// FILE_GEN_ERRORS_HEADER = "## ⚠️ File generation errors" (workflow.py — viết bằng \u
+// escape để không phụ thuộc cách lưu emoji; FE0F tùy chọn).
+const STEP_ERROR_PREFIX  = '[LỖI';
+const FILE_GEN_ERRORS_RE = /^##[ \t]*⚠️?[ \t]*File generation errors[ \t]*$/m;
 
 /* ────────────────────────────────────────────────────────────────────────
    STATE
@@ -789,6 +887,12 @@ let _stepEls     = null;   // [{ node, conn, circle, state }] — progress track
 let _tabEls      = null;   // [{ btn, icon }] — thanh tab dựng một lần
 let pollGen      = 0;      // "thế hệ" theo dõi — tăng mỗi lần stopAll(); response của thế hệ cũ bị bỏ qua
 let pollAbort    = null;   // AbortController cho các request của thế hệ hiện tại
+let pollInFlight = false;  // GET /workflow/{id} của thế hệ hiện tại đang bay (pollNow single-flight)
+let pollAgain    = false;  // pollNow() gọi lúc đang bay → poll lại ngay khi response về
+let pollPaused   = false;  // đã bỏ lượt poll vì tab ẩn → visibilitychange poll lại ngay
+let pollFailures = 0;      // số lần poll lỗi tạm thời liên tiếp (5xx / mạng) → backoff
+let cancelInFlight  = false; // POST /workflow/{id}/cancel đang bay → nút hủy bị khóa
+let cancelRequested = false; // server đã nhận yêu cầu hủy (200) — chờ poll xác nhận
 let mdReady      = false;  // marked + DOMPurify đã tải và cấu hình xong (xem setupMarkdown)
 let jszipLoading = null;   // Promise nạp JSZip lười (xem loadJSZip) — null = chưa nạp / lần trước lỗi
 
@@ -809,6 +913,7 @@ let jszipLoading = null;   // Promise nạp JSZip lười (xem loadJSZip) — nu
   document.getElementById('wid-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') trackFromInput();
   });
+  document.addEventListener('visibilitychange', onVisibilityChange);
 })();
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -829,6 +934,8 @@ function trackWorkflow(id) {
   startTime    = null;
   artifactsCache = {};   // Reset cache khi bắt đầu theo dõi workflow mới
   _lastBodyKey = null;   // buộc render lại tab-body cho workflow mới
+  cancelInFlight  = false;
+  cancelRequested = false;
   pollAbort    = new AbortController();   // stopAll() đã hủy request của lần theo dõi trước
 
   pushUrl(id);
@@ -840,6 +947,10 @@ function trackWorkflow(id) {
 /* ────────────────────────────────────────────────────────────────────────
    FETCH & POLL
    ──────────────────────────────────────────────────────────────────────── */
+// Lỗi poll TẠM THỜI (5xx khi container agent-api khởi động lại, mất mạng, proxy trả HTML…)
+// KHÔNG xóa view hay ngừng theo dõi: giữ dữ liệu lần cập nhật cuối, hiện banner và thử
+// lại với backoff 2.5s → 5s → 10s → 20s → 30s (trần). Chỉ 404 (workflow không tồn tại)
+// là lỗi cuối cùng. Tab ẩn (document.hidden) → tạm dừng poll, tiếp tục ngay khi hiện lại.
 async function fetchAndUpdate() {
   if (!currentId) return;
   // Chốt workflow + thế hệ lúc gửi request. Nếu trong lúc chờ người dùng đã đổi
@@ -849,55 +960,123 @@ async function fetchAndUpdate() {
   const id    = currentId;
   const stale = () => gen !== pollGen;
   pollTimer = null;   // timer (nếu có) vừa bắn xong
+  // Tab đang ẩn → bỏ lượt này (không tốn request khi để tab nền hàng giờ); handler
+  // visibilitychange gọi pollNow() ngay khi tab hiện lại. Lượt tải ĐẦU vẫn chạy để tab
+  // mở ở nền có sẵn dữ liệu.
+  if (document.hidden && lastData) { pollPaused = true; return; }
+  pollPaused   = false;
+  pollInFlight = true;
+  pollAgain    = false;
+
+  let data;
   try {
     const res = await fetch(`/workflow/${encodeURIComponent(id)}`, { signal: pollAbort?.signal });
     if (stale()) return;
     if (!res.ok) {
-      const j = await res.json().catch(() => ({ detail: res.statusText }));
+      const j = await res.json().catch(() => null);
       if (stale()) return;
-      showError(j.detail || `HTTP ${res.status}`);
-      stopAll();
-      return;
+      if (res.status === 404) {
+        // Workflow không tồn tại (id sai / đã bị xóa) → lỗi cuối cùng: dừng theo dõi.
+        showError(String((j && j.detail) || res.statusText || 'HTTP 404'));
+        stopAll();
+        return;
+      }
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
     }
-    const data = await res.json();
+    data = await res.json();
     if (stale()) return;
-
-    // Auto-set active tab to latest completed step on first meaningful load
-    if (!userPickedTab) {
-      const completed = data.completed_steps || [];
-      if (completed.length > 0) {
-        activeTab = completed[completed.length - 1];
-      } else {
-        activeTab = STEPS[0].role;
-      }
-    }
-
-    lastData = data;
-    renderAll(data);
-    document.getElementById('err-box').style.display = 'none';
-
-    const live = data.status === 'running' || data.status === 'pending';
-    setPollIndicator(live);
-    if (live) {
-      if (pollTimer) clearTimeout(pollTimer);   // luôn chỉ tồn tại đúng 1 timer poll
-      pollTimer = setTimeout(fetchAndUpdate, POLL_MS);
-      // Tải artifact metadata trong khi chạy (mỗi khi có role mới hoàn thành)
-      const _artifactRoles = new Set(['fe','mobile','be','dba','devsecops','tech_lead','da']);
-      const _completedArt  = (data.completed_steps || []).filter(r => _artifactRoles.has(r));
-      if (_completedArt.some(r => !(r in artifactsCache))) {
-        loadArtifacts(id);
-      }
-    } else {
-      stopDur();
-      // Luôn tải lại artifact khi workflow kết thúc
-      loadArtifacts(id);
-    }
   } catch (e) {
     // Request của lần theo dõi cũ bị hủy (AbortError) hoặc đã lỗi thời → bỏ qua im lặng.
     if (stale() || e.name === 'AbortError') return;
-    showError(e.message);
-    stopAll();
+    onPollFailure(e);
+    return;
+  } finally {
+    // Chỉ thế hệ hiện tại được nhả cờ — stopAll() đã reset cho thế hệ mới.
+    if (!stale()) pollInFlight = false;
   }
+
+  // Poll thành công → xóa banner mất kết nối, reset backoff.
+  pollFailures = 0;
+  hideConnBanner();
+
+  // Auto-set active tab to latest completed step on first meaningful load
+  if (!userPickedTab) {
+    const completed = data.completed_steps || [];
+    if (completed.length > 0) {
+      activeTab = completed[completed.length - 1];
+    } else {
+      activeTab = STEPS[0].role;
+    }
+  }
+
+  lastData = data;
+  // Lỗi render (bug UI / dữ liệu lạ) tách khỏi lỗi mạng: nếu nằm chung catch ở trên nó sẽ
+  // bị retry mãi dưới banner "mất kết nối". Báo ra err-box (giữ view) và vẫn poll tiếp.
+  try {
+    renderAll(data);
+    document.getElementById('err-box').style.display = 'none';
+  } catch (e) {
+    console.error('Render workflow lỗi:', e);
+    showInlineError(`Lỗi hiển thị: ${e.message}`);
+  }
+
+  const live = isLive(data);
+  setPollIndicator(live ? 'live' : false);
+  if (live) {
+    // pollNow() được gọi khi request vừa rồi đang bay (vd. vừa gửi hủy) → poll lại ngay.
+    schedulePoll(pollAgain ? 0 : POLL_MS);
+    // Tải artifact metadata trong khi chạy (mỗi khi có role mới hoàn thành)
+    const _artifactRoles = new Set(['fe','mobile','be','dba','devsecops','tech_lead','da']);
+    const _completedArt  = (data.completed_steps || []).filter(r => _artifactRoles.has(r));
+    if (_completedArt.some(r => !(r in artifactsCache))) {
+      loadArtifacts(id);
+    }
+  } else {
+    stopDur();
+    // Luôn tải lại artifact khi workflow kết thúc
+    loadArtifacts(id);
+  }
+}
+
+// Luôn chỉ tồn tại đúng 1 timer poll.
+function schedulePoll(ms) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(fetchAndUpdate, ms);
+}
+
+// Backoff khi poll lỗi tạm thời: lần lỗi thứ n (1, 2, 3…) → 2.5s, 5s, 10s, 20s, 30s, 30s…
+function pollBackoffMs(failures) {
+  return Math.min(POLL_MAX_MS, POLL_MS * 2 ** Math.max(0, failures - 1));
+}
+
+function onPollFailure(e) {
+  pollFailures++;
+  const delay = pollBackoffMs(pollFailures);
+  const why   = e && e.status ? `HTTP ${e.status}` : 'không kết nối được';
+  showConnBanner(`Mất kết nối tới agent-api (${why}) — đang giữ dữ liệu lần cập nhật cuối. `
+    + `Thử lại sau ${delay / 1000} giây (lần ${pollFailures}).`);
+  setPollIndicator('retry');
+  schedulePoll(delay);
+}
+
+// Poll ngay — đường DUY NHẤT cho "Thử lại ngay", tab hiện lại và làm mới sau khi gửi hủy.
+// Single-flight: đang có request bay thì chỉ đánh dấu pollAgain (response về sẽ poll lại
+// ngay) thay vì mở request thứ hai (response về lệch thứ tự có thể render dữ liệu cũ hơn).
+// pollAbort === null nghĩa là đã stopAll() (404, mở Recent) → không hồi sinh vòng poll.
+function pollNow() {
+  if (!currentId || !pollAbort) return;
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (pollInFlight) { pollAgain = true; return; }
+  fetchAndUpdate();
+}
+
+function onVisibilityChange() {
+  if (document.hidden) return;
+  // Chỉ nối lại vòng poll còn sống: đã bỏ lượt vì tab ẩn, hoặc đang chờ timer/backoff.
+  // Workflow đã kết thúc / 404 không có timer → không poll lại.
+  if (pollPaused || pollTimer) pollNow();
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -930,23 +1109,83 @@ function revealInStrip(strip, el) {
   strip.scrollLeft += (r.left + r.width / 2) - (s.left + s.width / 2);
 }
 
+/* ── Trạng thái từng bước (hàm thuần — test bằng node) ──────────────── */
+function isLive(data) {
+  return !!data && (data.status === 'running' || data.status === 'pending');
+}
+
+// Bước đang chạy: bước đầu tiên chưa xong, CHỈ khi status 'running'. Run 'pending' còn nằm
+// trong hàng đợi — chưa bước nào chạy nên không vẽ spinner cho BA.
+function currentStepOf(data) {
+  if (!data || data.status !== 'running') return null;
+  const completed = new Set(data.completed_steps || []);
+  const s = STEPS.find(st => !completed.has(st.role));
+  return s ? s.role : null;
+}
+
+// Bước lỗi. Khi đã có output, output là nguồn sự thật: Clarifier Regen Loop có thể chạy
+// lại một bước lỗi thành công (hoặc làm hỏng một bước tốt) mà failed_steps không được
+// cập nhật. Chưa có output → dựa vào failed_steps.
+function isStepFailed(data, role) {
+  const out = (data.step_outputs || {})[role];
+  if (typeof out === 'string' && out.trim()) return out.trimStart().startsWith(STEP_ERROR_PREFIX);
+  return (data.failed_steps || []).includes(role);
+}
+
+function hasFileGenErrors(output) {
+  return FILE_GEN_ERRORS_RE.test(String(output || ''));
+}
+
+// Ưu tiên failed > warn > done > active > todo. Output lỗi toàn bộ ("[LỖI trong be] …")
+// CŨNG chứa section "File generation errors" → phải xét failed trước warn. Bước lỗi vẫn
+// nằm trong completed_steps (node trả về bình thường) → xét failed trước done.
+function stepState(data, role) {
+  if (isStepFailed(data, role)) return 'failed';
+  if ((data.completed_steps || []).includes(role)) {
+    return hasFileGenErrors((data.step_outputs || {})[role]) ? 'warn' : 'done';
+  }
+  return role === currentStepOf(data) ? 'active' : 'todo';
+}
+
+function isCancelling(data) {
+  return isLive(data) && !!(data.cancel_requested || cancelRequested);
+}
+
+// Ghi chú dưới status bar: vị trí hàng đợi (pending) / đang hủy. queue_position 1 = chạy kế
+// tiếp; so với null (không dùng truthiness) vì backend cũ không trả field này.
+function statusNote(data) {
+  if (!isLive(data)) return '';
+  if (isCancelling(data)) {
+    return data.status === 'pending' ? 'Đang hủy…' : 'Đang hủy — sẽ dừng sau bước hiện tại';
+  }
+  if (data.status === 'pending') {
+    return data.queue_position != null
+      ? `Đang chờ trong hàng đợi (vị trí ${data.queue_position})`
+      : 'Đang chờ bắt đầu…';
+  }
+  return '';
+}
+
+function cancelBtnState(data) {
+  if (!isLive(data))     return { show: false, disabled: true,  label: '✕ Hủy workflow' };
+  if (cancelInFlight)    return { show: true,  disabled: true,  label: 'Đang gửi yêu cầu hủy…' };
+  if (isCancelling(data)) return { show: true, disabled: true,  label: 'Đang hủy…' };
+  return { show: true, disabled: false, label: '✕ Hủy workflow' };
+}
+
 /* ── Status bar ─────────────────────────────────────────────────────── */
 function renderStatusBar(data) {
-  const MAP = {
-    pending:   { cls: 'badge-pending',   dot: true,  label: 'Pending' },
-    running:   { cls: 'badge-running',   dot: true,  label: 'Running' },
-    completed: { cls: 'badge-completed', dot: false, label: 'Completed' },
-    failed:    { cls: 'badge-failed',    dot: false, label: 'Failed' },
-  };
-  const s = MAP[data.status] || MAP.failed;
+  const s = STATUS_MAP[data.status] || STATUS_MAP.failed;
 
   // Khi đã xong 15/15 nhưng status vẫn 'running' → đang chạy Clarifier Regen Loop
   // (re-gen các engineer role + chạy lại Clarifier). Nói rõ để không hiểu nhầm là treo.
   // Tắt vòng này bằng CLARIFIER_REGEN_LOOPS=0 trong .env.
   const _allStepsDone = (data.completed_steps || []).length >= STEPS.length;
-  const _label = (data.status === 'running' && _allStepsDone)
-    ? 'Running — Clarifier regen…'
-    : s.label;
+  const _label = isCancelling(data)
+    ? 'Cancelling…'
+    : (data.status === 'running' && _allStepsDone)
+      ? 'Running — Clarifier regen…'
+      : s.label;
 
   // Cập nhật tại chỗ — giữ nguyên phần tử .blink-dot để animation không restart mỗi poll
   const pill = document.getElementById('status-pill');
@@ -956,11 +1195,11 @@ function renderStatusBar(data) {
   setText(document.getElementById('status-label'), _label);
 
   // Duration
-  if ((data.status === 'running' || data.status === 'pending') && !startTime) {
+  if (isLive(data) && !startTime) {
     startTime = new Date(data.created_at);
     startDur();
   }
-  if (data.status !== 'running' && data.status !== 'pending') stopDur();
+  if (!isLive(data)) stopDur();
 
   const dur = data.completed_at
     ? fmtDur(new Date(data.created_at), new Date(data.completed_at))
@@ -971,22 +1210,33 @@ function renderStatusBar(data) {
   setText(document.getElementById('meta-started'), fmtTime(data.created_at));
   setText(document.getElementById('dur-val'), dur);
   setText(document.getElementById('meta-steps'), `${(data.completed_steps || []).length} / ${STEPS.length}`);
+  const _nFailed = STEPS.filter(st => isStepFailed(data, st.role)).length;
+  setText(document.getElementById('meta-steps-failed'), _nFailed ? ` · ✗ ${_nFailed} lỗi` : '');
   document.getElementById('meta-error').style.display = data.error ? '' : 'none';
   setText(document.getElementById('meta-error-val'), data.error || '');
+
+  renderCancelUi();
+}
+
+// Nút hủy + ghi chú trạng thái — gọi lại cả khi POST /cancel bắt đầu/kết thúc (không chờ poll)
+function renderCancelUi() {
+  const st  = cancelBtnState(lastData);
+  const btn = document.getElementById('cancel-btn');
+  btn.style.display = st.show ? '' : 'none';
+  if (btn.disabled !== st.disabled) btn.disabled = st.disabled;
+  setText(btn, st.label);
+
+  const note   = statusNote(lastData);
+  const noteEl = document.getElementById('status-note');
+  noteEl.style.display = note ? '' : 'none';
+  setText(noteEl, note);
 }
 
 /* ── Progress tracker ───────────────────────────────────────────────── */
+const STEP_TITLES = { failed: 'Bước này thất bại', warn: 'Một số file không sinh được' };
+
 function renderProgress(data) {
   const completed = new Set(data.completed_steps || []);
-  const running   = data.status === 'running' || data.status === 'pending';
-
-  // Determine current active step
-  let currentStep = null;
-  if (running) {
-    for (const s of STEPS) {
-      if (!completed.has(s.role)) { currentStep = s.role; break; }
-    }
-  }
 
   setText(document.getElementById('steps-done'), completed.size);
 
@@ -1015,31 +1265,34 @@ function renderProgress(data) {
 
   STEPS.forEach((step, i) => {
     const el         = _stepEls[i];
-    const isDone     = completed.has(step.role);
-    const isActive   = step.role === currentStep;
+    const state      = stepState(data, step.role);
     const isSelected = step.role === activeTab;
 
     // Connector (trước mỗi step trừ step đầu)
     if (el.conn) {
       const prevDone = completed.has(STEPS[i - 1].role);
-      el.conn.classList.toggle('done',   isDone && prevDone);
-      el.conn.classList.toggle('active', isActive && prevDone);
+      el.conn.classList.toggle('done',   completed.has(step.role) && prevDone);
+      el.conn.classList.toggle('active', state === 'active' && prevDone);
     }
 
     // toggle(cls, bool) không đụng DOM khi class đã đúng → animation/transition giữ nguyên
     const wasSelected = el.node.classList.contains('selected');
-    el.node.classList.toggle('done',     isDone);
-    el.node.classList.toggle('active',   isActive);
+    el.node.classList.toggle('done',     state === 'done');
+    el.node.classList.toggle('warn',     state === 'warn');
+    el.node.classList.toggle('failed',   state === 'failed');
+    el.node.classList.toggle('active',   state === 'active');
     el.node.classList.toggle('selected', isSelected);
     if (isSelected && !wasSelected) revealInStrip(track, el.node);
 
     // Chỉ thay icon trong vòng tròn khi trạng thái đổi (thay mỗi poll sẽ restart spin)
-    const state = isDone ? 'done' : isActive ? 'active' : 'todo';
     if (el.state !== state) {
       el.state = state;
-      if (isDone) {
+      el.node.title = STEP_TITLES[state] || '';
+      if (state === 'done' || state === 'warn') {
         el.circle.innerHTML = `<svg><use href="#icon-check"/></svg>`;
-      } else if (isActive) {
+      } else if (state === 'failed') {
+        el.circle.innerHTML = `<svg><use href="#icon-x"/></svg>`;
+      } else if (state === 'active') {
         el.circle.innerHTML = `<svg style="animation:spin .8s linear infinite"><use href="#icon-loader"/></svg>`;
       } else {
         el.circle.textContent = `${i + 1}`;
@@ -1049,14 +1302,9 @@ function renderProgress(data) {
 }
 
 /* ── Tabs ───────────────────────────────────────────────────────────── */
-function renderTabs(data) {
-  const completed  = new Set(data.completed_steps || []);
-  const running    = data.status === 'running' || data.status === 'pending';
-  let   currentStep = null;
-  if (running) {
-    for (const s of STEPS) { if (!completed.has(s.role)) { currentStep = s.role; break; } }
-  }
+const TAB_ICONS = { done: '✓', warn: '⚠', failed: '✗', active: '⟳', todo: '○' };
 
+function renderTabs(data) {
   const nav = document.getElementById('tabs-nav');
   if (!_tabEls) {
     // Dựng 15 nút một lần — giữ nguyên phần tử để focus bàn phím không mất mỗi poll
@@ -1073,14 +1321,17 @@ function renderTabs(data) {
 
   STEPS.forEach((step, i) => {
     const { btn, icon } = _tabEls[i];
-    const isDone  = completed.has(step.role);
-    const isRun   = step.role === currentStep;
-    const isActv  = step.role === activeTab;
+    const state  = stepState(data, step.role);
+    const isActv = step.role === activeTab;
 
-    setText(icon, isDone ? '✓' : isRun ? '⟳' : '○');
+    setText(icon, TAB_ICONS[state]);
+    const title = STEP_TITLES[state] || '';
+    if (btn.title !== title) btn.title = title;
     const wasActv = btn.classList.contains('active');
-    btn.classList.toggle('t-done', isDone);
-    btn.classList.toggle('t-run',  isRun);
+    btn.classList.toggle('t-done', state === 'done');
+    btn.classList.toggle('t-warn', state === 'warn');
+    btn.classList.toggle('t-fail', state === 'failed');
+    btn.classList.toggle('t-run',  state === 'active');
     btn.classList.toggle('active', isActv);
     if (isActv && !wasActv) revealInStrip(nav, btn);
   });
@@ -1088,12 +1339,9 @@ function renderTabs(data) {
 
 /* ── Tab body ───────────────────────────────────────────────────────── */
 function renderTabBody(data) {
-  const completed  = new Set(data.completed_steps || []);
-  const running    = data.status === 'running' || data.status === 'pending';
-  let   currentStep = null;
-  if (running) {
-    for (const s of STEPS) { if (!completed.has(s.role)) { currentStep = s.role; break; } }
-  }
+  const completed   = new Set(data.completed_steps || []);
+  const running     = isLive(data);
+  const currentStep = currentStepOf(data);
 
   const body = document.getElementById('tab-body');
   const step = STEPS.find(s => s.role === activeTab);
@@ -1102,26 +1350,41 @@ function renderTabBody(data) {
   const _stepOutputs = data.step_outputs || {};
   const _hasKey      = activeTab in _stepOutputs;
   const output       = _stepOutputs[activeTab] || "";
+  const state        = stepState(data, activeTab);
+  const cancelling   = isCancelling(data);
 
   // Tránh rebuild DOM tab-body mỗi lần poll khi nội dung KHÔNG đổi — rebuild làm
   // reset vị trí scroll của bảng/diagram/code đang xem. Chỉ render lại khi "chữ ký"
-  // thay đổi (đổi tab, step có output mới, artifact vừa tải xong). Lưu ý: sub-tab
-  // (Output/Files) do switchSubTab tự toggle display nên KHÔNG nằm trong chữ ký →
-  // lựa chọn sub-tab của người dùng được giữ nguyên qua các lần poll.
+  // thay đổi (đổi tab, step có output mới, trạng thái/hàng đợi/hủy đổi, artifact vừa
+  // tải xong). Lưu ý: sub-tab (Output/Files) do switchSubTab tự toggle display nên KHÔNG
+  // nằm trong chữ ký → lựa chọn sub-tab của người dùng được giữ nguyên qua các lần poll.
   const _artCount = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_')).length;
   const _bodyKey = [
     activeTab,
     _hasKey ? 1 : 0,
     output.length,
-    (running && activeTab === currentStep) ? 'cur' : (running ? 'r' : 's'),
-    completed.has(activeTab) ? 'c' : '',
+    data.status,
+    state,
+    currentStep || '',   // "Chờ hoàn thành N bước trước" phụ thuộc bước đang chạy
+    data.status === 'pending' && data.queue_position != null ? data.queue_position : '',
+    state === 'active' && cancelling ? 'x' : '',
     _artCount,
   ].join('|');
   if (_bodyKey === _lastBodyKey) return;   // không đổi → giữ nguyên DOM + scroll
   _lastBodyKey = _bodyKey;
 
   if (_hasKey && output && output.trim()) {
-    // Hoàn thành — render markdown (đã sanitize, xem renderMarkdown) + panel files nếu có artifact.
+    // Có output — render markdown (đã sanitize, xem renderMarkdown) + panel files nếu có
+    // artifact. Bước lỗi / có file sinh lỗi → thông báo rõ ở đầu tab, trước nội dung.
+    const notice = state === 'failed'
+      ? `<div class="step-notice step-notice-err" role="alert"><strong>✗ Bước này thất bại</strong>`
+        + `Agent gặp lỗi nên không có kết quả dùng được — chi tiết lỗi ở bên dưới. `
+        + `Các bước sau có thể thiếu đầu vào từ bước này.</div>`
+      : state === 'warn'
+        ? `<div class="step-notice step-notice-warn" role="status"><strong>⚠ Một số file không sinh được</strong>`
+          + `Các file còn lại vẫn dùng được — danh sách file lỗi nằm ở mục `
+          + `“File generation errors” bên dưới.</div>`
+        : '';
     const clean    = renderMarkdown(output);
     const roleArts = (artifactsCache[activeTab] || []).filter(f => !f.filename.startsWith('_'));
     const filesBtn = roleArts.length
@@ -1135,6 +1398,7 @@ function renderTabBody(data) {
       ? `<div class="sub-tab-row"><button class="sub-tab-btn${outActive}" id="stb-output" onclick="switchSubTab('output')">📄 Output</button>${filesBtn}</div>`
       : '';
     body.innerHTML = `
+      ${notice}
       ${subTabRow}
       <div id="sub-output" style="display:${outDisplay}"><div class="md">${clean}</div></div>
       <div id="sub-files" style="display:${filesDisplay}">${renderFileTree(activeTab, roleArts)}</div>`;
@@ -1156,7 +1420,16 @@ function renderTabBody(data) {
     // parse markdown (xem promoteAsciiDiagram) — dựa trên markdown NGUỒN, không phải
     // HTML đã render.
 
-  } else if (_hasKey && (!output || !output.trim())) {
+  } else if (state === 'failed') {
+    // Lỗi nhưng không có output để hiện (failed_steps có role, step_outputs không có)
+    body.innerHTML = `
+      <div class="state-box">
+        <div class="big-icon">✗</div>
+        <h3 style="color:var(--err)">${step.name}</h3>
+        <p>Bước này thất bại và không để lại output. Xem mục <strong>Error</strong> ở thanh trạng thái phía trên.</p>
+      </div>`;
+
+  } else if (_hasKey) {
     // Hoàn thành nhưng output rỗng (model quá nhỏ hoặc context overflow)
     body.innerHTML = `
       <div class="state-box">
@@ -1166,13 +1439,27 @@ function renderTabBody(data) {
            Có thể do model quá nhỏ hoặc context vượt giới hạn. Thử dùng model mạnh hơn.</p>
       </div>`;
 
+  } else if (data.status === 'pending' && !completed.has(step.role)) {
+    // Run còn trong hàng đợi — chưa bước nào chạy
+    const qp = data.queue_position;
+    body.innerHTML = `
+      <div class="state-box">
+        <div class="big-icon">⏳</div>
+        <h3>${step.name}</h3>
+        <p>${qp != null
+          ? `Đang chờ trong hàng đợi (vị trí ${esc(qp)}) — workflow bắt đầu khi các lần chạy trước xong.`
+          : 'Workflow đang chờ bắt đầu…'}</p>
+      </div>`;
+
   } else if (step.role === currentStep) {
     // Currently running
     body.innerHTML = `
       <div class="state-box">
         <div class="spinner"></div>
         <h3>${step.name}</h3>
-        <p>Agent đang xử lý… Kết quả sẽ hiển thị tại đây khi hoàn thành.</p>
+        <p>${cancelling
+          ? 'Đã yêu cầu hủy — workflow sẽ dừng khi bước này xong.'
+          : 'Agent đang xử lý… Kết quả sẽ hiển thị tại đây khi hoàn thành.'}</p>
       </div>`;
 
   } else if (completed.has(step.role)) {
@@ -1183,7 +1470,7 @@ function renderTabBody(data) {
         <p>Đang tải output…</p>
       </div>`;
 
-  } else if (running) {
+  } else if (running && currentStep) {
     // Pending step — workflow still running
     const stepIdx    = STEPS.findIndex(s => s.role === step.role);
     const currentIdx = STEPS.findIndex(s => s.role === currentStep);
@@ -1193,16 +1480,19 @@ function renderTabBody(data) {
         <div class="big-icon">⏳</div>
         <h3>${step.name}</h3>
         <p>Chờ hoàn thành ${stepsAway} bước trước.
-           Hiện tại đang xử lý: <strong>${currentStep ? STEPS.find(s=>s.role===currentStep)?.name : '…'}</strong></p>
+           Hiện tại đang xử lý: <strong>${STEPS.find(s => s.role === currentStep).name}</strong></p>
       </div>`;
 
   } else {
     // Not started / workflow ended before this step
+    const why = data.status === 'cancelled' ? 'Không chạy — workflow đã bị hủy trước bước này.'
+              : data.status === 'failed'    ? 'Không chạy — workflow dừng vì lỗi.'
+              : 'Chưa chạy.';
     body.innerHTML = `
       <div class="state-box">
         <div class="big-icon" style="opacity:.35">○</div>
         <h3 style="color:var(--muted)">${step.name}</h3>
-        <p>Chưa chạy.</p>
+        <p>${why}</p>
       </div>`;
   }
 }
@@ -1344,7 +1634,7 @@ async function showRecent() {
 
     grid.innerHTML = '';
     data.workflows.forEach(w => {
-      const iconMap = { pending:'⏳', running:'⟳', completed:'✓', failed:'✗' };
+      const iconMap = { pending:'⏳', running:'⟳', completed:'✓', failed:'✗', cancelled:'⊘' };
       const icon    = iconMap[w.status] || '?';
       const chip    = document.createElement('div');
       chip.className = 'recent-chip';
@@ -1375,9 +1665,23 @@ function showView(which) {
 
 function showError(msg) {
   showView('empty');
+  showInlineError(msg);
+}
+
+// Hiện err-box nhưng GIỮ view hiện tại (lỗi render khi đang theo dõi)
+function showInlineError(msg) {
   const box = document.getElementById('err-box');
   box.textContent = '⚠️  ' + msg;
   box.style.display = 'block';
+}
+
+function showConnBanner(msg) {
+  setText(document.getElementById('conn-banner-text'), msg);
+  document.getElementById('conn-banner').style.display = '';
+}
+
+function hideConnBanner() {
+  document.getElementById('conn-banner').style.display = 'none';
 }
 
 function stopAll() {
@@ -1385,12 +1689,74 @@ function stopAll() {
   pollGen++;
   if (pollAbort) { pollAbort.abort(); pollAbort = null; }
   if (pollTimer) { clearTimeout(pollTimer);  pollTimer = null; }
+  pollInFlight = false;
+  pollAgain    = false;
+  pollPaused   = false;
+  pollFailures = 0;
+  hideConnBanner();
   stopDur();
   setPollIndicator(false);
 }
 
-function setPollIndicator(on) {
-  document.getElementById('poll-indicator').style.display = on ? 'flex' : 'none';
+// mode: false (ẩn) | 'live' (đang poll) | 'retry' (poll lỗi tạm thời, đang chờ thử lại).
+// Giữ nguyên phần tử .blink-dot (chỉ đổi class) → animation không restart.
+function setPollIndicator(mode) {
+  const el = document.getElementById('poll-indicator');
+  el.style.display = mode ? 'flex' : 'none';
+  el.classList.toggle('retry', mode === 'retry');
+  setText(document.getElementById('poll-text'), mode === 'retry' ? 'Mất kết nối…' : 'Polling…');
+}
+
+function toast(msg, ms = 2800) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.setAttribute('role', 'status');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), ms);
+}
+
+/* ── Hủy workflow ───────────────────────────────────────────────────── */
+// POST /workflow/{id}/cancel → 200 {workflow_id, status}: run pending bị hủy ngay
+// (status "cancelled"); run đang chạy nhận cancel_requested và dừng sau bước hiện tại
+// (status vẫn "running"). 404 = không tìm thấy (hoặc agent-api cũ chưa có endpoint),
+// 409 = đã kết thúc. Cả hai chỉ báo toast + poll lại — trạng thái thật luôn lấy từ GET;
+// chỉ 404 của GET mới được dừng theo dõi.
+async function requestCancel() {
+  if (!currentId || cancelInFlight || !isLive(lastData) || isCancelling(lastData)) return;
+  if (!confirm('Hủy workflow này?\n\nBước đang chạy sẽ chạy nốt rồi workflow dừng; '
+             + 'các bước sau không chạy. Không hoàn tác được.')) return;
+  const gen = pollGen;
+  const id  = currentId;   // chốt id: đổi workflow trong lúc chờ không hủy nhầm / báo nhầm
+  cancelInFlight = true;
+  renderCancelUi();
+  try {
+    const res = await fetch(`/workflow/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+    if (gen !== pollGen) return;
+    if (res.ok) {
+      const j = await res.json().catch(() => ({}));
+      if (gen !== pollGen) return;
+      cancelRequested = true;
+      toast(j.status === 'cancelled'
+        ? '✓ Đã hủy workflow.'
+        : '✓ Đã gửi yêu cầu hủy — workflow sẽ dừng sau bước hiện tại.');
+    } else if (res.status === 409) {
+      toast('Workflow đã kết thúc — không còn gì để hủy.');
+    } else if (res.status === 404) {
+      toast('✗ Không hủy được: agent-api không tìm thấy workflow (hoặc chưa hỗ trợ hủy).');
+    } else {
+      toast(`✗ Hủy thất bại (HTTP ${res.status}) — thử lại sau.`);
+    }
+  } catch (e) {
+    if (gen !== pollGen) return;
+    toast(`✗ Không gửi được yêu cầu hủy: ${e.message}`);
+  } finally {
+    if (gen === pollGen) {
+      cancelInFlight = false;
+      renderCancelUi();
+    }
+  }
+  if (gen === pollGen) pollNow();   // lấy trạng thái thật (cancelled / cancel_requested) ngay
 }
 
 function startDur() {
