@@ -23,7 +23,7 @@ jobs:
       - name: Install tooling
         run: |
           python -m pip install --upgrade pip
-          pip install pytest ruff
+          pip install pytest ruff mypy==2.4.1
 
       - name: Install service deps (cho test ingest/workflow)
         run: |
@@ -32,6 +32,19 @@ jobs:
 
       - name: Lint (ruff)
         run: ruff check rag-api agent-api open-webui-tools tests
+
+      # agent-api/app.py và rag-api/app.py trùng tên module "app" → chạy mypy riêng từng
+      # thư mục service (cấu hình [tool.mypy] trong pyproject.toml). Chạy đủ cả 3 thư mục
+      # rồi mới báo lỗi để thấy hết vấn đề trong một lần.
+      - name: Type check (mypy)
+        run: |
+          status=0
+          for d in agent-api rag-api open-webui-tools; do
+            echo "::group::mypy $d"
+            (cd "$d" && python -m mypy --config-file ../pyproject.toml *.py) || status=1
+            echo "::endgroup::"
+          done
+          exit $status
 
       - name: Unit tests (pytest)
         run: pytest -q

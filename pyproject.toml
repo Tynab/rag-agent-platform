@@ -17,3 +17,17 @@ extend-exclude = ["data", ".git"]
 # system_prompt và docstring tiếng Việt dài — không phải lỗi logic.
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
+
+[tool.mypy]
+# Kiểm tra kiểu tĩnh cho mã nguồn service (CI chạy với mypy==2.4.1).
+# agent-api/app.py và rag-api/app.py trùng tên module "app" → KHÔNG chạy mypy một lần
+# cho cả repo; chạy riêng từng thư mục service (cd vào thư mục, import phẳng như trong
+# container):
+#   for d in agent-api rag-api open-webui-tools; do
+#     (cd "$d" && python -m mypy --config-file ../pyproject.toml *.py)
+#   done
+python_version = "3.11"
+# Thư viện bên thứ ba thiếu type stub (requests, docx2txt...) không làm fail CI.
+ignore_missing_imports = true
+explicit_package_bases = true
+warn_unused_ignores = true
