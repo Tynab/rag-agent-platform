@@ -159,16 +159,21 @@ BA → PM → SA → TA → Designer → Team Lead → FE → Mobile → DBA →
 
 ### Cơ chế sinh code (Artifact Roles)
 
-Các agent `fe`, `mobile`, `be`, `dba`, `da`, `tech_lead`, `devsecops` sử dụng quy trình sinh code **2 pha**:
+Các agent `fe`, `mobile`, `be`, `dba`, `tech_lead`, `devsecops` (role `mode="codegen"` — xem [Role registry](#role-registry--cấu-hình-hành-vi-theo-role)) sử dụng quy trình sinh code **2 pha**. `da` là role báo cáo (gọi LLM một lần) nhưng code block trong output vẫn được trích thành artifact.
 
 **Pha 1 — Lập kế hoạch file:**
-- `CODING_PLANNER_MODEL` (model nhẹ, ví dụ `granite4.1:8b`) nhận danh sách task từ TL output
+- `CODING_PLANNER_MODEL` (model nhẹ, ví dụ `granite4.1:8b`) nhận **toàn bộ** TL task board của role. Board dài hơn ngân sách ~3.000 ký tự thì chỉ cắt bớt chữ của các task dài nhất — không task nào bị bỏ
+- Context gửi planner (~2.000 ký tự) giữ đề bài + tech stack ở đầu, cộng phần đuôi context
 - Sinh JSON array các file cần tạo: `[{"filename": "src/auth/login.tsx", "description": "...", "language": "typescript"}]`
 - Tối đa `MAX_FILES_PER_ROLE` file mỗi role
 
 **Pha 2 — Sinh từng file:**
-- Mỗi file được sinh độc lập bằng coding model với context tập trung
-- Nếu còn task TL chưa được cover → **pha follow-up**: lên kế hoạch thêm file và sinh tiếp
+- Mỗi file được sinh độc lập bằng coding model với context tập trung. `tech_lead`/`devsecops` (review role) nhận thêm context rút gọn ~1.500 ký tự (đề bài + tech stack + đuôi output các agent trước)
+- Nếu còn task TL chưa được cover → **pha follow-up**: lên kế hoạch thêm file và sinh tiếp. Pass follow-up có thể thử lại file lỗi một lần
+
+**Giới hạn của mỗi lời gọi LLM:** timeout httpx thật (`OLLAMA_REQUEST_TIMEOUT`) và trần token `num_predict` theo loại lời gọi (`PLANNER_NUM_PREDICT` / `FILEGEN_NUM_PREDICT` / `REPORT_NUM_PREDICT`, nhân ×2 khi model suy luận) — xem [Nhóm Agent API](#nhóm-agent-api). Thinking khi sinh file bật/tắt bằng `FILEGEN_THINK`. Khi chạm trần, agent-api ghi log cảnh báo `chạm trần ...`.
+
+**File sinh lỗi:** file lỗi (timeout, lỗi Ollama, model trả nội dung rỗng hoặc chạm trần giữa lúc suy luận) **không** được lưu thành artifact. Output của role có thêm section `## ⚠️ File generation errors` liệt kê từng file lỗi kèm lỗi ngắn gọn, và các task TL tương ứng hiện ⏳ trong checklist. Nếu **không file nào** sinh được, bước bị đánh dấu lỗi: output bắt đầu bằng `[LỖI trong {role}]` và role nằm trong `failed_steps` của workflow.
 
 **Task Completion Checklist:**
 Cuối output của mỗi engineer agent luôn có bảng checklist đối chiếu từng task TL với file đã sinh:
@@ -187,6 +192,28 @@ Sau khi workflow hoàn tất, Clarifier phân tích §10 "Recommended Re-generat
 3. Lặp tối đa `CLARIFIER_REGEN_LOOPS` lần (mặc định = 1)
 
 Tắt tính năng: `CLARIFIER_REGEN_LOOPS=0` trong `.env`.
+
+### Role registry — cấu hình hành vi theo role
+
+`AgentConfig` trong `agent-api/agents.py` là **nguồn sự thật duy nhất** cho hành vi của từng role. Các bảng trong `workflow.py`/`artifacts.py` (role có artifact, role được re-gen, section TL board, giới hạn context…) được dẫn xuất tự động từ `AGENTS` lúc khởi động — không sửa bảng trực tiếp.
+
+| Field | Ý nghĩa | Role hiện tại |
+|---|---|---|
+| `mode` | `"codegen"`: sinh code 2 pha (planner lập danh sách file → sinh từng file); `"report"` (mặc định): gọi LLM một lần | codegen: fe, mobile, be, dba, tech_lead, devsecops |
+| `extract_artifacts` | Trích code block trong output ra file (tab Artifacts, tải ZIP) | fe, mobile, be, dba, da, tech_lead, devsecops |
+| `regen_eligible` | Được chạy lại trong [Clarifier Regen Loop](#11-clarifier-regen-loop) (§10 của Clarifier) | fe, mobile, be, dba, da, tech_lead, devsecops |
+| `tl_sections` | Từ khóa heading TL task board dành cho role | fe, mobile, be, dba |
+| `per_dep_chars` | Số ký tự tối đa lấy từ output mỗi agent phụ thuộc (mặc định 3.000) | tech_lead 800, devsecops 1.000, tester 3.000, clarifier 1.500 |
+| `wants_date_hint` | Chèn ngày hiện tại vào context (timeline/sprint không dùng ngày quá khứ) | ba, pm, sa, ta |
+| `wants_db_hint` | Chèn gợi ý kiểu DB (SQL/NoSQL/cả hai) suy từ tech stack. Tech stack có cả SQL lẫn NoSQL (vd. PostgreSQL + MongoDB) → cả DBA và DA nhận gợi ý cho DB hỗn hợp | dba, da |
+| `review_context` | Mỗi lần sinh file kèm context rút gọn của các agent trước | tech_lead, devsecops |
+
+**Thêm role mới:**
+1. Khai báo `MODEL_XXX = os.environ.get("XXX_MODEL", "<default>")`, thêm `XXX_MODEL` vào `.env` và khối `environment:` của agent-api trong `docker-compose.yml`.
+2. Thêm `AgentConfig` vào `AGENTS` (step_id, role, name, model, depends_on, rag_query_hint, system_prompt) và đặt các field hành vi ở bảng trên — mặc định là role `"report"` không có hành vi đặc biệt.
+3. Chèn role vào `WORKFLOW_STEPS` (và danh sách step trong `open-webui-tools/yan_agent_workflow.py`).
+4. Nếu `regen_eligible=True`: thêm alias tên role vào `_REGEN_ROLE_RE` trong `workflow.py`. Nếu `wants_db_hint=True`: thêm câu chữ gợi ý DB cho role trong `_build_context_parts`.
+5. Chạy `python -m pytest tests/test_role_registry*.py` — test kiểm tra bảng dẫn xuất và các bất biến (codegen ⇒ trích artifact, TL board/review chỉ cho codegen, planning roles không re-gen...).
 
 ---
 
@@ -225,6 +252,7 @@ rag-agent-platform/
 │   │   │   └── *.md                  → chunk.module = {project} (flat)
 │   │   └── ...
 │   ├── memory/
+│   │   ├── workflows.sqlite3         → Trạng thái mọi workflow (WORKFLOW_DB_PATH, SQLite WAL)
 │   │   └── episodic/
 │   │       └── workflow_runs.jsonl   → Log tự động mỗi workflow run (JSONL)
 │   └── artifacts/
@@ -242,18 +270,25 @@ rag-agent-platform/
 │   └── Dockerfile
 │
 ├── agent-api/
-│   ├── app.py                        → FastAPI SDLC orchestrator: /workflow/run /agent/{role} /artifacts
-│   ├── agents.py                     → 15 AgentConfig: model, system_prompt, depends_on, rag_query_hint
+│   ├── app.py                        → FastAPI SDLC orchestrator: /workflow/run /cancel /agent/{role} /artifacts, hàng đợi workflow
+│   ├── agents.py                     → 15 AgentConfig: model, system_prompt, depends_on, rag_query_hint + hành vi per-role (role registry)
 │   ├── workflow.py                   → LangGraph StateGraph: node factory, context builder, artifact generator
 │   ├── artifacts.py                  → Trích xuất file code từ markdown output, lưu vào disk
+│   ├── llm.py                        → Factory ChatOllama: timeout httpx thật, trần num_predict, FILEGEN_THINK
+│   ├── store.py                      → Lưu trạng thái workflow vào SQLite + khôi phục lúc khởi động
 │   ├── requirements.txt
 │   ├── Dockerfile
-│   └── static/
-│       └── workflow.html             → SDLC Workflow UI (single-page app)
+│   └── static/                       → Phục vụ tại /ui (workflow.html) và /ui/static/<path>
+│       ├── workflow.html             → SDLC Workflow UI (single-page app)
+│       └── vendor/                   → marked, DOMPurify, highlight.js, JSZip (+ LICENSE) — UI chạy offline
 │
-└── open-webui-tools/
-    ├── yan_knowledge_base.py         → Open WebUI tool: query RAG knowledge base
-    └── yan_agent_workflow.py         → Open WebUI tool: chạy SDLC workflow hoặc agent đơn lẻ
+├── open-webui-tools/
+│   ├── yan_knowledge_base.py         → Open WebUI tool: query RAG knowledge base
+│   └── yan_agent_workflow.py         → Open WebUI tool: chạy / theo dõi / hủy SDLC workflow hoặc agent đơn lẻ
+│
+├── tests/                            → pytest (chạy không cần Docker) — xem mục 19
+├── pyproject.toml                    → Cấu hình pytest, ruff, mypy
+└── .github/workflows/ci.yml          → CI: ruff + mypy + pytest (Python 3.11 / 3.12)
 ```
 
 **Định dạng file được hỗ trợ khi ingest:**
@@ -433,21 +468,33 @@ curl -s -X POST http://localhost:8090/ingest \
   -d '{"project": "myproject"}' | jq
 ```
 
-Kết quả thành công:
+Kết quả thành công (ingest tất cả project — rút gọn; field đầy đủ xem [POST /ingest](#post-ingest)):
 
 ```json
 {
   "status": "ok",
-  "projects": {
+  "projects_ingested": ["myproject"],
+  "total_documents": 4,
+  "total_chunks": 142,
+  "total_upserted": 142,
+  "total_skipped_unchanged": 0,
+  "reset": false,
+  "details": {
     "myproject": {
+      "status": "ok",
+      "chunks": 142,
       "upserted": 142,
-      "skipped": 0,
-      "errors": 0,
-      "graph_chunks_saved": 142
+      "skipped_unchanged": 0,
+      "failed_batches": 0,
+      "batch_error": null,
+      "graph_chunks_saved": 142,
+      "stale_removed": 0
     }
   }
 }
 ```
+
+Ingest là **tăng dần**: chạy lại khi tài liệu không đổi trả `upserted: 0`, `skipped_unchanged: 142` và không gọi Ollama lần nào.
 
 ### Bước 6 — Kiểm tra hệ thống
 
@@ -493,6 +540,7 @@ curl -s -X POST http://localhost:8091/workflow/run \
 {
   "workflow_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "pending",
+  "queue_position": null,
   "message": "Workflow đã được xếp hàng. Poll GET /workflow/a1b2c3d4-... để kiểm tra trạng thái."
 }
 ```
@@ -500,7 +548,15 @@ curl -s -X POST http://localhost:8091/workflow/run \
 ```bash
 # Poll trạng thái (workflow thường mất 15–60 phút tùy model)
 watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq .status'
+
+# Hoặc mở giao diện theo dõi trên trình duyệt
+#   http://localhost:8091/ui?id=a1b2c3d4-e5f6-7890-abcd-ef1234567890
+
+# Hủy nếu cần (bước đang chạy chạy nốt rồi dừng)
+curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890/cancel | jq
 ```
+
+> Mặc định chỉ một workflow chạy tại một thời điểm (`WORKFLOW_CONCURRENCY=1`); workflow gửi thêm nằm ở `pending` với `queue_position` = vị trí trong hàng đợi — xem [Hàng đợi workflow](#hàng-đợi-workflow-workflow_concurrency).
 
 ### Bước 8 — Thiết lập Open WebUI Tools (tùy chọn)
 
@@ -509,6 +565,8 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 3. Dán nội dung `open-webui-tools/yan_knowledge_base.py` → **Save**
 4. Lặp lại cho `open-webui-tools/yan_agent_workflow.py`
 5. Bật tool trong **Model Settings → Tools**
+
+> **Tool không tự cập nhật:** Open WebUI lưu bản tool được dán tay, nên sau khi pull code mới phải dán lại cả hai file (hiện là `yan_knowledge_base` 1.2.0 và `yan_agent_workflow` 2.1.0). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) **giữ nguyên** tới khi sửa tay trong **Valves** — xem [mục 13](#13-open-webui--custom-tools).
 
 ---
 
@@ -539,10 +597,10 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 | `OLLAMA_HOST` | `0.0.0.0` | Interface Ollama lắng nghe |
 | `OLLAMA_ORIGINS` | `*` | CORS origins cho Ollama API |
 | `OLLAMA_CONTEXT_LENGTH` | `32768` | Context window (tokens) cho mọi LLM call trong agent-api |
-| `OLLAMA_MAX_LOADED_MODELS` | `2` | Số model giữ đồng thời trong VRAM/RAM |
-| `OLLAMA_NUM_PARALLEL` | `2` | Số request Ollama xử lý song song |
+| `OLLAMA_MAX_LOADED_MODELS` | `1` | Số model giữ đồng thời trong VRAM/RAM. Workflow được thiết kế cho **một slot**: giữ `1` cùng `WORKFLOW_CONCURRENCY=1` |
+| `OLLAMA_NUM_PARALLEL` | `1` | Số request Ollama xử lý song song |
 | `OLLAMA_KEEP_ALIVE` | `5m` | Thời gian giữ model trong bộ nhớ sau request cuối |
-| `OLLAMA_REQUEST_TIMEOUT` | `1200` (agent-api) / `600` (rag-api) | Timeout (giây) cho mỗi lần gọi LLM (agent-api: mọi agent step; rag-api: chat model của `/ask`) |
+| `OLLAMA_REQUEST_TIMEOUT` | `1200` (agent-api) / `600` (rag-api) | Timeout (giây) httpx cho mỗi lần gọi LLM — agent-api: mọi agent step; rag-api: chat model của `/ask` **và** LLM trích xuất thực thể lúc ingest (`GRAPH_ENTITY_EXTRACTION=true`). ChatOllama gọi Ollama ở chế độ stream nên đây là giới hạn thời gian tới **token đầu tiên** (gồm cả load/swap model và xử lý prompt) và **khoảng lặng giữa hai chunk**, không phải tổng thời gian sinh. `<= 0` = không giới hạn. Timeout này nay mới thực sự được áp dụng (trước đây ChatOllama 0.3.x bỏ qua kwarg `request_timeout` nên timeout là vô hạn) — máy chậm/chạy CPU có thể phải tăng giá trị |
 | `OLLAMA_FLASH_ATTENTION` | `1` | Bật Flash Attention (tăng tốc trên GPU hỗ trợ) |
 
 ### Nhóm Models
@@ -581,7 +639,7 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 | `RAG_TOP_K` | `5` | Số chunk trả về mỗi query (default) |
 | `INGEST_EMBED_WORKERS` | `1` | Số request embed asyncio đồng thời khi ingest |
 | `INGEST_EMBED_RETRIES` | `3` | Số lần retry khi embed một batch lúc ingest lỗi (OOM / HTTP tạm thời) |
-| `RAG_TIMEOUT` | `600` | Ở rag-api: timeout (giây) mỗi lần gọi Ollama `/api/embed` (cùng biến với agent-api, xem bên dưới) |
+| `RAG_TIMEOUT` | `600` | Ở rag-api: timeout (giây) mỗi lần gọi Ollama `/api/embed` — cả embed câu hỏi (`/ask`, `/retrieve`) lẫn từng batch lúc ingest (trước đây ingest dùng cứng 600 s). Cùng biến với agent-api, xem bên dưới |
 | `GRAPH_ENABLED` | `true` | Bật Neo4j graph enrichment (`false` = rag-api không chạm tới Neo4j) |
 | `GRAPH_ENTITY_EXTRACTION` | `false` | LLM extract entity khi ingest (chậm hơn nhưng tăng độ phong phú graph) |
 
@@ -593,12 +651,12 @@ watch -n 30 'curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef12
 | `MAX_FILES_PER_ROLE` | `6` | Số file tối đa mỗi coding agent sinh trong 1 workflow |
 | `CLARIFIER_REGEN_LOOPS` | `1` | Số vòng lặp Clarifier re-generation (0 = tắt) |
 | `WORKFLOW_MAX_SECONDS` | `0` | Ngân sách thời gian tổng của một workflow (giây), kiểm tra giữa các node. `0` = không giới hạn |
-| `WORKFLOW_CONCURRENCY` | `1` | Số workflow chạy đồng thời; workflow khác xếp hàng. Giữ `1` khi `OLLAMA_NUM_PARALLEL=1` |
-| `WORKFLOW_DB_PATH` | `/data/memory/workflows.sqlite3` | File SQLite lưu trạng thái workflow — nằm trong volume `./data/memory` nên còn sau restart |
-| `PLANNER_NUM_PREDICT` | `2048` | Trần token sinh ra (`num_predict`) cho planner JSON danh sách file |
-| `FILEGEN_NUM_PREDICT` | `8192` | Trần token sinh ra cho mỗi file code |
-| `REPORT_NUM_PREDICT` | `16384` | Trần token sinh ra cho báo cáo Markdown của mỗi agent |
-| `FILEGEN_THINK` | *(rỗng)* | Bật/tắt thinking khi sinh file code (`true`/`false`); rỗng = theo mặc định của model |
+| `WORKFLOW_CONCURRENCY` | `1` | Số workflow chạy đồng thời; workflow khác nằm `pending` trong hàng đợi FIFO. Giữ `1` (Ollama chỉ có một slot, một model nạp sẵn) — xem [Hàng đợi workflow](#hàng-đợi-workflow-workflow_concurrency) |
+| `WORKFLOW_DB_PATH` | `/data/memory/workflows.sqlite3` | File SQLite lưu trạng thái workflow — nằm trong volume `./data/memory` nên còn sau restart / rebuild. Xem [Lưu trạng thái workflow](#lưu-trạng-thái-workflow-sqlite-và-khôi-phục-sau-restart) |
+| `PLANNER_NUM_PREDICT` | `2048` | Trần token (`num_predict`) cho planner JSON danh sách file. Ghi chú chung cho ba biến `*_NUM_PREDICT` ở dòng `REPORT_NUM_PREDICT` |
+| `FILEGEN_NUM_PREDICT` | `8192` | Trần token cho mỗi lần sinh một file code |
+| `REPORT_NUM_PREDICT` | `16384` | Trần token cho báo cáo Markdown (gọi LLM một lần) của mỗi agent. **Ba biến `*_NUM_PREDICT`:** giá trị env là ngân sách cho **phần trả lời**. Lời gọi có thinking (model thuộc danh sách reasoning: `qwen3*`, `north-mini-code*`, `gemma4*`, `deepseek-r1*`, `qwq*`, `phi4-reasoning*`…, hoặc `FILEGEN_THINK=true`) được nhân ×2 vì token suy luận tính chung ngân sách `num_predict`; kết quả kẹp tối đa ở context window (`OLLAMA_CONTEXT_LENGTH`). `0` hoặc âm = không đặt trần. Với model mặc định (mọi agent model đều là reasoning) và `OLLAMA_CONTEXT_LENGTH=32768`, trần thực tế là 16384 token mỗi file và 32768 mỗi báo cáo; chỉ planner (`granite4.1:8b`) dùng đúng 2048. Chạm trần → log cảnh báo `chạm trần ...` |
+| `FILEGEN_THINK` | *(rỗng)* | Bật/tắt thinking khi sinh file code. Chỉ nhận `true`/`false` (không phân biệt hoa thường); giá trị khác bị bỏ qua kèm log cảnh báo. Rỗng = theo mặc định của model. Chỉ áp cho lời gọi sinh từng file (không áp cho planner hay báo cáo). Model không hỗ trợ thinking mà đặt `true` thì mọi file sẽ báo lỗi |
 | `MEMORY_DIR` / `ARTIFACT_DIR` | `/data/memory` / `/data/artifacts` | Cố định trong compose, khớp volume `./data/memory` và `./data/artifacts` |
 
 ### Nhóm Neo4j
@@ -651,11 +709,14 @@ curl -s http://localhost:8091/agents | jq
 
 ### GET /ui
 
-Giao diện web để theo dõi và tương tác với SDLC workflow.
+Giao diện web để theo dõi và tương tác với SDLC workflow. `GET /ui` (và `/ui/`) trả trang `workflow.html`; mọi file trong `agent-api/static/` được phục vụ tại `/ui/static/<đường dẫn>` (thư viện JS vendor: `/ui/static/vendor/<file>`) — UI không tải gì từ CDN.
 
 ```
 http://localhost:8091/ui
+http://localhost:8091/ui?id=<workflow_id>     # mở thẳng một workflow
 ```
+
+Chi tiết tính năng: [Giao diện theo dõi workflow (/ui)](#giao-diện-theo-dõi-workflow-ui).
 
 ### POST /agent/{role}
 
@@ -727,7 +788,7 @@ curl -s -X POST http://localhost:8091/agent/sa \
 
 ### POST /workflow/run
 
-Gửi SDLC workflow 15 bước chạy nền (async). Trả về `workflow_id` ngay lập tức.
+Xếp hàng SDLC workflow 15 bước chạy nền (async). Trả về `workflow_id` và `queue_position` ngay lập tức. Workflow chạy khi tới lượt trong [hàng đợi](#hàng-đợi-workflow-workflow_concurrency).
 
 **Request body:**
 
@@ -782,13 +843,16 @@ curl -s -X POST http://localhost:8091/workflow/run \
 {
   "workflow_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "pending",
+  "queue_position": 2,
   "message": "Workflow đã được xếp hàng. Poll GET /workflow/a1b2c3d4-... để kiểm tra trạng thái."
 }
 ```
 
+`queue_position`: vị trí trong hàng đợi, đếm từ 1 (1 = chạy kế tiếp); `null` khi workflow chạy ngay (còn slot trống).
+
 ### GET /workflow/{workflow_id}
 
-Kiểm tra trạng thái hoặc lấy kết quả đã hoàn thành.
+Kiểm tra trạng thái hoặc lấy kết quả đã hoàn thành. Trạng thái đọc từ SQLite nên phản ánh tiến trình thật (ghi lại sau mỗi agent) và vẫn đọc được sau khi agent-api restart.
 
 ```bash
 # Xem status
@@ -805,25 +869,83 @@ curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq
 
 # Kiểm tra lỗi nếu có
 curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq '.error'
+
+# Các bước lỗi (output bắt đầu bằng [LỖI ...])
+curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq '.failed_steps'
+
+# Vị trí hàng đợi / trạng thái hủy
+curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890 | jq '{status, queue_position, cancel_requested}'
 ```
 
-**Trạng thái workflow:**
+**Các trường chính của response:**
+
+| Trường | Mô tả |
+|---|---|
+| `status` | `pending` \| `running` \| `completed` \| `failed` \| `cancelled` |
+| `step_outputs` | `{role: markdown output}` của các bước đã chạy |
+| `completed_steps` | Danh sách role đã chạy xong (theo thứ tự) |
+| `failed_steps` | Role chạy xong nhưng output là lỗi (`[LỖI trong {role}]...`) |
+| `error` | Tóm tắt lỗi (bước lỗi, timeout, bị hủy, bị gián đoạn) hoặc `null` |
+| `artifacts` | `{role: [metadata file]}` — giống `GET /workflow/{id}/artifacts` |
+| `queue_position` | Vị trí trong hàng đợi khi `pending` (1 = chạy kế tiếp); `null` khi không còn xếp hàng (sắp chạy, đang chạy hoặc đã kết thúc) |
+| `cancel_requested` | `true` khi đã gửi yêu cầu hủy cho run đang chạy — workflow dừng sau bước hiện tại |
+| `created_at` / `completed_at` | ISO-8601 UTC |
+
+**Trạng thái workflow:** `pending → running → completed | failed | cancelled`
 
 | Status | Ý nghĩa |
 |---|---|
-| `pending` | Đã xếp hàng, chưa bắt đầu |
+| `pending` | Đã xếp hàng, chưa bắt đầu (xem `queue_position`) |
 | `running` | LangGraph đang thực thi các bước (bao gồm cả Clarifier regen loop) |
-| `completed` | Hoàn tất toàn bộ + Clarifier regen loop |
-| `failed` | Lỗi không xử lý được — kiểm tra trường `error` |
+| `completed` | Hoàn tất toàn bộ + Clarifier regen loop (có thể kèm một vài bước lỗi trong `failed_steps`) |
+| `failed` | Lỗi không xử lý được, hoặc bị gián đoạn do agent-api khởi động lại — kiểm tra trường `error` |
+| `cancelled` | Bị hủy qua `POST /workflow/{id}/cancel` — `error = "Đã hủy theo yêu cầu người dùng"`; output các bước đã xong vẫn giữ nguyên |
 
-> Nếu một bước gặp lỗi LLM (timeout, model chưa pull...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs` và trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp.
+> Nếu một bước gặp lỗi LLM (timeout, model chưa pull, coding agent không sinh được file nào...), hệ thống ghi `[LỖI trong <role>]...` vào `step_outputs`, thêm role vào `failed_steps` và tóm tắt vào trường `error`, nhưng **workflow vẫn tiếp tục** các bước kế tiếp.
+
+### POST /workflow/{workflow_id}/cancel
+
+Hủy một workflow chưa kết thúc.
+
+```bash
+curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890/cancel | jq
+```
+
+| Trạng thái lúc hủy | Kết quả | Response |
+|---|---|---|
+| `pending` (đang chờ) | Bị hủy ngay, không bao giờ chạy | 200 `{"workflow_id": "...", "status": "cancelled"}` |
+| `running` | Bước (agent) hiện tại **chạy nốt** — không thể ngắt giữa chừng một lần gọi LLM — rồi workflow dừng với `status = "cancelled"`. Trong lúc chờ, `GET /workflow/{id}` trả `cancel_requested: true` | 200 `{"workflow_id": "...", "status": "running"}` |
+| Không tồn tại | — | 404 |
+| Đã kết thúc (`completed` / `failed` / `cancelled`) | — | 409 |
+
+Workflow bị hủy có `status = "cancelled"` và `error = "Đã hủy theo yêu cầu người dùng"`; output của các bước đã xong vẫn được giữ và xem được bình thường (kể cả artifact). Yêu cầu hủy đã được chấp nhận (200) thì kết quả cuối luôn là `cancelled`.
 
 ### GET /workflows
 
-Liệt kê 50 workflow gần nhất.
+Liệt kê workflow gần nhất (mới nhất trước) — mặc định 50, thêm `?limit=N` (1–500) để xem nhiều hơn. `completed_steps` ở đây là **số** bước đã xong.
 
 ```bash
-curl -s http://localhost:8091/workflows | jq '[.[] | {workflow_id, status, created_at, completed_at}]'
+curl -s http://localhost:8091/workflows | jq '.workflows[] | {workflow_id, status, completed_steps, created_at, completed_at}'
+
+# 200 workflow gần nhất
+curl -s "http://localhost:8091/workflows?limit=200" | jq .count
+```
+
+```json
+{
+  "count": 1,
+  "workflows": [
+    {
+      "workflow_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "status": "completed",
+      "project": "myproject",
+      "completed_steps": 15,
+      "total_steps": 15,
+      "created_at": "2026-06-06T10:00:00+00:00",
+      "completed_at": "2026-06-06T10:30:42+00:00"
+    }
+  ]
+}
 ```
 
 ### GET /workflow/{workflow_id}/artifacts
@@ -836,15 +958,20 @@ curl -s http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567890/arti
 
 ```json
 {
-  "fe": [
-    {"role": "fe", "path": "src/pages/Login.tsx", "filename": "Login.tsx", "size_bytes": 2341},
-    {"role": "fe", "path": "src/hooks/useAuth.ts", "filename": "useAuth.ts", "size_bytes": 876}
-  ],
-  "be": [
-    {"role": "be", "path": "src/auth/auth.controller.ts", "filename": "auth.controller.ts", "size_bytes": 3102}
-  ]
+  "workflow_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "artifacts": {
+    "fe": [
+      {"path": "fe/_output.md", "filename": "_output.md", "language": "md", "size": 18234},
+      {"path": "fe/src/pages/Login.tsx", "filename": "src/pages/Login.tsx", "language": "tsx", "size": 2341}
+    ],
+    "be": [
+      {"path": "be/src/auth/auth.controller.ts", "filename": "src/auth/auth.controller.ts", "language": "ts", "size": 3102}
+    ]
+  }
 }
 ```
+
+`filename` là đường dẫn tương đối trong thư mục role — dùng cho endpoint đọc file bên dưới.
 
 ### GET /workflow/{workflow_id}/artifacts/{role}/{path}
 
@@ -860,6 +987,70 @@ curl -O "http://localhost:8091/workflow/a1b2c3d4.../artifacts/fe/src/pages/Login
 # Đọc toàn bộ markdown output của một agent
 curl -s "http://localhost:8091/workflow/a1b2c3d4.../artifacts/be/_output.md"
 ```
+
+### Hàng đợi workflow (`WORKFLOW_CONCURRENCY`)
+
+- agent-api chạy tối đa `WORKFLOW_CONCURRENCY` workflow cùng lúc (mặc định `1` — nên giữ `1` vì Ollama chỉ có một slot và một model nạp sẵn; chạy song song chỉ làm model bị swap liên tục). Workflow gửi thêm nằm ở trạng thái `pending` trong hàng đợi **FIFO** và chạy lần lượt.
+- `queue_position` (trong response của `POST /workflow/run` và `GET /workflow/{id}`): vị trí trong hàng đợi, đếm từ 1 (1 = chạy kế tiếp). Giá trị là `null` khi workflow không còn xếp hàng (sắp chạy, đang chạy hoặc đã kết thúc).
+- Hủy workflow đang chờ hoặc đang chạy: [`POST /workflow/{workflow_id}/cancel`](#post-workflowworkflow_idcancel).
+- Hàng đợi và cờ hủy chỉ nằm trong bộ nhớ: khi agent-api khởi động lại, mọi workflow còn `pending`/`running` (kể cả workflow đang chờ hủy) chuyển sang `failed` với lỗi `"Bị gián đoạn do agent-api khởi động lại"` — hãy gửi lại nếu cần.
+
+### Lưu trạng thái workflow (SQLite) và khôi phục sau restart
+
+- agent-api lưu trạng thái mọi workflow vào SQLite tại `WORKFLOW_DB_PATH` (mặc định `/data/memory/workflows.sqlite3`, nằm trong volume `./data/memory` nên còn sau khi container restart hoặc được build lại). Mỗi bản ghi lưu dạng JSON đầy đủ, kèm cột index `workflow_id`, `status`, `created_at`. DB chạy WAL mode.
+- Giữ tối đa **500** workflow mới nhất. Bản ghi đã kết thúc (`completed` / `failed` / `cancelled`) cũ nhất bị xóa trước; run đang `pending`/`running` không bao giờ bị xóa.
+- Tiến trình được ghi lại sau mỗi agent hoàn thành, nên `GET /workflow/{id}` phản ánh tiến trình thật và vẫn đọc được sau restart.
+- Nếu agent-api khởi động lại khi còn workflow đang chạy hoặc đang chờ, lúc startup các workflow đó chuyển sang `failed` với lỗi `"Bị gián đoạn do agent-api khởi động lại"`. Workflow đã kết thúc không bị thay đổi. Hiện **chưa hỗ trợ chạy tiếp (resume)** workflow bị gián đoạn: hãy chạy lại.
+- Workflow cũ không có trong DB (chạy trước khi có SQLite, hoặc đã bị xóa do giới hạn 500) vẫn xem được nhờ dựng lại từ `data/artifacts` và `data/memory/episodic/workflow_runs.jsonl` (chỉ khôi phục được output của role có artifact). Run có artifact nhưng không có dòng hoàn tất trong JSONL được báo là `failed` (bị gián đoạn).
+- Chỉ chạy agent-api với **1 process** (uvicorn 1 worker, như Dockerfile): bước khôi phục lúc startup coi mọi run đang chạy là của process cũ đã dừng.
+- Nếu không mở được file SQLite (sai quyền, file hỏng) thì agent-api dừng ngay khi khởi động và ghi log lỗi. Sửa quyền hoặc xóa file (mất lịch sử workflow trong DB; artifact trên disk vẫn còn) rồi khởi động lại.
+
+```bash
+# Xem nhanh DB (cần sqlite3 trên host)
+sqlite3 data/memory/workflows.sqlite3 \
+  "SELECT workflow_id, status, created_at FROM workflows ORDER BY created_at DESC LIMIT 10;"
+```
+
+### Giao diện theo dõi workflow (/ui)
+
+**Trạng thái, hủy và kết nối:**
+
+- **Bước lỗi (✗ đỏ):** bước có output bắt đầu bằng `[LỖI …]` (hoặc nằm trong `failed_steps` khi chưa có output) hiện dấu ✗ đỏ trên sơ đồ 15 bước và trên tab; mở tab sẽ thấy thông báo "Bước này thất bại" ở đầu, chi tiết lỗi ngay bên dưới. Thanh trạng thái ghi thêm "· ✗ N lỗi" cạnh số bước. Workflow vẫn có thể "Completed" khi một vài bước lỗi.
+- **Một số file không sinh được (⚠ vàng):** coding role sinh được một phần file — output có mục "⚠️ File generation errors" — hiện ⚠ trên tab và dấu ✓ màu vàng trên sơ đồ, kèm thông báo dẫn tới danh sách file lỗi. Các file còn lại vẫn dùng được.
+- **Hàng đợi:** workflow đang chờ hiện "Đang chờ trong hàng đợi (vị trí N)" — vị trí 1 là chạy kế tiếp.
+- **Hủy workflow:** nút "✕ Hủy workflow" hiện khi workflow `pending`/`running`. Sau khi xác nhận: run đang chờ bị hủy ngay; run đang chạy hiện "Đang hủy — sẽ dừng sau bước hiện tại" (bước đang chạy chạy nốt rồi dừng) và chuyển sang trạng thái **Cancelled** (badge xám). Workflow đã kết thúc thì không hủy được nữa.
+- **Mất kết nối tạm thời:** khi agent-api khởi động lại hoặc mạng chập chờn (lỗi 5xx / không kết nối được), trang **không** xóa dữ liệu đang xem: hiện banner vàng "Mất kết nối tới agent-api…", tự thử lại sau 2.5s → 5s → 10s → 20s → tối đa 30s (hoặc bấm "Thử lại ngay"), banner tự ẩn khi kết nối lại. Chỉ khi workflow không tồn tại (404) trang mới dừng theo dõi và báo lỗi. Khi chuyển sang workflow khác, trang không bao giờ hiện dữ liệu của workflow trước trong lúc workflow mới chưa tải xong.
+- **Tab ẩn:** khi tab trình duyệt bị ẩn, trang tạm dừng poll để đỡ tải agent-api; quay lại tab là cập nhật ngay.
+
+**Điều hướng và hiển thị:**
+
+- **Back/Forward:** URL `/ui?id=<workflow_id>` luôn khớp với workflow đang theo dõi. Mỗi lần mở một workflow khác thì có thêm một mục lịch sử; Back/Forward của trình duyệt chuyển qua lại giữa các workflow (workflow vừa rời đi sẽ ngừng poll). Back về `/ui` (không có `?id=`) thì quay lại màn hình trống. Bấm Track lại cùng ID hoặc tải lại trang không tạo mục lịch sử trùng.
+- **Recent:** mục của hôm nay chỉ hiện giờ, mục của ngày khác hiện ngày + giờ. Di chuột lên mục để xem thời điểm đầy đủ.
+- **Copy ID / Copy code chạy cả trên http thường:** Clipboard API của trình duyệt chỉ có trong secure context (https hoặc localhost). Khi mở UI qua `http://<ip>:8091`, UI tự chuyển sang cách sao chép cũ (`document.execCommand('copy')`). Mọi phản hồi (sao chép, hủy workflow, tải zip) hiện dưới dạng toast ở góc dưới phải, trình đọc màn hình cũng đọc được. Nếu không sao chép được, toast hiện luôn Workflow ID để chép tay.
+- **Bảng và output dài:** ô bảng tự xuống dòng (cột đầu chỉ giữ một dòng khi mọi ô của cột đều ngắn). Bảng chỉ cuộn ngang trong khung riêng khi có quá nhiều cột, bảng cao cuộn dọc với hàng tiêu đề dính trên. Thanh tab các bước dính ngay dưới header khi cuộn output dài. Bước đang chạy tự được cuộn vào khung của dải tiến trình. Trên điện thoại, thanh trạng thái thu gọn và vẫn có nút hủy.
+- **Khối code:** chỉ khối có ghi ngôn ngữ mà highlight.js hỗ trợ mới được tô màu; khối không ghi ngôn ngữ (sơ đồ ASCII, cây thư mục, log) không bao giờ bị tô. Việc tô màu chỉ chạy khi khối sắp hiện trên màn hình. Một số tên ngôn ngữ được đổi trước khi tô (bảng `HL_ALIASES` trong `workflow.html`): `tf`/`hcl`/`terraform`/`mermaid`/`text` → không tô; `conf` → nginx; `Dockerfile` → dockerfile; `Jenkinsfile`/`gradle` → groovy; `env` → ini; `shell`/`zsh` → bash. Mỗi khối code (và trình xem file artifact) có nút **Copy**.
+
+**Chạy offline — thư viện giao diện đi kèm repo:**
+
+Giao diện `/ui` không tải gì từ Internet/CDN. Các thư viện JS/CSS nằm sẵn trong `agent-api/static/vendor/`, được phục vụ qua `/ui/static/vendor/<file>`. Phiên bản ghi ngay trong tên file, mỗi thư viện kèm file LICENSE:
+
+| Thư viện | File | Vai trò |
+|---|---|---|
+| marked 11.2.0 | `marked-11.2.0.min.js` | Render markdown |
+| DOMPurify 3.4.17 | `dompurify-3.4.17.min.js` | Lọc HTML (giấy phép Apache-2.0 hoặc MPL-2.0) |
+| highlight.js 11.12.0 (gói `@highlightjs/cdn-assets`) | `highlight-11.12.0.min.js` + `highlight-11.12.0-github-dark.min.css` | Tô màu code |
+| highlight.js grammar lẻ | `highlight-11.12.0-<ngôn ngữ>.min.js`: dockerfile, nginx, dart, groovy, properties | Lấy nguyên bản từ `npm pack @highlightjs/cdn-assets@11.12.0`, dùng chung `highlight-11.12.0.LICENSE`, phải nạp **sau** `highlight-11.12.0.min.js` |
+| JSZip 3.10.2 | `jszip-3.10.2.min.js` | Chỉ nạp khi bấm "Download All" lần đầu |
+
+Nếu marked/DOMPurify không tải được (file thiếu hoặc bị chặn), trang vẫn poll bình thường và hiện output của từng bước dạng văn bản thô đã escape, kèm dòng cảnh báo "Không định dạng được markdown".
+
+Nâng cấp một thư viện:
+1. `npm pack <gói>@<phiên bản>`, giải nén, chép đúng file `.min.js`/`.css` và LICENSE vào `agent-api/static/vendor/`, đổi tên thành `<lib>-<x.y.z>…`
+2. Sửa đường dẫn `/ui/static/vendor/...` trong `workflow.html`
+3. Xóa file `.js`/`.css` của bản cũ
+4. Chạy `python -m pytest tests/test_workflow_ui.py`. Test kiểm tra: không còn CDN, mọi file được tham chiếu đều tồn tại, banner khớp phiên bản trong tên file, có LICENSE, không sót file `.js`/`.css` cũ.
+
+Thêm ngôn ngữ cho highlight.js: chép `languages/<lang>.min.js` cùng phiên bản theo đúng quy tắc đặt tên `highlight-11.12.0-<lang>.min.js`, rồi thêm thẻ `<script>` sau `highlight-11.12.0.min.js` (test kiểm tra tên file, LICENSE, banner phiên bản và việc file được dùng).
 
 ---
 
