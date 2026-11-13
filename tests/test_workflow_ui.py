@@ -71,20 +71,61 @@ const LIBS = {
     broken: {},
   },
   DOMPurify: { ok: { sanitize(h, cfg) { calls.push(['sanitize', cfg]); return 'CLEAN:' + h; } } },
-  hljs: { ok: { highlightElement(el) { calls.push(['hl', el.id]); if (el.id === 'bad') throw new Error('x'); } } },
+  // hljs giả: biết đúng các grammar có trong vendor (common + grammar lẻ đã nạp), không có HCL.
+  hljs: { ok: {
+    getLanguage(n) {
+      return ['python', 'typescript', 'ts', 'nginx', 'dockerfile', 'bash', 'ini', 'groovy', 'shell', 'yml']
+        .includes(String(n).toLowerCase()) ? {} : undefined;
+    },
+    highlight(text, o) {
+      calls.push(['hl', o.language, text]);
+      if (text === 'BAD') throw new Error('x');
+      return { value: '<span class="hljs-x">' + text + '</span>' };
+    },
+  } },
 };
+// IntersectionObserver giả (input.lazy): chỉ ghi lại target; ["intersect", i] mới "cuộn tới" khối i.
+const io = { targets: [], cb: null, disconnected: 0 };
+class FakeIO {
+  constructor(cb, opts) { io.cb = cb; io.opts = opts; }
+  observe(t) { if (!io.targets.includes(t)) io.targets.push(t); }   // như IO thật: observe lại là no-op
+  unobserve(t) { io.targets = io.targets.filter(x => x !== t); }
+  disconnect() { io.targets = []; io.disconnected++; }
+}
 const ctx = { window: { location: { search: '' }, addEventListener() {}, history: { pushState() {} } },
   URLSearchParams, console: { warn() {} }, document: { getElementById: el, addEventListener() {} } };
 for (const [name, kind] of Object.entries(input.libs || { marked: 'ok' })) ctx[name] = LIBS[name][kind];
+if (input.lazy) ctx.IntersectionObserver = FakeIO;
 vm.createContext(ctx);
 vm.runInContext(src, ctx);
+// <pre><code class=…>text</code></pre> giả
+function codeBlock([cls, text]) {
+  const code = { className: cls, textContent: text, innerHTML: '', dataset: {}, added: [],
+                 classList: { add(c) { code.added.push(c); } } };
+  code.parentElement = { querySelector: () => code };
+  return code;
+}
+const view = c => ({ html: c.innerHTML, cls: [...c.added] });
 process.stdout.write(JSON.stringify({
   esc: (input.esc || []).map(s => ctx.esc(s)),
   diagram: (input.diagram || []).map(s => ctx.looksLikeAsciiDiagram(s)),
   promote: (input.promote || []).map(t => { const tok = { ...t }; ctx.promoteAsciiDiagram(tok); return tok; }),
   render: (input.render || []).map(s => ctx.renderMarkdown(s)),
-  highlight: (input.highlight || []).map(ids => ctx.highlightCode({
-    querySelectorAll(sel) { calls.push(['sel', sel]); return ids.map(id => ({ id })); } })),
+  alias: (input.alias || []).map(n => ctx.hlLanguageOf(n)),
+  // Mỗi phần tử: danh sách [class, text]; highlightCode chạy HAI lần trên cùng các khối
+  // (khối đã tô không được tô lại). input.lazy: sau đó lần lượt "cuộn tới" các khối input.intersect.
+  highlight: (input.highlight || []).map(blocks => {
+    const codes = blocks.map(codeBlock);
+    const root = { querySelectorAll(sel) { calls.push(['sel', sel]); return codes; } };
+    ctx.highlightCode(root);
+    ctx.highlightCode(root);
+    const before = codes.map(view), observed = io.targets.length;
+    for (const i of input.intersect || []) {
+      io.cb([{ isIntersecting: false, target: codes[i].parentElement }]);
+      io.cb([{ isIntersecting: true, target: codes[i].parentElement }]);
+    }
+    return { before, observed, after: codes.map(view), left: io.targets.length, opts: io.opts };
+  }),
   calls,
 }));
 """
@@ -253,16 +294,62 @@ def test_vendor_libs_present_render_sanitized_markdown():
     assert ["sanitize", _FORBID] in calls
 
 
+_HL_LIBS = {"marked": "ok", "DOMPurify": "ok", "hljs": "ok"}
+# [class của <code>, nội dung] — khối trơn / không có grammar / bảng alias / khối ném lỗi
+_HL_BLOCKS = [
+    ["", "User ---> API\nAPI ---> DB"],            # ``` không ghi ngôn ngữ (sơ đồ) — không tự đoán
+    ["language-plaintext", "+--+\n|  |"],           # sơ đồ ASCII đã được promoteAsciiDiagram đổi thành code
+    ["language-tf", 'resource "x" "y" {}'],         # Terraform: không có grammar → để trơn
+    ["language-python", "BAD"],                     # hljs ném lỗi ở khối này…
+    ["language-Dockerfile", "FROM python:3.11"],    # …các khối sau vẫn được tô
+    ["language-conf", "server { listen 80; }"],
+    ["language-toString", "x"],                     # tên trùng prototype của Object → không resolve
+    ["language-ts", "const a = 1"],
+]
+
+
 @pytest.mark.parametrize("with_hljs", [True, False], ids=["hljs", "no-hljs"])
-def test_highlight_only_explicit_languages_and_never_throws(with_hljs):
-    """Khối ``` không ghi ngôn ngữ không bị hljs tự đoán; lỗi ở một khối không làm hỏng lượt render."""
-    libs = {"marked": "ok", "DOMPurify": "ok", **({"hljs": "ok"} if with_hljs else {})}
-    calls = _run_js({"libs": libs, "highlight": [["a", "bad", "b"]]})["calls"]
-    hl = [c for c in calls if c[0] in ("sel", "hl")]
-    if with_hljs:
-        assert hl == [["sel", 'pre code[class*="language-"]'], ["hl", "a"], ["hl", "bad"], ["hl", "b"]]
-    else:
-        assert hl == []
+def test_highlight_only_known_languages_and_never_throws(with_hljs):
+    """Chỉ tô khối có ngôn ngữ hljs biết (qua bảng alias); khối trơn không bị tự đoán; lỗi ở một khối không làm hỏng lượt render."""
+    libs = _HL_LIBS if with_hljs else {"marked": "ok", "DOMPurify": "ok"}
+    out = _run_js({"libs": libs, "highlight": [_HL_BLOCKS]})
+    hl = [c for c in out["calls"] if c[0] in ("sel", "hl")]
+    if not with_hljs:
+        assert hl == [] and out["highlight"][0]["after"] == [{"html": "", "cls": []}] * len(_HL_BLOCKS)
+        return
+    # Gọi highlightCode hai lần: khối đã tô (hoặc đã xét) không bị tô lại.
+    assert hl == [
+        ["sel", 'pre code[class*="language-"]'], ["hl", "python", "BAD"], ["hl", "dockerfile", "FROM python:3.11"],
+        ["hl", "nginx", "server { listen 80; }"], ["hl", "ts", "const a = 1"],
+        ["sel", 'pre code[class*="language-"]'],
+    ]
+    after = out["highlight"][0]["after"]
+    painted = [i for i, b in enumerate(after) if b["cls"] == ["hljs"]]
+    assert painted == [4, 5, 7]
+    assert after[4]["html"] == '<span class="hljs-x">FROM python:3.11</span>'
+    assert after[0] == after[1] == after[2] == after[3] == {"html": "", "cls": []}
+
+
+def test_highlight_alias_table():
+    names = ["Dockerfile", "docker", "CONF", "nginxconf", "hcl", "terraform", "tf", "env", "shell", "zsh",
+             "Jenkinsfile", "text", "mermaid", "python", "yml", "constructor", "__proto__", "", None]
+    got = dict(zip(map(str, names), _run_js({"libs": _HL_LIBS, "alias": names})["alias"]))
+    assert got == {
+        "Dockerfile": "dockerfile", "docker": "dockerfile", "CONF": "nginx", "nginxconf": "nginx",
+        "hcl": None, "terraform": None, "tf": None, "env": "ini", "shell": "bash", "zsh": "bash",
+        "Jenkinsfile": "groovy", "text": None, "mermaid": None, "python": "python", "yml": "yml",
+        "constructor": None, "__proto__": None, "": None, "None": None,
+    }
+
+
+def test_highlight_is_lazy_until_the_block_scrolls_into_view():
+    blocks = [["language-python", "a = 1"], ["language-tf", "x"], ["language-python", "b = 2"]]
+    out = _run_js({"libs": _HL_LIBS, "lazy": True, "highlight": [blocks], "intersect": [2, 1]})
+    h = out["highlight"][0]
+    assert h["before"] == [{"html": "", "cls": []}] * 3, "chưa vào khung nhìn → chưa tô"
+    assert h["observed"] == 3 and h["opts"] == {"rootMargin": "300px 0px"}
+    assert [b["cls"] for b in h["after"]] == [[], [], ["hljs"]]   # chỉ khối đã cuộn tới (tf: không grammar)
+    assert h["left"] == 1, "khối đã xét được bỏ khỏi observer"
 
 
 # ── Trạng thái bước (failed / warn), cancelled, hàng đợi, poll bền bỉ ─────────────
@@ -944,3 +1031,40 @@ def test_tables_wrap_with_sticky_header_and_tabs_stick_below_header():
     tabs = _css_rule(".tabs-nav")
     assert "position: sticky" in tabs and "top: var(--header-h)" in tabs
     assert "overflow: clip" in _css_rule(".content-card")   # overflow:hidden làm sticky không dính
+
+
+@pytest.mark.parametrize("exec_ok", [True, False], ids=["copied", "failed"])
+def test_code_copy_button_flashes_and_announces(exec_ok):
+    res = _run_sm(
+        [["eval", "window.__b = document.createElement('button'); window.__b.textContent = 'Copy'; 0"],
+         ["await", "copyCode(window.__b, 'print(1)')"], ["eval", "window.__b.textContent"], ["snap"],
+         ["timers", 1500], ["eval", "window.__b.textContent"]],
+        exec=exec_ok,
+    )
+    flashed, snap, restored = res["out"][2], res["out"][3], res["out"][4]
+    assert res["logs"]["clip"] == [["exec", "copy", "print(1)"]]
+    assert flashed == ("✓ Đã chép" if exec_ok else "✗ Lỗi") and restored == "Copy"
+    assert snap["toastCls"] == ["toast toast-ok" if exec_ok else "toast toast-err"]
+
+
+def test_extra_highlight_grammars_register_after_the_core_bundle():
+    """Grammar lẻ (Dockerfile, nginx…) tự đăng ký vào hljs: phải nạp SAU bản core, và thật sự đăng ký được."""
+    html = HTML.read_text(encoding="utf-8")
+    srcs = re.findall(r"<script\b[^>]*\bsrc\s*=\s*[\"']/ui/static/vendor/([^\"']+)", html)
+    core = srcs.index("highlight-11.12.0.min.js")
+    extras = [s for s in srcs if s.startswith("highlight-11.12.0-") and s.endswith(".min.js")]
+    assert {"highlight-11.12.0-dockerfile.min.js", "highlight-11.12.0-nginx.min.js"} <= set(extras)
+    assert all(srcs.index(s) > core for s in extras)
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("không có node trên PATH")
+    js = (
+        "const vm = require('vm'), fs = require('fs'); const ctx = {}; vm.createContext(ctx);"
+        "for (const f of process.argv.slice(1)) vm.runInContext(fs.readFileSync(f, 'utf8'), ctx);"
+        "process.stdout.write(JSON.stringify(['dockerfile', 'nginx', 'dart', 'groovy', 'properties']"
+        ".map(l => !!vm.runInContext('hljs', ctx).getLanguage(l))));"
+    )
+    files = [str(VENDOR / s) for s in srcs[core:core + 1 + len(extras)]]
+    proc = subprocess.run([node, "-e", js, *files], capture_output=True, text=True, timeout=30, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [True] * 5

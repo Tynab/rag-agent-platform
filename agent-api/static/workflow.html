@@ -6,11 +6,19 @@
   <title>rag-agent-platform · Workflow UI</title>
   <!-- Thư viện vendor đi kèm repo (agent-api/static/vendor/, phiên bản ghi trong tên file)
        → chạy offline hoàn toàn, không phụ thuộc CDN. Giữ thẻ script đồng bộ (không defer/async):
-       script inline bên dưới cần marked/DOMPurify sẵn sàng. JSZip nạp lười khi bấm Download All. -->
+       script inline bên dưới cần marked/DOMPurify sẵn sàng. JSZip nạp lười khi bấm Download All.
+       highlight-11.12.0-<lang>.min.js: grammar lẻ của @highlightjs/cdn-assets@11.12.0 cho các ngôn
+       ngữ artifact mà bản common không có (Dockerfile, nginx, Dart, Groovy, .properties) — tự
+       đăng ký vào hljs nên phải nạp SAU highlight-11.12.0.min.js. -->
   <script src="/ui/static/vendor/marked-11.2.0.min.js"></script>
   <script src="/ui/static/vendor/dompurify-3.4.17.min.js"></script>
   <link rel="stylesheet" href="/ui/static/vendor/highlight-11.12.0-github-dark.min.css">
   <script src="/ui/static/vendor/highlight-11.12.0.min.js"></script>
+  <script src="/ui/static/vendor/highlight-11.12.0-dockerfile.min.js"></script>
+  <script src="/ui/static/vendor/highlight-11.12.0-nginx.min.js"></script>
+  <script src="/ui/static/vendor/highlight-11.12.0-dart.min.js"></script>
+  <script src="/ui/static/vendor/highlight-11.12.0-groovy.min.js"></script>
+  <script src="/ui/static/vendor/highlight-11.12.0-properties.min.js"></script>
   <style>
     /* ── Reset & tokens ───────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -729,6 +737,29 @@
     .md pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
     .md pre code { font-size: 12.5px; line-height: 1.45; }
     .md code { font-size: 12px; }
+    /* Khối code trong output: nút Copy ở góc trên phải, đặt NGOÀI <pre> (pre tự cuộn ngang/dọc
+       — nút nằm trong sẽ trôi theo nội dung). Mờ khi không dùng; rõ khi hover / focus bàn phím,
+       luôn rõ trên màn cảm ứng. z-index dưới thanh tab sticky (20). */
+    .md .code-wrap { position: relative; margin: 8px 0; }
+    .md .code-wrap > pre { margin: 0; }
+    .code-copy {
+      position: absolute;
+      top: 6px; right: 12px;
+      z-index: 2;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      opacity: .6;
+      transition: opacity .15s, color .15s;
+    }
+    .code-wrap:hover .code-copy, .code-copy:focus-visible { opacity: 1; color: var(--text); }
+    .code-copy:focus-visible { outline: 2px solid var(--accent-l); outline-offset: 2px; }
+    @media (hover: none) { .code-copy { opacity: 1; } }
     /* Đường lui khi không render được markdown (renderMarkdown): text thô xuống dòng như
        văn bản — không thành hộp 520px cuộn ngang/dọc trên màn hẹp. */
     .md pre.md-fallback { white-space: pre-wrap; overflow-wrap: anywhere; max-height: none; overflow: visible; }
@@ -960,6 +991,22 @@ const ARTIFACT_ROLES = new Set(['fe', 'mobile', 'be', 'dba', 'devsecops', 'tech_
 // Còn role đã xong mà /artifacts chưa có mục nào (vd. role không sinh file) → thử lại thưa
 const ART_RETRY_MS   = 30000;
 const TOAST_MAX      = 4;      // số toast hiện cùng lúc tối đa — cũ nhất bị bỏ trước
+
+// Tên ngôn ngữ của fence / artifact → grammar highlight.js (hlLanguageOf). null = cố ý KHÔNG
+// tô màu: không có grammar (Terraform/HCL), sơ đồ (mermaid, sơ đồ ASCII → plaintext), văn bản
+// thô. Tên không có trong bảng được dùng nguyên văn nếu hljs biết (ts, py, yml, sh…), không
+// thì để trơn. Map — không phải object — để fence ```constructor / ```toString không trúng
+// prototype. Khối không ghi ngôn ngữ KHÔNG bao giờ được tô (hljs tự đoán sẽ tô sơ đồ thành CSS/SQL).
+const HL_ALIASES = new Map([
+  ['tf', null], ['hcl', null], ['terraform', null], ['mermaid', null], ['plantuml', null],
+  ['text', null], ['txt', null], ['plaintext', null], ['plain', null], ['ascii', null], ['none', null],
+  ['conf', 'nginx'], ['nginxconf', 'nginx'],
+  ['dockerfile', 'dockerfile'], ['docker', 'dockerfile'], ['containerfile', 'dockerfile'],
+  ['jenkinsfile', 'groovy'], ['gradle', 'groovy'],
+  ['env', 'ini'], ['dotenv', 'ini'],
+  ['shell', 'bash'], ['zsh', 'bash'],   // hljs "shell" = phiên terminal có prompt $; fence ```shell thường chỉ là lệnh
+]);
+const HL_MAX_CHARS = 200000;   // khối lớn hơn: để trơn (hljs chạy đồng bộ, khóa trang)
 const FILE_GEN_ERRORS_RE = /^##[ \t]*⚠️?[ \t]*File generation errors[ \t]*$/m;
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -991,6 +1038,7 @@ let jszipLoading = null;   // Promise nạp JSZip lười (xem loadJSZip) — nu
 let currentView  = 'empty'; // view đang hiện: 'empty' | 'recent' | 'wf' (showView)
 let _artRolesKey = '';     // tập role artifact đã hoàn thành ở lần tải /artifacts gần nhất (shouldLoadArtifacts)
 let _artLoadAt   = 0;      // Date.now() của lần tải /artifacts gần nhất trong lúc workflow chạy
+let _hlObserver  = null;   // IntersectionObserver tô màu code lười (highlightCode)
 
 /* ────────────────────────────────────────────────────────────────────────
    INIT — pick up workflow_id from URL query string
@@ -1012,6 +1060,9 @@ let _artLoadAt   = 0;      // Date.now() của lần tải /artifacts gần nh�
   });
   document.addEventListener('visibilitychange', onVisibilityChange);
   window.addEventListener('popstate', onPopState);
+  // Nút Copy của khối code (output + viewer artifact) — một listener cho cả tab-body vì nội
+  // dung bên trong được dựng lại khi đổi tab / có output mới.
+  document.getElementById('tab-body').addEventListener('click', onTabBodyClick);
 })();
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -1502,6 +1553,8 @@ function renderTabBody(data) {
   ].join('|');
   if (_bodyKey === _lastBodyKey) return;   // không đổi → giữ nguyên DOM + scroll
   _lastBodyKey = _bodyKey;
+  // Nội dung cũ sắp bị thay → bỏ các khối code cũ khỏi hàng đợi tô màu lười
+  if (_hlObserver) _hlObserver.disconnect();
 
   if (_hasKey && output && output.trim()) {
     // Có output — render markdown (đã sanitize, xem renderMarkdown) + panel files nếu có
@@ -1536,7 +1589,8 @@ function renderTabBody(data) {
       const btnFil = document.getElementById('stb-files');
       if (btnFil) btnFil.classList.add('active');
     }
-    // Apply syntax highlighting to code blocks inside rendered markdown
+    // Nút Copy cho từng khối code, rồi tô màu lười (chỉ khối có ngôn ngữ hljs biết)
+    addCodeCopyButtons(body);
     highlightCode(body);
     // Wrap every table in a scrollable container so wide tables don't overflow
     body.querySelectorAll('.md table').forEach(tbl => {
@@ -1667,15 +1721,91 @@ function renderMarkdown(src) {
        + `<pre class="md-fallback">${esc(src)}</pre>`;
 }
 
-// Tô màu code bằng highlight.js (nếu đã tải). Chỉ khối có ngôn ngữ rõ ràng
-// (```python → class language-python; viewer artifact luôn có): khối ``` không ghi ngôn
-// ngữ thường là cây thư mục/sơ đồ/log — để hljs tự đoán sẽ tô màu bừa. Lỗi của một khối
-// không được làm hỏng cả lượt render (→ trang ngừng poll).
+// Tên ngôn ngữ (```Dockerfile, language của artifact…) → tên grammar hljs đã nạp, hoặc null
+// = không tô màu. Không phân biệt hoa thường. Xem HL_ALIASES.
+function hlLanguageOf(name) {
+  const key = String(name || '').trim().toLowerCase();
+  if (!key || typeof hljs === 'undefined') return null;
+  const lang = HL_ALIASES.has(key) ? HL_ALIASES.get(key) : key;
+  return lang && hljs.getLanguage(lang) ? lang : null;
+}
+
+// Tô màu MỘT khối <code class="language-xxx"> (mỗi khối một lần). Dùng hljs.highlight với
+// ngôn ngữ đã phân giải — không dùng highlightElement (khối lạ sẽ rơi vào tự đoán / cảnh báo).
+// Lỗi của một khối không được làm hỏng cả lượt render (→ trang ngừng poll).
+function highlightBlock(code) {
+  if (code.dataset.hl) return;
+  code.dataset.hl = '1';
+  const m    = /(?:^|\s)language-(\S+)/.exec(code.className || '');
+  const lang = m && hlLanguageOf(m[1]);
+  if (!lang) return;
+  const text = code.textContent;
+  if (text.length > HL_MAX_CHARS) return;
+  try {
+    code.innerHTML = hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
+    code.classList.add('hljs');
+  } catch (e) { console.warn('highlight.js lỗi:', e); }
+}
+
+// Tô màu code bằng highlight.js (nếu đã tải) — LƯỜI: chỉ khi khối sắp vào khung nhìn
+// (IntersectionObserver, nới 300px), nên output dài với hàng chục khối không khóa trang mỗi
+// lần render; khối trong sub-tab đang ẩn được tô khi người dùng mở nó. Trình duyệt không có
+// IntersectionObserver → tô ngay. Chỉ xét khối có class language-* (khối ``` trơn bỏ qua).
 function highlightCode(root) {
   if (typeof hljs === 'undefined') return;
-  root.querySelectorAll('pre code[class*="language-"]').forEach(el => {
-    try { hljs.highlightElement(el); } catch (e) { console.warn('highlight.js lỗi:', e); }
+  const blocks = Array.from(root.querySelectorAll('pre code[class*="language-"]'));
+  if (typeof IntersectionObserver === 'undefined') {
+    blocks.forEach(highlightBlock);
+    return;
+  }
+  if (!_hlObserver) {
+    _hlObserver = new IntersectionObserver(entries => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue;
+        _hlObserver.unobserve(en.target);
+        const code = en.target.querySelector('code');
+        if (code) highlightBlock(code);
+      }
+    }, { rootMargin: '300px 0px' });
+  }
+  blocks.forEach(code => _hlObserver.observe(code.parentElement || code));
+}
+
+// Bọc mỗi <pre> của output markdown trong .code-wrap kèm nút Copy (đặt TRƯỚC <pre> để thứ tự
+// Tab hợp lý). Bỏ qua <pre class="md-fallback"> (text thô khi không render được markdown).
+function addCodeCopyButtons(root) {
+  root.querySelectorAll('.md pre:not(.md-fallback)').forEach(pre => {
+    const wrap = document.createElement('div');
+    wrap.className = 'code-wrap';
+    pre.parentNode.insertBefore(wrap, pre);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'code-copy js-copy-code';
+    btn.textContent = 'Copy';
+    btn.setAttribute('aria-label', 'Sao chép khối code');
+    wrap.appendChild(btn);
+    wrap.appendChild(pre);
   });
+}
+
+function onTabBodyClick(e) {
+  const btn = e.target && e.target.closest ? e.target.closest('.js-copy-code') : null;
+  if (!btn) return;
+  const holder = btn.closest('.code-wrap, .art-viewer');
+  const src    = holder && (holder.querySelector('pre code') || holder.querySelector('pre'));
+  if (src) copyCode(btn, src.textContent);
+}
+
+// Sao chép một khối code (textContent — vẫn đúng nguyên văn sau khi hljs chèn span) + phản hồi
+// ngay trên nút và qua toast (vùng live, trình đọc màn hình đọc được).
+async function copyCode(btn, text) {
+  const ok = await copyText(text);
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = ok ? '✓ Đã chép' : '✗ Lỗi';
+  clearTimeout(Number(btn.dataset.timer));
+  btn.dataset.timer = String(setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500));
+  if (ok) toast('✓ Đã sao chép khối code', 'ok');
+  else toast('✗ Không sao chép được — hãy chọn và chép thủ công.', 'err');
 }
 
 /* ── Sơ đồ ASCII không bọc code fence ───────────────────────────────── */
@@ -2152,13 +2282,14 @@ async function viewArtifact(role, path) {
     viewer.innerHTML = `
       <div class="art-viewer-header">
         <span class="art-viewer-path">📄 ${esc(path)}</span>
+        <button type="button" class="btn btn-secondary btn-sm js-copy-code" aria-label="Sao chép nội dung file">Copy</button>
         <a class="btn btn-secondary btn-sm"
            href="/workflow/${wid}/artifacts/${role}/${encPath}?download=1"
            download="${esc(fname)}">⬇ Download</a>
-        <button class="btn btn-secondary btn-sm" onclick="closeArtViewer()">✕</button>
+        <button class="btn btn-secondary btn-sm" onclick="closeArtViewer()" aria-label="Đóng">✕</button>
       </div>
       <pre class="art-viewer-body"><code class="language-${esc(lang)}">${escaped}</code></pre>`;
-    highlightCode(viewer);
+    highlightCode(viewer);   // lười như output; ngôn ngữ artifact (tf, conf, txt…) qua HL_ALIASES
     const _reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     viewer.scrollIntoView({ behavior: _reduce ? 'auto' : 'smooth', block: 'nearest' });
   } catch (e) { /* ignore */ }
