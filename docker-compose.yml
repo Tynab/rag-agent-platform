@@ -124,7 +124,9 @@ services:
       # Biến rỗng thì entrypoint bỏ qua.
       NEO4J_PASSWORD: ""
       WATCHTOWER_HTTP_API_TOKEN: ""
-      NEO4J_PLUGINS: '["apoc"]'
+      # D5a: KHÔNG cài plugin (NEO4J_PLUGINS) — rag-api chỉ dùng Cypher thuần (MERGE /
+      # MATCH / constraint), không gọi procedure apoc.*. Bỏ APOC = không tải jar từ internet
+      # mỗi lần tạo container (stack offline), start nhanh hơn, bớt bề mặt tấn công.
       NEO4J_server_memory_heap_initial__size: 512m
       NEO4J_server_memory_heap_max__size: 1G
       NEO4J_server_memory_pagecache_size: 512m
@@ -132,13 +134,15 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     # Kiểm tra cổng Bolt bằng /dev/tcp của bash (không cần curl/wget, không lộ
-    # password như cypher-shell). start_period dài vì lần đầu phải tải plugin APOC.
+    # password như cypher-shell). start_period 30s cho JVM khởi động và lần start đầu
+    # khởi tạo database trên volume rỗng (không còn tải plugin); retries 10 × 15s vẫn
+    # chừa dư cho máy chậm trước khi bị coi là unhealthy.
     healthcheck:
       test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/7687"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 60s
+      start_period: 30s
     networks:
       - yan
     restart: unless-stopped
@@ -194,7 +198,8 @@ services:
     # D2: chờ Ollama + Qdrant healthy trước khi rag-api khởi động (Qdrant là bắt buộc
     # cho mọi /ingest và /ask). Neo4j CỐ Ý chỉ service_started: graph là tùy chọn
     # (GRAPH_ENABLED=false thì không dùng), rag-api degrade graceful khi Neo4j chưa
-    # sẵn sàng, và lần đầu Neo4j tải APOC khá lâu — không nên chặn cả stack vì nó.
+    # sẵn sàng, và Neo4j (JVM) khởi động chậm hơn các service khác — không nên chặn
+    # cả stack vì nó.
     depends_on:
       ollama:
         condition: service_healthy

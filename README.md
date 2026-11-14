@@ -434,7 +434,7 @@ Chờ đến khi tất cả container ở trạng thái `healthy`:
 docker compose ps
 ```
 
-> `ollama`, `qdrant`, `neo4j`, `rag-api`, `agent-api` đều có healthcheck. Thứ tự khởi động: `rag-api` chờ `ollama` + `qdrant` **healthy**; `agent-api` chờ thêm `rag-api` healthy; Open WebUI chờ `ollama` + `qdrant` healthy. `neo4j` cố ý chỉ là `service_started` với `rag-api` (graph là tùy chọn, rag-api degrade graceful) — lần đầu Neo4j tải plugin APOC nên có thể mất ~1 phút mới `healthy`.
+> `ollama`, `qdrant`, `neo4j`, `rag-api`, `agent-api` đều có healthcheck. Thứ tự khởi động: `rag-api` chờ `ollama` + `qdrant` **healthy**; `agent-api` chờ thêm `rag-api` healthy; Open WebUI chờ `ollama` + `qdrant` healthy. `neo4j` cố ý chỉ là `service_started` với `rag-api` (graph là tùy chọn, rag-api degrade graceful) — Neo4j (JVM) thường mất vài chục giây mới `healthy`, lâu hơn một chút ở lần start đầu (khởi tạo database trên volume rỗng). Neo4j chạy **không plugin** (không APOC): rag-api chỉ dùng Cypher thuần, nên container không phải tải jar từ internet khi tạo.
 
 ### Bước 3 — Pull models Ollama
 
@@ -1963,7 +1963,8 @@ curl -s -X POST http://localhost:8090/ask \
 | Tool `yan_knowledge_base` báo timeout dù rag-api vẫn đang trả lời | Valve `timeout` cũ (120) nhỏ hơn `OLLAMA_REQUEST_TIMEOUT` của rag-api — Ollama vẫn sinh tiếp và chiếm slot | Dán lại tool bản mới và đặt Valve `timeout` ≥ `curl -s localhost:8090/health \| jq .ollama_request_timeout` + thời gian truy hồi (mặc định 1260) |
 | Máy khác trong LAN không mở được UI | Cổng chỉ bind `127.0.0.1` (mặc định) | Đặt `BIND_ADDR=0.0.0.0` + `WEBUI_AUTH=true` — xem [Truy cập từ máy khác (LAN)](#truy-cập-từ-máy-khác-lan) |
 | `curl localhost:6333` / `:8090` từ máy khác bị từ chối | Hạ tầng luôn chỉ bind `127.0.0.1` | Chạy curl trên chính host hoặc dùng SSH tunnel |
-| Neo4j không kết nối | Container chưa sẵn sàng (lần đầu tải APOC) | Chờ `docker compose ps` báo neo4j `healthy`; `docker compose logs neo4j` |
+| Neo4j không kết nối | Container chưa sẵn sàng (JVM đang khởi động / lần đầu khởi tạo database) | Chờ `docker compose ps` báo neo4j `healthy`; `docker compose logs neo4j` |
+| Cypher báo `There is no procedure with the name apoc...` | Neo4j chạy không plugin (D5a) — rag-api không dùng APOC | Query tự viết trong Neo4j Browser: dùng Cypher thuần. Thật sự cần APOC thì thêm `NEO4J_PLUGINS: '["apoc"]'` vào `environment:` của neo4j (cần internet lúc tạo container) |
 | `dependency failed to start: container qdrant is unhealthy` | Qdrant chưa mở cổng 6333 sau ~1 phút | `docker compose logs qdrant` (thường do volume `qdrant_storage` hỏng / thiếu quyền) |
 | Biến trong `.env` không có tác dụng | Biến chưa được khai báo trong `environment:` của service | Thêm vào `docker-compose.yml`; chạy `pytest tests/test_config_wiring.py` để kiểm tra |
 | `/graph/status` → `connected: false` (log rag-api: `Neo4j ping failed ... unauthorized`) | `NEO4J_PASSWORD` trong `.env.secrets` khác mật khẩu đang lưu trong volume `neo4j_data` (`NEO4J_AUTH` chỉ áp dụng cho volume rỗng — vd. vừa sinh mật khẩu mới cho bản cài cũ) | `scripts/rotate-neo4j-password.sh` (nhập mật khẩu cũ) rồi `docker compose up -d`; nếu user đang bị khóa tạm do đăng nhập sai liên tục thì chờ vài giây rồi chạy lại |

@@ -460,6 +460,18 @@ def test_service_healthy_dependencies_have_healthcheck(compose):
     assert not bad, f"depends_on service_healthy nhưng service đích không có healthcheck: {bad}"
 
 
+def test_neo4j_runs_without_plugins_and_code_does_not_need_them(compose):
+    """D5a: rag-api chỉ dùng Cypher thuần → neo4j không cài plugin (APOC tải jar từ internet mỗi lần tạo container)."""
+    assert "NEO4J_PLUGINS" not in _env_keys(compose["services"]["neo4j"]), (
+        "neo4j không cần plugin — rag-api không gọi procedure apoc.*; bỏ NEO4J_PLUGINS"
+    )
+    uses_apoc = [
+        str(f.relative_to(ROOT)) for f in sorted((ROOT / "rag-api").rglob("*.py"))
+        if "apoc." in f.read_text(encoding="utf-8").lower()
+    ]
+    assert not uses_apoc, f"code gọi apoc.* nhưng neo4j không cài APOC (NEO4J_PLUGINS): {uses_apoc}"
+
+
 # image: <repo>:${<X>_IMAGE_TAG:-<tag mặc định>} — repo không chứa tag/biến, default không rỗng.
 _PINNABLE_IMAGE_RE = re.compile(r"^(?P<repo>[a-z0-9][a-z0-9._/-]*):\$\{(?P<var>[A-Z][A-Z0-9_]*_IMAGE_TAG):-(?P<default>[^}]+)\}$")
 
