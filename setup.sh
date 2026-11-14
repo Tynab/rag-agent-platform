@@ -48,4 +48,10 @@ echo "==> [5/5] Restart Docker daemon..."
 systemctl restart docker
 
 echo ""
-echo "✓ Setup hoàn tất. Bây giờ có thể chạy: docker compose up -d --build"
+echo "✓ Setup GPU hoàn tất."
+echo ""
+# D1b: secret (mật khẩu Neo4j, token watchtower) nằm trong .env.secrets — KHÔNG tạo ở đây:
+# script này chạy bằng root nên file sẽ thuộc root, docker compose của user thường không đọc được.
+echo "Bước tiếp theo — chạy bằng user THƯỜNG${SUDO_USER:+ (${SUDO_USER})}, KHÔNG dùng sudo, trong thư mục repo:"
+echo "  1. scripts/init-secrets.sh        # tạo .env.secrets (quyền 600) nếu chưa có"
+echo "  2. docker compose up -d --build"

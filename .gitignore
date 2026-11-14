@@ -129,9 +129,16 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+# Lưu ý: .env vẫn được track (chỉ chứa cấu hình KHÔNG bí mật) — dòng dưới chỉ chặn
+# `git add` nhầm file mới; file đã track không bị ảnh hưởng.
 .env
 .env.*
 *.env
+# Secret thật (D1b): tạo bằng scripts/init-secrets.sh, KHÔNG BAO GIỜ commit.
+.env.secrets
+.env.secrets.*
+# ...trừ file mẫu (chỉ có tên key, giá trị rỗng) — phải được commit.
+!.env.secrets.example
 .venv
 .venv/
 env/

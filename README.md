@@ -242,8 +242,15 @@ Tắt tính năng: `CLARIFIER_REGEN_LOOPS=0` trong `.env`.
 
 ```
 rag-agent-platform/
-├── .env                              # Nguồn cấu hình duy nhất (single source of truth)
+├── .env                              # Nguồn cấu hình duy nhất (single source of truth) — KHÔNG chứa secret
+├── .env.secrets                      # Secret thật (mật khẩu Neo4j, token watchtower) — gitignored, tạo bằng scripts/init-secrets.sh
+├── .env.secrets.example              # Mẫu .env.secrets: tên key + chú thích, giá trị rỗng
 ├── docker-compose.yml                # Định nghĩa toàn bộ dịch vụ của rag-agent-platform
+├── setup.sh                          # Cài NVIDIA driver + container toolkit (sudo)
+│
+├── scripts/
+│   ├── init-secrets.sh               → Tạo .env.secrets (giá trị ngẫu nhiên, quyền 600, không ghi đè)
+│   └── rotate-neo4j-password.sh      → Đổi mật khẩu Neo4j trên volume neo4j_data đã có
 │
 ├── data/
 │   ├── raw/                          # Tài liệu nguồn cho RAG
@@ -301,7 +308,7 @@ rag-agent-platform/
 
 ### Bước 1 — Chuẩn bị file `.env`
 
-Điền các biến bắt buộc vào `.env`:
+Điền các biến bắt buộc vào `.env` (file này **được commit vào git** nên chỉ chứa cấu hình không bí mật — mật khẩu/token nằm trong `.env.secrets`, xem [Bước 1b](#bước-1b--tạo-secrets-envsecrets)):
 
 ```env
 # ─── Truy cập mạng ───────────────────────────────────────────────────────────
@@ -360,7 +367,7 @@ INGEST_EMBED_WORKERS=2
 # ─── Neo4j ───────────────────────────────────────────────────────────────────
 NEO4J_URI=bolt://neo4j:7687
 NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=changeme_in_production
+# NEO4J_PASSWORD → .env.secrets (Bước 1b), KHÔNG đặt ở đây
 NEO4J_DATABASE=neo4j
 GRAPH_ENABLED=true
 GRAPH_ENTITY_EXTRACTION=false
@@ -376,7 +383,7 @@ QDRANT_COLLECTION_PREFIX=yan_raw_docs
 RAG_EMBEDDING_ENGINE=ollama
 
 # ─── Watchtower ──────────────────────────────────────────────────────────────
-WATCHTOWER_HTTP_API_TOKEN=your_secure_token_here
+# WATCHTOWER_HTTP_API_TOKEN → .env.secrets (Bước 1b), KHÔNG đặt ở đây
 # 6 trường (giây phút giờ ngày tháng thứ), tính theo TZ ở trên → 04:00 hằng ngày
 WATCHTOWER_SCHEDULE=0 0 4 * * *
 
@@ -391,6 +398,21 @@ CLARIFIER_REGEN_LOOPS=1
 # REPORT_NUM_PREDICT=16384
 # FILEGEN_THINK=
 ```
+
+### Bước 1b — Tạo secrets (`.env.secrets`)
+
+Mật khẩu Neo4j và token HTTP API của watchtower **không** nằm trong `.env` (file được commit) mà trong `.env.secrets` — file bị `.gitignore` chặn, quyền `600`, được `docker-compose.yml` nạp qua `env_file:` cho đúng ba service cần nó (`neo4j`, `rag-api`, `watchtower`). Cài mới chỉ cần chạy **một lần, trước lần `docker compose up` đầu tiên**, bằng **user thường** (không `sudo` — file phải thuộc user chạy `docker compose`):
+
+```bash
+scripts/init-secrets.sh
+```
+
+Script sinh giá trị ngẫu nhiên mạnh (64 ký tự hex, `openssl rand` hoặc `/dev/urandom`) cho `NEO4J_PASSWORD`, `NEO4J_AUTH` (= `neo4j/<NEO4J_PASSWORD>`, mật khẩu khởi tạo của container neo4j) và `WATCHTOWER_HTTP_API_TOKEN`; **không bao giờ ghi đè** `.env.secrets` đã có (chạy lại an toàn) và không in giá trị ra màn hình. Danh sách key + chú thích: `.env.secrets.example`. Cần `bash` (Windows: chạy trong WSL hoặc Git Bash).
+
+> - Thiếu `.env.secrets` thì `docker compose up` / `config` dừng ngay với lỗi `env file .../.env.secrets not found` — chạy `scripts/init-secrets.sh`.
+> - `NEO4J_AUTH` chỉ có tác dụng ở lần start **đầu tiên** của volume `neo4j_data` rỗng. Đổi mật khẩu Neo4j về sau (volume đã có dữ liệu): sửa `NEO4J_PASSWORD` **và** `NEO4J_AUTH` trong `.env.secrets` (hoặc đổi tên file cũ rồi chạy lại `scripts/init-secrets.sh`), chạy `scripts/rotate-neo4j-password.sh` (hỏi mật khẩu cũ), rồi `docker compose up -d`.
+> - Xem/dùng token watchtower mà không in ra màn hình: `set -a; . ./.env.secrets; set +a` rồi dùng `$WATCHTOWER_HTTP_API_TOKEN` (xem [Watchtower — Auto-update](#watchtower--auto-update)).
+> - Bản cài **trước** khi có `.env.secrets` (secret từng nằm trong `.env` và trong lịch sử git): làm theo [Nâng cấp bản cài cũ — chuyển secret sang .env.secrets](#nâng-cấp-bản-cài-cũ--chuyển-secret-sang-envsecrets).
 
 ### Bước 2 — Khởi động rag-agent-platform
 
@@ -569,6 +591,50 @@ curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567
 
 > **Tool không tự cập nhật:** Open WebUI lưu bản tool được dán tay, nên sau khi pull code mới phải dán lại cả hai file (hiện là `yan_knowledge_base` 1.2.0 và `yan_agent_workflow` 2.1.1). Giá trị Valve đã lưu từ bản cũ (vd. `timeout` 120, URL `localhost` / `host.docker.internal`) **giữ nguyên** tới khi sửa tay trong **Valves** — xem [mục 13](#13-open-webui--custom-tools).
 
+### Nâng cấp bản cài cũ — chuyển secret sang .env.secrets
+
+Chỉ dành cho máy đã chạy rag-agent-platform **trước** khi có `.env.secrets` (cài mới: chỉ cần [Bước 1b](#bước-1b--tạo-secrets-envsecrets)). Trước đây `NEO4J_PASSWORD` và `WATCHTOWER_HTTP_API_TOKEN` nằm trong `.env` — file được commit — nên giá trị cũ **vẫn còn trong lịch sử git** và phải coi là đã lộ: đổi **cả hai**. Làm đúng thứ tự dưới đây (bước 5 recreate `neo4j`/`rag-api`/`watchtower` — chờ workflow đang chạy xong trước):
+
+1. **Sao lưu `.env` TRƯỚC khi `git pull`** — bản mới xóa hai giá trị secret khỏi `.env`, nên bản sao lưu là nơi duy nhất còn mật khẩu Neo4j hiện tại (`.gitignore` đã chặn `.env.*`, file không bị commit nhầm):
+   ```bash
+   cp -p .env .env.pre-secrets.bak && chmod 600 .env.pre-secrets.bak
+   ```
+2. **Pull code mới.** Nếu `git pull` từ chối vì `.env` có thay đổi cục bộ (`would be overwritten by merge`), bỏ thay đổi của `.env` (đã sao lưu) rồi pull lại; sau đó chép lại các chỉnh sửa **không bí mật** của bạn (model, timeout…) từ bản sao lưu — **không** chép lại hai dòng secret:
+   ```bash
+   git pull || { git checkout -- .env && git pull; }
+   # So sánh, ẩn hai dòng secret khỏi màn hình:
+   diff .env.pre-secrets.bak .env | grep -v -E '^[<>] *(NEO4J_PASSWORD|WATCHTOWER_HTTP_API_TOKEN)='
+   ```
+3. **Tạo `.env.secrets`** với mật khẩu Neo4j và token watchtower **mới**:
+   ```bash
+   scripts/init-secrets.sh
+   ```
+4. **Đổi (rotate) cả hai secret** vì giá trị cũ còn trong lịch sử git:
+   - *Token watchtower*: bước 3 đã sinh token mới; token cũ hết hiệu lực khi watchtower được recreate ở bước 5.
+   - *Mật khẩu Neo4j*: volume `neo4j_data` vẫn dùng mật khẩu cũ (`NEO4J_AUTH` chỉ áp dụng cho volume rỗng), nên phải đổi **trong DB** sang `NEO4J_PASSWORD` mới của `.env.secrets` — chạy khi container neo4j đang chạy (container cũ từ trước khi pull là được; nếu đã dừng: `docker compose up -d neo4j`):
+     ```bash
+     NEO4J_OLD_PASSWORD="$(sed -n 's/^NEO4J_PASSWORD=//p' .env.pre-secrets.bak | tail -n 1)" \
+       scripts/rotate-neo4j-password.sh
+     ```
+     Giá trị trong `.env` cũ có nháy bao ngoài thì bỏ nháy — hoặc chạy `scripts/rotate-neo4j-password.sh` không kèm biến và nhập mật khẩu cũ khi được hỏi (không hiện ra màn hình). Script chạy `ALTER CURRENT USER SET PASSWORD FROM … TO …` bằng `cypher-shell` trong container, truyền mật khẩu qua biến môi trường/stdin (không qua tham số dòng lệnh).
+5. **Khởi động lại stack** với cấu hình mới, kiểm tra, rồi xóa bản sao lưu (chứa secret cũ, nay đã vô hiệu):
+   ```bash
+   docker compose up -d
+   curl -s http://localhost:8090/graph/status | jq .connected        # → true
+   rm .env.pre-secrets.bak
+   ```
+
+> **Giữ tạm mật khẩu Neo4j cũ** (khi chưa đổi được ngay, vd. không chạy được `cypher-shell`): ở bước 3 truyền mật khẩu cũ — `NEO4J_PASSWORD="$(sed -n 's/^NEO4J_PASSWORD=//p' .env.pre-secrets.bak | tail -n 1)" scripts/init-secrets.sh` — rồi bỏ qua phần Neo4j ở bước 4; stack chạy ngay với volume cũ. Mật khẩu đó vẫn nằm trong lịch sử git nên **phải đổi sớm**. Vì `init-secrets.sh` không bao giờ ghi đè file đã có, đưa mật khẩu mới vào bằng cách đổi tên file cũ:
+> ```bash
+> mv .env.secrets .env.secrets.old      # .gitignore chặn .env.secrets.*
+> scripts/init-secrets.sh               # file mới: mật khẩu Neo4j + token watchtower mới
+> NEO4J_OLD_PASSWORD="$(sed -n 's/^NEO4J_PASSWORD=//p' .env.secrets.old | tail -n 1)" scripts/rotate-neo4j-password.sh
+> docker compose up -d && rm .env.secrets.old
+> ```
+> Mật khẩu cũ chứa ký tự không an toàn cho file env (`/`, `$`, `#`, nháy, khoảng trắng…) thì `init-secrets.sh` từ chối giữ — dùng luồng chính ở trên.
+>
+> Đổi secret là đủ để vô hiệu giá trị cũ; xóa hẳn khỏi lịch sử git (`git filter-repo`, force-push) là tùy chọn và không thu hồi được các bản clone/fork đã có.
+
 ---
 
 ## 7. Biến môi trường chi tiết
@@ -580,7 +646,7 @@ curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567
 > mkdir -p ./data/raw ./data/memory/episodic ./data/artifacts
 > ```
 >
-> **Wiring biến (C1):** compose **không** dùng `env_file:` — mỗi service chỉ nhận đúng các key trong khối `environment:` của nó. Thêm biến mới vào code thì phải thêm `NAME: ${NAME:-<default>}` vào `environment:` của service tương ứng; `tests/test_config_wiring.py` quét code agent-api/rag-api và fail nếu thiếu, đồng thời kiểm tra mọi `${VAR}` không có default trong compose đều có trong `.env`.
+> **Wiring biến (C1):** cấu hình thường đi qua khối `environment:` — mỗi service chỉ nhận đúng các key trong khối đó. `env_file:` **chỉ** dùng cho file secret `.env.secrets` (D1b, xem [Nhóm Secrets](#nhóm-secrets-envsecrets)). Thêm biến mới vào code thì phải thêm `NAME: ${NAME:-<default>}` vào `environment:` của service tương ứng (secret thì thêm vào `.env.secrets.example` + `scripts/init-secrets.sh`); `tests/test_config_wiring.py` quét code agent-api/rag-api và fail nếu thiếu, đồng thời kiểm tra mọi `${VAR}` không có default trong compose đều có trong `.env`, `.env` không chứa giá trị secret và mỗi secret chỉ tới đúng service dùng nó.
 
 ### Nhóm truy cập mạng & chung
 
@@ -665,9 +731,21 @@ curl -s -X POST http://localhost:8091/workflow/a1b2c3d4-e5f6-7890-abcd-ef1234567
 | Biến | Mặc định | Mô tả |
 |---|---|---|
 | `NEO4J_URI` | `bolt://neo4j:7687` | Bolt URI kết nối Neo4j |
-| `NEO4J_USERNAME` | `neo4j` | Username Neo4j |
-| `NEO4J_PASSWORD` | — | Password Neo4j — **phải đổi trước khi deploy** |
+| `NEO4J_USERNAME` | `neo4j` | Username Neo4j (user admin khởi tạo của image neo4j luôn là `neo4j`) |
+| `NEO4J_PASSWORD` | *(trong `.env.secrets`)* | Password Neo4j — secret, xem [Nhóm Secrets](#nhóm-secrets-envsecrets) |
 | `NEO4J_DATABASE` | `neo4j` | Tên database |
+
+### Nhóm Secrets (`.env.secrets`)
+
+Không nằm trong `.env` (file được commit). Tạo bằng `scripts/init-secrets.sh` ([Bước 1b](#bước-1b--tạo-secrets-envsecrets)); mẫu + chú thích: `.env.secrets.example`. Compose nạp file qua `env_file:` (thiếu file → mọi lệnh `docker compose up`/`config` báo lỗi), và mỗi service ghi đè rỗng (`""`) các secret không phải của nó.
+
+| Biến | Service dùng | Mô tả |
+|---|---|---|
+| `NEO4J_PASSWORD` | `rag-api` | Mật khẩu rag-api dùng để đăng nhập Neo4j (cùng `NEO4J_USERNAME`) |
+| `NEO4J_AUTH` | `neo4j` | `neo4j/<NEO4J_PASSWORD>` — mật khẩu khởi tạo của image neo4j, **chỉ** áp dụng ở lần start đầu của volume `neo4j_data` rỗng. Phải khớp `NEO4J_PASSWORD`. Volume đã có dữ liệu: đổi mật khẩu bằng `scripts/rotate-neo4j-password.sh` |
+| `WATCHTOWER_HTTP_API_TOKEN` | `watchtower` | Token Bearer cho HTTP API của watchtower (`127.0.0.1:8080/v1/update`, `/v1/metrics`) |
+
+> Giá trị phải dùng được ở cả `env_file` của Compose (interpolate `$`) lẫn `. ./.env.secrets` của bash và regex `NEO4J_AUTH` (tách bằng `/`): **không** đặt trong nháy, không có khoảng trắng, `$`, `#`, nháy, `/`. Giá trị do `init-secrets.sh` sinh là hex 64 ký tự.
 
 ---
 
@@ -1598,7 +1676,7 @@ curl -s http://localhost:8090/graph/projects/myproject/entities | jq
 
 ### Neo4j Browser — Cypher Queries
 
-Mở [http://localhost:7474](http://localhost:7474) (user: `neo4j`, password: giá trị `NEO4J_PASSWORD` trong `.env`).
+Mở [http://localhost:7474](http://localhost:7474) (user: `neo4j`, password: giá trị `NEO4J_PASSWORD` trong `.env.secrets` — xem bằng `grep '^NEO4J_PASSWORD=' .env.secrets` khi cần, đừng dán vào chat/issue).
 
 ```cypher
 // Xem toàn bộ graph của một project
@@ -1770,6 +1848,10 @@ docker exec -it ollama bash
 ### Watchtower — Auto-update
 
 ```bash
+# Nạp token từ .env.secrets vào shell hiện tại (không in ra màn hình).
+# Token KHÔNG còn nằm trong .env — xem Bước 1b.
+set -a; . ./.env.secrets; set +a
+
 # Trigger update thủ công
 curl -s -H "Authorization: Bearer ${WATCHTOWER_HTTP_API_TOKEN}" \
   http://localhost:8080/v1/update
@@ -1778,6 +1860,8 @@ curl -s -H "Authorization: Bearer ${WATCHTOWER_HTTP_API_TOKEN}" \
 curl -s -H "Authorization: Bearer ${WATCHTOWER_HTTP_API_TOKEN}" \
   http://localhost:8080/v1/metrics
 ```
+
+> `set -a; . ./.env.secrets` export **mọi** secret trong file vào shell đang mở — dùng trong một shell riêng/subshell (`( set -a; . ./.env.secrets; set +a; curl ... )`) nếu không muốn chúng ở lại. Token rỗng hoặc sai → watchtower trả `401`.
 
 > Watchtower chỉ cập nhật container có label `com.centurylinklabs.watchtower.enable=true` (`WATCHTOWER_LABEL_ENABLE=true`) — hiện là `open-webui` và `deunhealth`. Lịch `WATCHTOWER_SCHEDULE` (mặc định `0 0 4 * * *`) tính theo `TZ` truyền vào container watchtower.
 >
@@ -1822,6 +1906,8 @@ curl -s -X POST http://localhost:8090/ask \
 | Triệu chứng | Nguyên nhân | Cách xử lý |
 |---|---|---|
 | `rag-api` / `agent-api` crash khi start | Thiếu env var bắt buộc | `docker compose logs rag-api` — tìm `RuntimeError` |
+| `docker compose up` báo `env file .../.env.secrets not found` | Chưa tạo file secret (cài mới, hoặc vừa pull bản có `.env.secrets`) | Chạy `scripts/init-secrets.sh` bằng user thường — bản cài cũ xem [Nâng cấp bản cài cũ](#nâng-cấp-bản-cài-cũ--chuyển-secret-sang-envsecrets) |
+| `docker compose` báo `permission denied` khi đọc `.env.secrets` | File được tạo bằng `sudo` nên thuộc root | `sudo chown "$USER": .env.secrets && chmod 600 .env.secrets`; lần sau chạy `scripts/init-secrets.sh` không có sudo |
 | `/ask` trả về 404 "chưa được ingest" | Chưa chạy `/ingest` | `curl -X POST localhost:8090/ingest -d '{"project":"..."}'` |
 | `/ingest` trả về `"status": "empty"` | Không có subfolder trong `data/raw/` | Tạo subfolder và đặt file vào đó |
 | `/ask` với `module` không trả kết quả | Module sai tên hoặc chưa ingest | Tên module = tên thư mục con chính xác |
@@ -1851,7 +1937,7 @@ curl -s -X POST http://localhost:8090/ask \
 | Neo4j không kết nối | Container chưa sẵn sàng (lần đầu tải APOC) | Chờ `docker compose ps` báo neo4j `healthy`; `docker compose logs neo4j` |
 | `dependency failed to start: container qdrant is unhealthy` | Qdrant chưa mở cổng 6333 sau ~1 phút | `docker compose logs qdrant` (thường do volume `qdrant_storage` hỏng / thiếu quyền) |
 | Biến trong `.env` không có tác dụng | Biến chưa được khai báo trong `environment:` của service | Thêm vào `docker-compose.yml`; chạy `pytest tests/test_config_wiring.py` để kiểm tra |
-| `/graph/status` → `connected: false` | Sai `NEO4J_PASSWORD` | `.env` phải khớp với lần đầu Neo4j init |
+| `/graph/status` → `connected: false` (log rag-api: `Neo4j ping failed ... unauthorized`) | `NEO4J_PASSWORD` trong `.env.secrets` khác mật khẩu đang lưu trong volume `neo4j_data` (`NEO4J_AUTH` chỉ áp dụng cho volume rỗng — vd. vừa sinh mật khẩu mới cho bản cài cũ) | `scripts/rotate-neo4j-password.sh` (nhập mật khẩu cũ) rồi `docker compose up -d`; nếu user đang bị khóa tạm do đăng nhập sai liên tục thì chờ vài giây rồi chạy lại |
 | `graph_chunks_saved: 0` sau ingest | `GRAPH_ENABLED=false`, hoặc không có chunk nào mới/đã sửa (ingest tăng dần không ghi lại Chunk đã có trong Neo4j) | Bình thường nếu `upserted: 0` và `skipped_unchanged` > 0; nếu không, đổi `GRAPH_ENABLED=true` + rebuild `rag-api` |
 | Workflow mất > 60 phút | Model nặng hoặc tài nguyên thiếu | Giảm song song; dùng model nhỏ hơn; đặt `WORKFLOW_MAX_SECONDS` để dừng sớm |
 | `GET /workflow/{id}` trả 404 | Sai ID, hoặc workflow đã bị xóa khỏi SQLite (giữ 500 workflow mới nhất) mà không còn artifact/dòng JSONL nào trên disk | Kiểm tra ID qua `GET /workflows?limit=500`; workflow cũ có artifact vẫn xem được (dựng lại từ disk) |
@@ -1879,7 +1965,7 @@ curl -s -X POST http://localhost:8090/ask \
 | **Qdrant gRPC** | localhost:6334 | Qdrant gRPC endpoint |
 | **Neo4j Browser** | http://localhost:7474 | Graph DB browser UI |
 | **Neo4j Bolt** | bolt://localhost:7687 | Neo4j driver connection |
-| **Watchtower** | http://localhost:8080 *(cần `WATCHTOWER_HTTP_API_TOKEN`)* | HTTP API: `/v1/update`, `/v1/metrics` |
+| **Watchtower** | http://localhost:8080 *(cần `WATCHTOWER_HTTP_API_TOKEN` trong `.env.secrets`)* | HTTP API: `/v1/update`, `/v1/metrics` — xem [Watchtower — Auto-update](#watchtower--auto-update) |
 | **Deunhealth** | *(không publish cổng)* | Health watchdog — `network_mode: none`, xem `docker compose logs deunhealth` |
 
 ---
@@ -1913,7 +1999,7 @@ Một số test đáng chú ý khi sửa code:
 
 | Test | Kiểm tra |
 |---|---|
-| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` của service trong `docker-compose.yml` |
+| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, chạy với `docker` giả) |
 | `tests/test_role_registry*.py` | Bảng hành vi dẫn xuất từ `AgentConfig` và các bất biến của role registry |
 | `tests/test_workflow_queue*.py` | Hàng đợi FIFO, `WORKFLOW_CONCURRENCY`, hủy workflow và các race hủy/hoàn tất |
 | `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |

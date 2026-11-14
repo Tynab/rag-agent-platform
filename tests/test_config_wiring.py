@@ -1,18 +1,25 @@
-"""Contract test cấu hình (C1) — code ↔ docker-compose.yml ↔ .env. Không cần Docker.
+"""Contract test cấu hình (C1) — code ↔ docker-compose.yml ↔ .env ↔ .env.secrets. Không cần Docker.
 
-Compose KHÔNG dùng `env_file:`; mỗi service chỉ nhận đúng các key khai báo trong
-khối `environment:`. Một biến code có đọc nhưng compose quên truyền sẽ âm thầm rơi
-về default trong code — dù `.env` có đặt giá trị (đã xảy ra với WORKFLOW_MAX_SECONDS,
-INGEST_EMBED_RETRIES, RAG_TIMEOUT của rag-api). Test này chặn lỗi đó:
+`env_file:` CHỈ được dùng cho file secret `.env.secrets` (D1b — gitignored, tạo bằng
+scripts/init-secrets.sh, mẫu `.env.secrets.example`); mọi cấu hình còn lại đi qua khối
+`environment:` của từng service. Một biến code có đọc nhưng compose quên truyền sẽ âm
+thầm rơi về default trong code — dù `.env` có đặt giá trị (đã xảy ra với
+WORKFLOW_MAX_SECONDS, INGEST_EMBED_RETRIES, RAG_TIMEOUT của rag-api). Test này chặn lỗi đó:
 
 1. Mọi biến môi trường mà code của service đọc (`os.environ.get`, `os.environ[...]`,
    `os.getenv`, `_require_env`, helper kiểu `_env_int`, `"X" in os.environ`, kể cả khi
-   tên biến đi qua hằng module-level) phải có trong `environment:` của service đó.
+   tên biến đi qua hằng module-level) phải có trong `environment:` của service đó, hoặc
+   là key của `.env.secrets.example` mà service nạp qua `env_file: .env.secrets` (và không
+   bị ghi đè rỗng trong `environment:`).
 2. Mọi `${VAR}` interpolate trong compose mà KHÔNG có default (`:-`/`-`) phải được
    định nghĩa trong `.env` (nếu không compose chỉ cảnh báo và thay bằng chuỗi rỗng).
 3. Một số bất biến vận hành: cổng host không publish ra mọi interface, service
    stateful không bị Watchtower auto-update, `service_healthy` chỉ trỏ tới service
    có healthcheck.
+4. Secrets (D1b): `.env` (được commit) không chứa giá trị secret, `.env.secrets` bị
+   gitignore, mỗi secret có đúng service dùng nó, service khác ghi đè rỗng; script
+   init-secrets.sh / rotate-neo4j-password.sh chạy đúng hợp đồng (không ghi đè, quyền
+   600, không lộ secret ra argv/stdout).
 
 PyYAML có sẵn trong CI qua dependency bắc cầu (langchain-core, uvicorn[standard]).
 """
@@ -20,7 +27,12 @@ PyYAML có sẵn trong CI qua dependency bắc cầu (langchain-core, uvicorn[st
 from __future__ import annotations
 
 import ast
+import os
 import re
+import shutil
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -31,6 +43,20 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = ROOT / "docker-compose.yml"
 COMPOSE_CPU_FILE = ROOT / "docker-compose.cpu.yml"
 ENV_FILE = ROOT / ".env"
+SECRETS_FILE_NAME = ".env.secrets"
+SECRETS_EXAMPLE_FILE = ROOT / ".env.secrets.example"
+INIT_SECRETS_SCRIPT = ROOT / "scripts" / "init-secrets.sh"
+ROTATE_NEO4J_SCRIPT = ROOT / "scripts" / "rotate-neo4j-password.sh"
+
+# Secret trong .env.secrets → service DUY NHẤT được thấy giá trị. Service đọc bằng code
+# (rag-api) được đối chiếu thêm với bộ quét env; neo4j/watchtower là image bên thứ ba.
+SECRET_CONSUMERS: dict[str, str] = {
+    "NEO4J_PASSWORD": "rag-api",
+    "NEO4J_AUTH": "neo4j",
+    "WATCHTOWER_HTTP_API_TOKEN": "watchtower",
+}
+# Tên key trông như secret → không được có giá trị trong .env (kể cả dòng comment).
+_SECRET_KEY_RE = re.compile(r"TOKEN|PASSWORD|PASSWD|SECRET|API_KEY|PRIVATE_KEY", re.IGNORECASE)
 
 # Thư mục source → tên service trong docker-compose.yml.
 SERVICE_DIRS: dict[str, str] = {
@@ -202,11 +228,49 @@ def compose() -> dict:
     return _load_compose(COMPOSE_FILE)
 
 
-def _env_keys(service: dict) -> set[str]:
+def _env_map(service: dict) -> dict[str, str | None]:
+    """Khối `environment:` dạng {KEY: value}; `KEY` không có `=` (list) / `KEY:` rỗng (map) → None."""
     env = service.get("environment") or {}
     if isinstance(env, dict):
-        return set(env)
-    return {str(item).split("=", 1)[0] for item in env}
+        return {str(k): (None if v is None else str(v)) for k, v in env.items()}
+    out: dict[str, str | None] = {}
+    for item in env:
+        key, sep, value = str(item).partition("=")
+        out[key] = value if sep else None
+    return out
+
+
+def _env_keys(service: dict) -> set[str]:
+    return set(_env_map(service))
+
+
+def _env_files(service: dict) -> list[str]:
+    """Đường dẫn trong `env_file:` (dạng chuỗi, list chuỗi hoặc list {path, required}), bỏ './'."""
+    raw = service.get("env_file") or []
+    items = [raw] if isinstance(raw, (str, dict)) else list(raw)
+    paths = []
+    for item in items:
+        path = item.get("path", "") if isinstance(item, dict) else item
+        paths.append(str(path).removeprefix("./"))
+    return paths
+
+
+def _secret_keys() -> set[str]:
+    return set(_dotenv_values(SECRETS_EXAMPLE_FILE))
+
+
+def _blanked_secrets(service: dict) -> set[str]:
+    """Secret bị ghi đè rỗng trong `environment:` (environment thắng env_file) → service không thấy."""
+    return {k for k, v in _env_map(service).items() if k in _secret_keys() and v == ""}
+
+
+def _wired_keys(service: dict) -> set[str]:
+    """Key mà container của service thực sự nhận được giá trị (environment + .env.secrets)."""
+    blanked = _blanked_secrets(service)
+    wired = _env_keys(service) - blanked
+    if SECRETS_FILE_NAME in _env_files(service):
+        wired |= _secret_keys() - blanked
+    return wired
 
 
 def _labels(service: dict) -> dict[str, str]:
@@ -218,16 +282,28 @@ def _labels(service: dict) -> dict[str, str]:
 
 def _dotenv_keys(path: Path) -> set[str]:
     """Key được ĐỊNH NGHĨA (không tính dòng comment) trong file .env."""
-    keys: set[str] = set()
+    return set(_dotenv_values(path))
+
+
+_DOTENV_LINE_RE = re.compile(r"^\s*(?P<comment>#\s*)?(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=(?P<value>.*)$")
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def _dotenv_values(path: Path, *, include_comments: bool = False) -> dict[str, str]:
+    """{KEY: value} của file env (dòng cuối thắng). include_comments=True → tính cả `# KEY=value`."""
+    values: dict[str, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        m = _DOTENV_LINE_RE.match(raw)
+        if not m or (m.group("comment") is not None and not include_comments):
             continue
-        key = line.split("=", 1)[0].strip()
-        key = key.removeprefix("export ").strip()
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            keys.add(key)
-    return keys
+        values[m.group("key")] = _unquote(m.group("value"))
+    return values
 
 
 def _strings(node) -> list[str]:
@@ -307,13 +383,15 @@ def test_env_scanner_finds_known_reads(service_dir, expected):
 @pytest.mark.parametrize(("service_dir", "service"), sorted(SERVICE_DIRS.items()))
 def test_every_env_var_read_by_code_is_wired_in_compose(compose, service_dir, service):
     reads = env_reads_in_dir(ROOT / service_dir)
-    wired = _env_keys(compose["services"][service])
+    # environment: + secret nạp qua `env_file: .env.secrets` (trừ secret bị ghi đè rỗng).
+    wired = _wired_keys(compose["services"][service])
     allow = NOT_WIRED_ALLOWLIST.get(service, {})
 
     missing = {name: files for name, files in reads.items() if name not in wired and name not in allow}
     assert not missing, (
         f"{service}: code đọc biến môi trường nhưng docker-compose.yml không truyền vào "
-        f"`environment:` (thêm `NAME: ${{NAME:-<default>}}` và ghi chú trong .env/README): "
+        f"`environment:` (thêm `NAME: ${{NAME:-<default>}}` và ghi chú trong .env/README; "
+        f"secret thì thêm vào .env.secrets.example + SECRET_CONSUMERS + `env_file: .env.secrets`): "
         + ", ".join(f"{n} ({', '.join(f)})" for n, f in sorted(missing.items()))
     )
 
@@ -380,3 +458,347 @@ def test_service_healthy_dependencies_have_healthcheck(compose):
             if not hc.get("test") or hc.get("disable"):
                 bad.append(f"{name} → {dep}")
     assert not bad, f"depends_on service_healthy nhưng service đích không có healthcheck: {bad}"
+
+
+# ── Secrets (D1b): .env.secrets ↔ compose ↔ scripts ─────────────────────────────
+
+
+def test_dotenv_has_no_secret_values():
+    """.env được commit vào git → không dòng nào (kể cả `# KEY=value`) được mang giá trị secret."""
+    if not ENV_FILE.exists():
+        pytest.skip(".env không có trong checkout")
+    offending = []
+    for lineno, raw in enumerate(ENV_FILE.read_text(encoding="utf-8").splitlines(), start=1):
+        m = _DOTENV_LINE_RE.match(raw)
+        if not m:
+            continue
+        key = m.group("key")
+        if (_SECRET_KEY_RE.search(key) or key in SECRET_CONSUMERS) and _unquote(m.group("value")):
+            offending.append(f"{key} (dòng {lineno})")
+    # Chỉ nêu tên key — không bao giờ in giá trị.
+    assert not offending, f".env (được commit) chứa giá trị secret — chuyển sang .env.secrets: {offending}"
+
+
+def test_secrets_example_lists_exactly_the_consumed_keys_without_values():
+    values = _dotenv_values(SECRETS_EXAMPLE_FILE)
+    assert set(values) == set(SECRET_CONSUMERS), (
+        f".env.secrets.example phải liệt kê đúng các secret trong SECRET_CONSUMERS: "
+        f"thừa {sorted(set(values) - set(SECRET_CONSUMERS))}, thiếu {sorted(set(SECRET_CONSUMERS) - set(values))}"
+    )
+    filled = sorted(k for k, v in values.items() if v)
+    assert not filled, f".env.secrets.example là file mẫu được commit — giá trị phải để rỗng: {filled}"
+
+
+def test_gitignore_ignores_secrets_file_but_not_example():
+    git = shutil.which("git")
+    if git is None or not (ROOT / ".git").exists():
+        pytest.skip("cần git checkout")
+
+    def ignored(name: str) -> bool:
+        # --no-index: xét pattern .gitignore kể cả với file đã track (không thì luôn "không ignore").
+        res = subprocess.run([git, "check-ignore", "-q", "--no-index", name], cwd=ROOT, capture_output=True, text=True)
+        assert res.returncode in (0, 1), res.stderr
+        return res.returncode == 0
+
+    assert ignored(SECRETS_FILE_NAME), ".gitignore phải chặn .env.secrets"
+    assert ignored(".env.secrets.tmp.Ab12Cd"), ".gitignore phải chặn file tạm của init-secrets.sh"
+    assert not ignored(".env.secrets.example"), ".env.secrets.example phải commit được (thêm !.env.secrets.example)"
+
+
+def test_each_secret_reaches_only_its_consumer(compose):
+    """Mỗi secret tới đúng service dùng nó; service khác nạp .env.secrets phải ghi đè rỗng.
+
+    env_file nạp TOÀN BỘ file vào container. Với neo4j điều này là bắt buộc chứ không chỉ
+    là least-privilege: entrypoint của image ghi mọi biến NEO4J_* có giá trị thành setting
+    trong neo4j.conf, nên NEO4J_PASSWORD lọt vào sẽ thành dòng "PASSWORD=<mật khẩu>".
+    """
+    services = compose["services"]
+    users = {name for name, svc in services.items() if SECRETS_FILE_NAME in _env_files(svc)}
+    assert users == set(SECRET_CONSUMERS.values()), (
+        f"Service nạp env_file .env.secrets phải đúng là {sorted(set(SECRET_CONSUMERS.values()))}, "
+        f"hiện là {sorted(users)}"
+    )
+    for key, consumer in SECRET_CONSUMERS.items():
+        assert key in _wired_keys(services[consumer]), (
+            f"{consumer} phải nhận {key} từ .env.secrets (khai báo env_file và không ghi đè trong environment:)"
+        )
+    for name in sorted(users):
+        own = {k for k, c in SECRET_CONSUMERS.items() if c == name}
+        leaked = sorted(_secret_keys() - own - _blanked_secrets(services[name]))
+        assert not leaked, f'{name} nạp .env.secrets nhưng không ghi đè rỗng secret của service khác: {leaked} (thêm `KEY: ""`)'
+    assert "NEO4J_PASSWORD" in _blanked_secrets(services["neo4j"]), 'neo4j phải đặt NEO4J_PASSWORD: "" (neo4j.conf)'
+
+
+def test_secrets_read_by_code_belong_to_that_service():
+    """Secret của service có code trong repo phải thật sự được code đó đọc (danh sách không mục)."""
+    dirs = {service: directory for directory, service in SERVICE_DIRS.items()}
+    for key, consumer in SECRET_CONSUMERS.items():
+        if consumer in dirs:
+            assert key in env_reads_in_dir(ROOT / dirs[consumer]), f"{consumer} không còn đọc {key} — bỏ khỏi .env.secrets"
+
+
+@pytest.mark.parametrize("compose_file", [COMPOSE_FILE, COMPOSE_CPU_FILE], ids=lambda p: p.name)
+def test_compose_never_interpolates_secrets(compose_file):
+    """${SECRET} chỉ lấy được từ .env (được commit) → secret phải đi qua env_file .env.secrets."""
+    found = set()
+    for s in _strings(_load_compose(compose_file)):
+        for m in _INTERP_RE.finditer(s.replace("$$", "")):
+            name = m.group("braced") or m.group("bare")
+            if name in SECRET_CONSUMERS or _SECRET_KEY_RE.search(name):
+                found.add(name)
+    assert not found, f"{compose_file.name} interpolate secret {sorted(found)} — dùng env_file .env.secrets"
+
+
+# ── scripts/init-secrets.sh và scripts/rotate-neo4j-password.sh ────────────────
+
+_BASH = shutil.which("bash")
+needs_bash = pytest.mark.skipif(_BASH is None or sys.platform == "win32", reason="cần bash (Linux/macOS)")
+
+
+def _script_env(**extra: str) -> dict[str, str]:
+    """Env của tiến trình test, bỏ mọi secret có sẵn (tránh script vô tình 'giữ' giá trị ngoài)."""
+    env = {k: v for k, v in os.environ.items() if k not in SECRET_CONSUMERS and k != "NEO4J_OLD_PASSWORD"}
+    env.update(extra)
+    return env
+
+
+def _make_repo(tmp_path: Path, *scripts: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    for script in scripts:
+        shutil.copy2(script, repo / "scripts" / script.name)
+    return repo
+
+
+def _run_script(repo: Path, script: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    # Gọi qua `bash <file>` — không phụ thuộc bit thực thi của file trong checkout.
+    assert _BASH is not None
+    return subprocess.run(
+        [_BASH, str(repo / "scripts" / script.name)],
+        env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+    )
+
+
+def _run_init(repo: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    return _run_script(repo, INIT_SECRETS_SCRIPT, _script_env(**env))
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@needs_bash
+def test_init_secrets_creates_every_key_with_strong_values_and_mode_600(tmp_path):
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    res = _run_init(repo)
+    assert res.returncode == 0, res.stderr
+
+    secrets = repo / SECRETS_FILE_NAME
+    assert _mode(secrets) == 0o600
+    values = _dotenv_values(secrets)
+    assert set(values) == _secret_keys(), "init-secrets.sh phải sinh đúng các key của .env.secrets.example"
+    assert not sorted(k for k, v in values.items() if not v), "mọi key phải có giá trị"
+    assert re.fullmatch(r"[0-9a-f]{64}", values["NEO4J_PASSWORD"])
+    assert re.fullmatch(r"[0-9a-f]{64}", values["WATCHTOWER_HTTP_API_TOKEN"])
+    assert values["NEO4J_PASSWORD"] != values["WATCHTOWER_HTTP_API_TOKEN"]
+    assert values["NEO4J_AUTH"] == "neo4j/" + values["NEO4J_PASSWORD"]
+
+    output = res.stdout + res.stderr
+    assert not sorted(k for k, v in values.items() if v in output), "script không được in giá trị secret"
+    assert sorted(p.name for p in repo.iterdir()) == [SECRETS_FILE_NAME, "scripts"], "không để lại file tạm"
+
+
+@needs_bash
+def test_init_secrets_never_overwrites_an_existing_file(tmp_path):
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    assert _run_init(repo).returncode == 0
+    secrets = repo / SECRETS_FILE_NAME
+    first = secrets.read_bytes()
+
+    again = _run_init(repo)
+    assert again.returncode == 0, again.stderr
+    assert secrets.read_bytes() == first, "chạy lại không được sinh giá trị mới"
+
+    # File người dùng tự sửa: giữ nguyên nội dung + quyền, kể cả khi truyền NEO4J_PASSWORD.
+    secrets.write_text("NEO4J_PASSWORD=user-edited-value\n", encoding="utf-8")
+    secrets.chmod(0o640)
+    res = _run_init(repo, NEO4J_PASSWORD="Another-Pass-123")
+    assert res.returncode == 0, res.stderr
+    assert secrets.read_text(encoding="utf-8") == "NEO4J_PASSWORD=user-edited-value\n"
+    assert _mode(secrets) == 0o640
+    assert "chmod 600" in res.stderr, "phải cảnh báo khi file secret mở quyền cho group/other"
+    output = res.stdout + res.stderr
+    assert "user-edited-value" not in output and "Another-Pass-123" not in output
+
+
+@needs_bash
+def test_init_secrets_keeps_an_existing_neo4j_password(tmp_path):
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    res = _run_init(repo, NEO4J_PASSWORD="Old-Pass_1234")
+    assert res.returncode == 0, res.stderr
+    values = _dotenv_values(repo / SECRETS_FILE_NAME)
+    assert values["NEO4J_PASSWORD"] == "Old-Pass_1234"
+    assert values["NEO4J_AUTH"] == "neo4j/Old-Pass_1234"
+    assert re.fullmatch(r"[0-9a-f]{64}", values["WATCHTOWER_HTTP_API_TOKEN"]), "token watchtower luôn sinh mới"
+    assert "Old-Pass_1234" not in res.stdout + res.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    "bad",
+    ["short77", "neo4j", "has/slash1", "has space1", "dollar$sign1", "quote'1234", 'dq"12345', "hash#tag1234",
+     "tilde~home1", "semi;colon1", "back`tick1"],
+)
+def test_init_secrets_rejects_neo4j_passwords_unsafe_for_env_files(tmp_path, bad):
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    res = _run_init(repo, NEO4J_PASSWORD=bad)
+    assert res.returncode != 0
+    assert sorted(p.name for p in repo.iterdir()) == ["scripts"], "lỗi thì không được tạo file nào"
+    if bad != "neo4j":  # "neo4j" xuất hiện hợp lệ trong thông báo lỗi
+        assert bad not in res.stdout + res.stderr
+
+
+@needs_bash
+def test_init_secrets_falls_back_to_urandom_without_openssl(tmp_path):
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_openssl = fake_bin / "openssl"
+    fake_openssl.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_openssl.chmod(0o755)
+    res = _run_init(repo, PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert res.returncode == 0, res.stderr
+    values = _dotenv_values(repo / SECRETS_FILE_NAME)
+    assert re.fullmatch(r"[0-9a-f]{64}", values["NEO4J_PASSWORD"])
+    assert re.fullmatch(r"[0-9a-f]{64}", values["WATCHTOWER_HTTP_API_TOKEN"])
+    assert values["NEO4J_PASSWORD"] != values["WATCHTOWER_HTTP_API_TOKEN"]
+
+
+@needs_bash
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="chỉ kiểm tra được khi chạy bằng root")
+def test_init_secrets_refuses_sudo_into_another_users_checkout(tmp_path):
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    os.chown(repo, 65534, 65534)  # repo thuộc user thường (nobody), script chạy bằng root
+    res = _run_init(repo)
+    assert res.returncode != 0
+    assert "sudo" in res.stderr
+    assert not (repo / SECRETS_FILE_NAME).exists()
+
+
+# docker giả: ghi argv / env / stdin của từng lần gọi và mô phỏng xác thực của Neo4j
+# (mật khẩu hiện tại của "DB" nằm trong $FAKE_DB_PASSWORD_FILE; ALTER đổi nó sang mật khẩu mới).
+_FAKE_DOCKER = r"""#!/usr/bin/env bash
+set -u
+log="$FAKE_DOCKER_LOG"
+d="$log/$(printf '%03d' "$(find "$log" -mindepth 1 -maxdepth 1 | wc -l)")"
+mkdir -p "$d"
+printf '%s\n' "$@" > "$d/argv"
+case "${1-}" in
+  inspect)
+    echo "${FAKE_NEO4J_RUNNING:-true}"
+    exit 0 ;;
+  exec)
+    cat > "$d/stdin"
+    printf '%s\n' "${NEO4J_USERNAME-}" "${NEO4J_PASSWORD-}" > "$d/env"
+    if [[ "${NEO4J_PASSWORD-}" != "$(cat "$FAKE_DB_PASSWORD_FILE")" ]]; then
+      echo "The client is unauthorized due to authentication failure." >&2
+      exit 1
+    fi
+    if grep -q "ALTER CURRENT USER" "$d/stdin"; then
+      printf '%s' "$FAKE_NEW_PASSWORD" > "$FAKE_DB_PASSWORD_FILE"
+    fi
+    exit 0 ;;
+esac
+exit 2
+"""
+
+_NEW_NEO4J_PASSWORD = "0123456789abcdef" * 4
+
+
+def _rotate_setup(tmp_path: Path, *, db_password: str, auth: str | None = None) -> tuple[Path, dict[str, str], Path, Path]:
+    repo = _make_repo(tmp_path, ROTATE_NEO4J_SCRIPT)
+    (repo / ".env").write_text("NEO4J_USERNAME=neo4j\n", encoding="utf-8")
+    (repo / SECRETS_FILE_NAME).write_text(
+        f"NEO4J_PASSWORD={_NEW_NEO4J_PASSWORD}\n"
+        f"NEO4J_AUTH={auth if auth is not None else 'neo4j/' + _NEW_NEO4J_PASSWORD}\n"
+        f"WATCHTOWER_HTTP_API_TOKEN={'f' * 64}\n",
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "docker").write_text(_FAKE_DOCKER, encoding="utf-8")
+    (fake_bin / "docker").chmod(0o755)
+    log = tmp_path / "docker-calls"
+    log.mkdir()
+    db = tmp_path / "db-password"
+    db.write_text(db_password, encoding="utf-8")
+    env = _script_env(
+        PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        FAKE_DOCKER_LOG=str(log), FAKE_DB_PASSWORD_FILE=str(db), FAKE_NEW_PASSWORD=_NEW_NEO4J_PASSWORD,
+    )
+    return repo, env, log, db
+
+
+def _docker_calls(log: Path) -> list[dict]:
+    calls = []
+    for d in sorted(log.iterdir()):
+        calls.append({
+            "argv": (d / "argv").read_text(encoding="utf-8").splitlines(),
+            "stdin": (d / "stdin").read_text(encoding="utf-8") if (d / "stdin").exists() else None,
+            "env": (d / "env").read_text(encoding="utf-8").splitlines() if (d / "env").exists() else None,
+        })
+    return calls
+
+
+@needs_bash
+def test_rotate_neo4j_password_passes_secrets_via_env_and_stdin_only(tmp_path):
+    old = "o'ld\\pass-1"  # nháy đơn + backslash: kiểm tra escape string literal Cypher
+    repo, env, log, db = _rotate_setup(tmp_path, db_password=old)
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": old})
+    assert res.returncode == 0, res.stderr
+    assert db.read_text(encoding="utf-8") == _NEW_NEO4J_PASSWORD
+
+    calls = _docker_calls(log)
+    for call in calls:
+        argv = "\n".join(call["argv"])
+        assert old not in argv and _NEW_NEO4J_PASSWORD not in argv, f"secret lọt vào argv của docker: {call['argv'][:2]}"
+    alters = [c for c in calls if c["stdin"] and "ALTER" in c["stdin"]]
+    assert len(alters) == 1
+    alter = alters[0]
+    assert alter["stdin"] == f"ALTER CURRENT USER SET PASSWORD FROM 'o\\'ld\\\\pass-1' TO '{_NEW_NEO4J_PASSWORD}';\n"
+    assert alter["env"] == ["neo4j", old], "đăng nhập bằng mật khẩu CŨ qua biến môi trường"
+    argv = alter["argv"]
+    assert argv[:2] == ["exec", "-i"] and "cypher-shell" in argv
+    assert argv[argv.index("--database") + 1] == "system"
+    assert {"NEO4J_USERNAME", "NEO4J_PASSWORD"} <= set(argv), "docker exec -e KEY (không kèm giá trị)"
+    output = res.stdout + res.stderr
+    assert old not in output and _NEW_NEO4J_PASSWORD not in output
+
+    # Chạy lại: DB đã dùng mật khẩu mới → không ALTER lần nữa.
+    again = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": old})
+    assert again.returncode == 0, again.stderr
+    assert sum(1 for c in _docker_calls(log) if c["stdin"] and "ALTER" in c["stdin"]) == 1
+
+
+@needs_bash
+def test_rotate_neo4j_password_refuses_bad_input_without_touching_the_db(tmp_path):
+    old = "Old-Pass_1234"
+    # NEO4J_AUTH không khớp NEO4J_PASSWORD → dừng trước khi gọi docker.
+    repo, env, log, db = _rotate_setup(tmp_path / "a", db_password=old, auth="neo4j/something-else")
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": old})
+    assert res.returncode != 0 and "NEO4J_AUTH" in res.stderr
+    assert _docker_calls(log) == []
+
+    # Không có mật khẩu cũ và stdin không phải terminal → dừng, không ALTER.
+    repo, env, log, db = _rotate_setup(tmp_path / "b", db_password=old)
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, env)
+    assert res.returncode != 0 and "NEO4J_OLD_PASSWORD" in res.stderr
+    assert db.read_text(encoding="utf-8") == old
+
+    # Sai mật khẩu cũ → cypher-shell lỗi → exit khác 0, DB giữ nguyên, không lộ secret.
+    repo, env, log, db = _rotate_setup(tmp_path / "c", db_password=old)
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": "Wrong-Pass-999"})
+    assert res.returncode != 0
+    assert db.read_text(encoding="utf-8") == old
+    output = res.stdout + res.stderr
+    assert "Wrong-Pass-999" not in output and _NEW_NEO4J_PASSWORD not in output
