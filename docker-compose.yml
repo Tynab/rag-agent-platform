@@ -24,10 +24,15 @@ name: rag-agent-platform
 # secret nó không dùng (tests/test_config_wiring.py kiểm tra):
 #   neo4j      → NEO4J_AUTH                 rag-api → NEO4J_PASSWORD
 #   watchtower → WATCHTOWER_HTTP_API_TOKEN
+#
+# ── Phiên bản image (D4a) ─────────────────────────────────────────────────────
+# Image bên thứ ba dùng tag cấu hình được: <repo>:${<X>_IMAGE_TAG:-<tag cũ>}. Chưa đặt
+# biến = đúng tag cũ (latest / 5-community / main). Cách pin bản đang chạy: khối
+# "Phiên bản image bên thứ ba" trong .env. Image build local (rag-api, agent-api) không áp dụng.
 
 services:
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
     container_name: ollama
     pull_policy: if_not_present
     tty: true
@@ -76,7 +81,7 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:${QDRANT_IMAGE_TAG:-latest}
     container_name: qdrant
     labels:
       # Stateful (vector index) — không auto-recreate giữa lúc ingest/query.
@@ -100,7 +105,7 @@ services:
     restart: unless-stopped
 
   neo4j:
-    image: neo4j:5-community
+    image: neo4j:${NEO4J_IMAGE_TAG:-5-community}
     container_name: neo4j
     labels:
       # Stateful (graph DB) — không auto-recreate giữa lúc ingest/query.
@@ -271,7 +276,7 @@ services:
     restart: unless-stopped
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_IMAGE_TAG:-main}
     container_name: open-webui
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
@@ -317,7 +322,7 @@ services:
     restart: unless-stopped
 
   watchtower:
-    image: containrrr/watchtower
+    image: containrrr/watchtower:${WATCHTOWER_IMAGE_TAG:-latest}
     container_name: watchtower
     # D5: publish HTTP API ra localhost để runbook trong README (localhost:8080/v1/*)
     # chạy được. Chỉ bind 127.0.0.1 — không expose ra ngoài host.
@@ -352,7 +357,7 @@ services:
     restart: unless-stopped
 
   deunhealth:
-    image: qmcgaw/deunhealth
+    image: qmcgaw/deunhealth:${DEUNHEALTH_IMAGE_TAG:-latest}
     container_name: deunhealth
     labels:
       - "com.centurylinklabs.watchtower.enable=true"

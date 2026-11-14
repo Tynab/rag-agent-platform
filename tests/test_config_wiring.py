@@ -460,6 +460,34 @@ def test_service_healthy_dependencies_have_healthcheck(compose):
     assert not bad, f"depends_on service_healthy nhưng service đích không có healthcheck: {bad}"
 
 
+# image: <repo>:${<X>_IMAGE_TAG:-<tag mặc định>} — repo không chứa tag/biến, default không rỗng.
+_PINNABLE_IMAGE_RE = re.compile(r"^(?P<repo>[a-z0-9][a-z0-9._/-]*):\$\{(?P<var>[A-Z][A-Z0-9_]*_IMAGE_TAG):-(?P<default>[^}]+)\}$")
+
+
+def test_third_party_images_use_a_configurable_tag(compose):
+    """D4a: mọi image không build local phải pin được qua biến *_IMAGE_TAG (có default) trong .env."""
+    bad, variables = [], {}
+    for name, svc in compose["services"].items():
+        if svc.get("build"):
+            continue
+        m = _PINNABLE_IMAGE_RE.match(str(svc.get("image", "")))
+        if not m:
+            bad.append(f"{name}: {svc.get('image')!r}")
+            continue
+        variables.setdefault(m.group("var"), []).append(name)
+    assert not bad, f"image bên thứ ba phải có dạng <repo>:${{<X>_IMAGE_TAG:-<tag>}}: {bad}"
+    shared = {v: s for v, s in variables.items() if len(s) > 1}
+    assert not shared, f"mỗi service một biến *_IMAGE_TAG riêng: {shared}"
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    undocumented = sorted(v for v in variables if f"`{v}`" not in readme)
+    assert not undocumented, f"thiếu mô tả trong bảng biến môi trường của README: {undocumented}"
+    if ENV_FILE.exists():
+        dotenv = _dotenv_values(ENV_FILE, include_comments=True)
+        missing = sorted(v for v in variables if v not in dotenv)
+        assert not missing, f"thiếu dòng (có thể comment) `# {missing[0]}=...` trong khối Phiên bản image của .env: {missing}"
+
+
 # ── Secrets (D1b): .env.secrets ↔ compose ↔ scripts ─────────────────────────────
 
 

@@ -43,6 +43,8 @@
 | `watchtower` | `containrrr/watchtower` | 8080 (HTTP API) | `127.0.0.1` | Tự động pull & restart image có label `watchtower.enable=true` |
 | `deunhealth` | `qmcgaw/deunhealth` | — | — | Khởi động lại container khi healthcheck thất bại liên tục (`network_mode: none`) |
 
+> **Phiên bản image:** tag của các image bên thứ ba ở bảng trên là mặc định; pin phiên bản qua biến `*_IMAGE_TAG` trong `.env` — xem [Nhóm phiên bản image](#nhóm-phiên-bản-image).
+>
 > **Bảo mật cổng:** không service nào có xác thực mặc định, nên mọi cổng chỉ publish trên `127.0.0.1` (truy cập được từ chính máy chạy Docker). Riêng `agent-api` và Open WebUI bind theo `BIND_ADDR` (mặc định `127.0.0.1`) — xem [Truy cập từ máy khác (LAN)](#truy-cập-từ-máy-khác-lan). Các container gọi nhau qua network nội bộ `yan` (`http://rag-api:8090`, `http://ollama:11434`…), không qua cổng host.
 
 ### Phân nhóm model theo chức năng
@@ -746,6 +748,33 @@ Không nằm trong `.env` (file được commit). Tạo bằng `scripts/init-sec
 | `WATCHTOWER_HTTP_API_TOKEN` | `watchtower` | Token Bearer cho HTTP API của watchtower (`127.0.0.1:8080/v1/update`, `/v1/metrics`) |
 
 > Giá trị phải dùng được ở cả `env_file` của Compose (interpolate `$`) lẫn `. ./.env.secrets` của bash và regex `NEO4J_AUTH` (tách bằng `/`): **không** đặt trong nháy, không có khoảng trắng, `$`, `#`, nháy, `/`. Giá trị do `init-secrets.sh` sinh là hex 64 ký tự.
+
+### Nhóm phiên bản image
+
+Image bên thứ ba trong `docker-compose.yml` có dạng `<repo>:${<X>_IMAGE_TAG:-<tag mặc định>}` (D4a). Chưa đặt biến (khối comment "Phiên bản image bên thứ ba" trong `.env`) = dùng đúng tag cũ, không đổi gì. Image build local (`rag-api`, `agent-api`) không áp dụng.
+
+| Biến | Mặc định | Image |
+|---|---|---|
+| `OLLAMA_IMAGE_TAG` | `latest` | `ollama/ollama` |
+| `QDRANT_IMAGE_TAG` | `latest` | `qdrant/qdrant` |
+| `NEO4J_IMAGE_TAG` | `5-community` | `neo4j` |
+| `OPEN_WEBUI_IMAGE_TAG` | `main` | `ghcr.io/open-webui/open-webui` |
+| `WATCHTOWER_IMAGE_TAG` | `latest` | `containrrr/watchtower` |
+| `DEUNHEALTH_IMAGE_TAG` | `latest` | `qmcgaw/deunhealth` |
+
+**Pin đúng bản đang chạy:**
+
+```bash
+docker compose images                                                     # image + tag đang chạy
+docker image inspect --format '{{index .RepoDigests 0}}' ollama/ollama:latest   # → ollama/ollama@sha256:…
+docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' ollama/ollama:latest  # số phiên bản (nếu image có label OCI)
+```
+
+Đặt vào `.env` tag phiên bản (`OLLAMA_IMAGE_TAG=0.12.3`) hoặc tag + digest để khóa tuyệt đối (`OLLAMA_IMAGE_TAG=0.12.3@sha256:…` — Docker dùng digest, tag chỉ để người đọc), rồi `docker compose pull && docker compose up -d`.
+
+> - **open-webui / deunhealth:** watchtower chỉ làm mới **đúng tag** đang dùng. Pin tag phiên bản thì tag đó thường không bao giờ được push lại, pin digest thì không bao giờ đổi → không còn tự cập nhật; muốn lên bản mới thì đổi biến rồi `pull` + `up -d`.
+> - **ollama / qdrant / neo4j** vốn không được watchtower cập nhật (stateful); pin giúp `docker compose pull` không vô tình nâng phiên bản (định dạng dữ liệu volume có thể đổi giữa các bản).
+> - Lần `docker compose up -d` đầu tiên sau thay đổi này có thể recreate `watchtower` và `deunhealth` một lần: chuỗi image đổi từ tag ngầm định sang `:latest` tường minh (cùng một image).
 
 ---
 
@@ -1865,7 +1894,7 @@ curl -s -H "Authorization: Bearer ${WATCHTOWER_HTTP_API_TOKEN}" \
 
 > Watchtower chỉ cập nhật container có label `com.centurylinklabs.watchtower.enable=true` (`WATCHTOWER_LABEL_ENABLE=true`) — hiện là `open-webui` và `deunhealth`. Lịch `WATCHTOWER_SCHEDULE` (mặc định `0 0 4 * * *`) tính theo `TZ` truyền vào container watchtower.
 >
-> - `ollama`, `qdrant`, `neo4j` là service **stateful** → `watchtower.enable=false` để không bị recreate giữa lúc workflow/ingest đang chạy. Cập nhật thủ công khi rảnh: `docker compose pull ollama qdrant neo4j && docker compose up -d ollama qdrant neo4j`.
+> - `ollama`, `qdrant`, `neo4j` là service **stateful** → `watchtower.enable=false` để không bị recreate giữa lúc workflow/ingest đang chạy. Cập nhật thủ công khi rảnh: `docker compose pull ollama qdrant neo4j && docker compose up -d ollama qdrant neo4j` (đã pin `*_IMAGE_TAG` thì đổi biến trong `.env` trước — xem [Nhóm phiên bản image](#nhóm-phiên-bản-image)).
 > - `rag-api` và `agent-api` dùng local build với `watchtower.enable=false` — dùng `docker compose up -d --build` khi cần cập nhật.
 
 ### Truy cập từ máy khác (LAN)
@@ -1999,7 +2028,7 @@ Một số test đáng chú ý khi sửa code:
 
 | Test | Kiểm tra |
 |---|---|
-| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, chạy với `docker` giả) |
+| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, chạy với `docker` giả); image bên thứ ba pin được qua `*_IMAGE_TAG` |
 | `tests/test_role_registry*.py` | Bảng hành vi dẫn xuất từ `AgentConfig` và các bất biến của role registry |
 | `tests/test_workflow_queue*.py` | Hàng đợi FIFO, `WORKFLOW_CONCURRENCY`, hủy workflow và các race hủy/hoàn tất |
 | `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |
