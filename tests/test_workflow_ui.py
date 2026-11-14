@@ -22,7 +22,8 @@
   hiển thị cứng khớp WORKFLOW_STEPS / AGENTS của agent-api/agents.py (đọc bằng regex, không cần node).
 - Bàn phím: chip Recent, node dải tiến trình, tên file artifact là <button type="button">
   (Tab tới được; Enter/Space = click là hành vi gốc của trình duyệt), aria-label / aria-current,
-  viền :focus-visible. Download All thu hồi object URL sau REVOKE_DELAY_MS, không ngay sau click.
+  viền :focus-visible, đóng viewer artifact bằng bàn phím trả focus về tên file. Download All
+  thu hồi object URL sau REVOKE_DELAY_MS, không ngay sau click.
 
 F12 (race khi đổi workflow / poll trùng), layout/animation thật và phím Enter/Space thật cần
 trình duyệt → kiểm bằng Playwright thủ công, không nằm trong pytest.
@@ -387,17 +388,23 @@ function makeEl(id, tag = 'DIV') {
     remove() { if (el.parent) el.parent.children = el.parent.children.filter(x => x !== el); el.parent = null; },
     setAttribute(k, v) { el.attrs[k] = String(v); }, removeAttribute(k) { delete el.attrs[k]; },
     getAttribute(k) { return k in el.attrs ? el.attrs[k] : null; }, hasAttribute(k) { return k in el.attrs; },
-    addEventListener() {}, focus() {}, select() {}, setSelectionRange() {},
+    addEventListener() {}, select() {}, setSelectionRange() {},
+    // focus thật: ghi lại + đổi document.activeElement. el.focusVisible giả lập :focus-visible
+    // (true = focus từ bàn phím). el.qs / el.qsa: test tự cấp kết quả querySelector(All).
+    focus() { logs.focus.push(el.id); document.activeElement = el; },
+    contains(x) { for (let n = x; n; n = n.parent) if (n === el) return true; return false; },
+    matches(sel) { return sel === ':focus-visible' ? !!el.focusVisible : false; },
     click() { logs.clicks.push({ attached: !!el.parent, href: el.href, download: el.download,
                                  revokedBefore: logs.revoked.length }); },
-    querySelector() { return makeEl(''); }, querySelectorAll() { return []; },
+    qs: {}, qsa: {},
+    querySelector(sel) { return el.qs[sel] || makeEl(''); }, querySelectorAll(sel) { return el.qsa[sel] || []; },
     getBoundingClientRect() { return { left: 0, right: 0, width: 0 }; },
   };
   return el;
 }
 
 const els = {}, listeners = {}, winListeners = {}, pushes = [];
-const logs = { clicks: [], revoked: [], clip: [], zip: [] };
+const logs = { clicks: [], revoked: [], clip: [], zip: [], focus: [] };
 const document = {
   hidden: false,
   getElementById(id) { return els[id] || (els[id] = makeEl(id)); },
@@ -1245,6 +1252,51 @@ def test_file_tree_name_is_a_button_and_download_icon_has_a_label():
     assert '<button type="button" class="ft-name ft-open">a&quot;&lt;b&gt;.ts</button>' in row
     assert 'role="button"' not in html, "hàng chứa link ⬇ — không được tự làm role=button"
     assert re.search(r'<a class="[^"]*ft-dl"[^>]*aria-label="Tải xuống a&quot;&lt;b&gt;.ts"', row, re.S)
+
+
+# Hàng file + nút ✕ giả trong tab-body / viewer (DOM giả: qsa/qs do test cấp, xem makeEl).
+_VIEWER_DOM = r"""(() => {
+  const row = p => {
+    const r = document.createElement('div'); r.className = 'ft-item';
+    r.dataset.role = 'fe'; r.dataset.path = p;
+    const b = document.createElement('button'); b.id = 'open:' + p; b.className = 'ft-name ft-open';
+    r.appendChild(b); r.qs['.ft-open'] = b; return r;
+  };
+  document.getElementById('tab-body').qsa['.ft-item'] = [row('src/a.ts'), row(PATH), row('x.ts')];
+  const v = document.getElementById('art-viewer');
+  globalThis.closeBtn = v.appendChild(document.createElement('button')); closeBtn.id = 'close';
+  globalThis.other = document.createElement('button'); other.id = 'other';
+  globalThis.closeWith = (el, kb) => {
+    v.style.display = ''; el.focusVisible = kb; el.focus(); closeArtViewer();
+    return [v.style.display, document.activeElement.id];
+  };
+  return [v.dataset.role, v.dataset.path, v.style.display];
+})()"""
+
+
+def test_closing_artifact_viewer_by_keyboard_returns_focus_to_the_file_name():
+    """Mở file bằng bàn phím rồi đóng viewer bằng ✕ (Enter/Space): focus phải về tên file đó,
+    không rơi về <body> (Tab kế tiếp nhảy lên ô Workflow ID ở đầu trang). Đóng bằng chuột thì
+    không dời focus / cuộn trang. Đường thật (phím thật) kiểm bằng Playwright."""
+    path = "src/b\"'\\x.ts"   # ' " \ — so sánh data-path trong JS, không dựng selector
+    rec = _rec("completed", completed_steps=ROLES, step_outputs={r: "x" for r in ROLES})
+    res = _run_sm(
+        [["track", "wf-1"], ["tab", "fe"],
+         ["await", f"viewArtifact('fe', {json.dumps(path)}).then(() => 0)"],
+         ["eval", _VIEWER_DOM.replace("PATH", json.dumps(path))],
+         ["eval", "closeWith(closeBtn, true)"],                       # bàn phím
+         ["eval", "closeWith(closeBtn, false)"],                      # chuột
+         ["eval", "closeWith(other, true)"],                          # focus ở ngoài viewer
+         ["eval", "closeBtn.matches = () => { throw new SyntaxError(':focus-visible'); };"
+                  " closeWith(closeBtn, false)"]],                     # trình duyệt cũ
+        [_ok(rec), _ok({"path": path, "language": "ts", "content": "A"})],
+    )
+    opened, keyboard, mouse, outside, legacy = res["out"][1:]
+    assert opened == ["fe", path, ""], "viewArtifact phải ghi role/path của file đang xem lên viewer"
+    assert keyboard == ["none", "open:" + path], "đóng bằng bàn phím → focus về tên file đã mở viewer"
+    assert mouse == ["none", "close"], "đóng bằng chuột → không dời focus (không cuộn trang)"
+    assert outside == ["none", "other"], "focus không nằm trong viewer → không đụng tới focus"
+    assert legacy == ["none", "open:" + path], "không hiểu :focus-visible → coi là bàn phím"
 
 
 def test_keyboard_focus_styles_and_button_resets():

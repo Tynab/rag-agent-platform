@@ -2355,6 +2355,9 @@ async function viewArtifact(role, path) {
     const viewer = document.getElementById('art-viewer');
     if (!viewer) return;
     viewer.style.display = '';
+    // File đang xem — closeArtViewer trả focus bàn phím về đúng tên file này khi đóng
+    viewer.dataset.role = role;
+    viewer.dataset.path = path;
     const lang    = data.language || 'text';
     const fname   = path.split('/').pop();
     const escaped = esc(data.content);
@@ -2374,9 +2377,29 @@ async function viewArtifact(role, path) {
   } catch (e) { /* ignore */ }
 }
 
+// Đóng bằng bàn phím (Enter/Space trên nút ✕): nút đang focus bị ẩn theo viewer → focus rơi
+// về <body> và Tab kế tiếp nhảy lên đầu trang (ô Workflow ID). Trả focus về tên file đã mở
+// viewer — tìm theo data-role/data-path so sánh trong JS (không dựng selector từ tên file có
+// thể chứa ' " \). Đóng bằng chuột (nút không :focus-visible) giữ nguyên như cũ: không dời
+// focus, không cuộn trang.
 function closeArtViewer() {
   const v = document.getElementById('art-viewer');
-  if (v) v.style.display = 'none';
+  if (!v) return;
+  const active = document.activeElement;
+  const kbClose = !!active && v.contains(active) && isKeyboardFocus(active);
+  v.style.display = 'none';
+  if (!kbClose) return;
+  const body = document.getElementById('tab-body');
+  const row  = body && [...body.querySelectorAll('.ft-item')]
+    .find(r => r.dataset.role === v.dataset.role && r.dataset.path === v.dataset.path);
+  const name = row && row.querySelector('.ft-open');
+  if (name) name.focus();
+}
+
+// Phần tử đang có focus từ bàn phím? Trình duyệt không hiểu :focus-visible (ném lỗi) → coi là
+// bàn phím: các trình duyệt đó (Safari cũ) không focus nút khi click chuột.
+function isKeyboardFocus(el) {
+  try { return el.matches(':focus-visible'); } catch (e) { return true; }
 }
 
 // JSZip (~100 KB) chỉ cần khi bấm "Download All" → nạp lười đúng một lần (các lần bấm
