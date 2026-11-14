@@ -120,8 +120,8 @@ services:
     environment:
       # PHẢI ghi đè rỗng: entrypoint của image neo4j ghi MỌI biến NEO4J_* có giá trị (trừ
       # NEO4J_AUTH, NEO4J_PLUGINS...) thành setting trong neo4j.conf → NEO4J_PASSWORD từ
-      # .env.secrets sẽ thành dòng "PASSWORD=<mật khẩu>" (lộ mật khẩu, Neo4j 5 từ chối setting lạ).
-      # Biến rỗng thì entrypoint bỏ qua.
+      # .env.secrets sẽ thành dòng "PASSWORD=<mật khẩu>" trong neo4j.conf (lộ mật khẩu ra file
+      # cấu hình). Biến rỗng thì entrypoint bỏ qua.
       NEO4J_PASSWORD: ""
       WATCHTOWER_HTTP_API_TOKEN: ""
       # D5a: KHÔNG cài plugin (NEO4J_PLUGINS) — rag-api chỉ dùng Cypher thuần (MERGE /

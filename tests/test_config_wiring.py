@@ -679,7 +679,8 @@ needs_bash = pytest.mark.skipif(_BASH is None or sys.platform == "win32", reason
 
 def _script_env(**extra: str) -> dict[str, str]:
     """Env của tiến trình test, bỏ mọi secret có sẵn (tránh script vô tình 'giữ' giá trị ngoài)."""
-    env = {k: v for k, v in os.environ.items() if k not in SECRET_CONSUMERS and k != "NEO4J_OLD_PASSWORD"}
+    skip = set(SECRET_CONSUMERS) | {"NEO4J_OLD_PASSWORD", "KEEP_NEO4J_PASSWORD"}
+    env = {k: v for k, v in os.environ.items() if k not in skip}
     env.update(extra)
     return env
 
@@ -741,28 +742,101 @@ def test_init_secrets_never_overwrites_an_existing_file(tmp_path):
     assert again.returncode == 0, again.stderr
     assert secrets.read_bytes() == first, "chạy lại không được sinh giá trị mới"
 
-    # File người dùng tự sửa: giữ nguyên nội dung + quyền, kể cả khi truyền NEO4J_PASSWORD.
-    secrets.write_text("NEO4J_PASSWORD=user-edited-value\n", encoding="utf-8")
+    # File người dùng tự sửa (đủ key, hợp lệ): giữ nguyên nội dung + quyền, kể cả khi truyền
+    # KEEP_NEO4J_PASSWORD hay có NEO4J_PASSWORD trong môi trường.
+    edited = (
+        "NEO4J_PASSWORD=user-edited-value\n"
+        "NEO4J_AUTH=neo4j/user-edited-value\n"
+        "WATCHTOWER_HTTP_API_TOKEN=user-edited-token\n"
+    )
+    secrets.write_text(edited, encoding="utf-8")
     secrets.chmod(0o640)
-    res = _run_init(repo, NEO4J_PASSWORD="Another-Pass-123")
+    res = _run_init(repo, KEEP_NEO4J_PASSWORD="Another-Pass-123", NEO4J_PASSWORD="Ambient-Pass-456")
     assert res.returncode == 0, res.stderr
-    assert secrets.read_text(encoding="utf-8") == "NEO4J_PASSWORD=user-edited-value\n"
+    assert secrets.read_text(encoding="utf-8") == edited
     assert _mode(secrets) == 0o640
     assert "chmod 600" in res.stderr, "phải cảnh báo khi file secret mở quyền cho group/other"
     output = res.stdout + res.stderr
-    assert "user-edited-value" not in output and "Another-Pass-123" not in output
+    for value in ("user-edited-value", "user-edited-token", "Another-Pass-123", "Ambient-Pass-456"):
+        assert value not in output
+
+
+_COMPLETE_SECRETS = {
+    "NEO4J_PASSWORD": "Valid-Pass_123",
+    "NEO4J_AUTH": "neo4j/Valid-Pass_123",
+    "WATCHTOWER_HTTP_API_TOKEN": "Valid-Token_456",
+}
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    ("case", "content", "expected_keys"),
+    [
+        # Người dùng `cp .env.secrets.example .env.secrets` rồi chạy script: mọi key rỗng.
+        ("example-copy", None, set(SECRET_CONSUMERS)),
+        ("missing-token", {k: v for k, v in _COMPLETE_SECRETS.items() if k != "WATCHTOWER_HTTP_API_TOKEN"},
+         {"WATCHTOWER_HTTP_API_TOKEN"}),
+        ("auth-mismatch", {**_COMPLETE_SECRETS, "NEO4J_AUTH": "neo4j/Other-Pass_999"}, {"NEO4J_AUTH"}),
+        ("unsafe-password", {**_COMPLETE_SECRETS, "NEO4J_PASSWORD": "Valid$Pass_1",
+                             "NEO4J_AUTH": "neo4j/Valid$Pass_1"}, {"NEO4J_PASSWORD"}),
+        ("short-password", {**_COMPLETE_SECRETS, "NEO4J_PASSWORD": "Sh0rt_x", "NEO4J_AUTH": "neo4j/Sh0rt_x"},
+         {"NEO4J_PASSWORD"}),
+    ],
+)
+def test_init_secrets_rejects_an_existing_but_unusable_file_without_touching_it(tmp_path, case, content, expected_keys):
+    """File đã có nhưng thiếu/rỗng key → thoát ≠ 0, nêu TÊN key, không sửa file, không in giá trị."""
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    secrets = repo / SECRETS_FILE_NAME
+    if content is None:
+        shutil.copy2(SECRETS_EXAMPLE_FILE, secrets)
+    else:
+        secrets.write_text("".join(f"{k}={v}\n" for k, v in content.items()), encoding="utf-8")
+    secrets.chmod(0o600)
+    before = secrets.read_bytes()
+
+    res = _run_init(repo)
+    assert res.returncode != 0, f"{case}: file không dùng được thì phải thoát ≠ 0"
+    assert secrets.read_bytes() == before, "không được sửa file đã có"
+    assert sorted(p.name for p in repo.iterdir()) == [SECRETS_FILE_NAME, "scripts"], "không để lại file tạm"
+    for key in expected_keys:
+        assert key in res.stderr, f"{case}: phải nêu tên key lỗi {key}"
+    for key in set(SECRET_CONSUMERS) - expected_keys:
+        assert f"- {key}" not in res.stderr, f"{case}: {key} hợp lệ, không được báo lỗi"
+    output = res.stdout + res.stderr
+    leaked = [v for v in (content or {}).values() if v and v.split("/")[-1] in output]
+    assert not leaked, f"{case}: không được in giá trị secret"
+
+
+@needs_bash
+def test_init_secrets_ignores_an_ambient_neo4j_password(tmp_path):
+    """NEO4J_PASSWORD còn export trong shell (vd. `set -a; . ./.env.secrets`) KHÔNG được giữ lại.
+
+    Nếu không, luồng đổi mật khẩu của README (mv .env.secrets .env.secrets.old && init-secrets.sh
+    trong cùng shell) sinh lại đúng mật khẩu cũ và rotate-neo4j-password.sh thành no-op.
+    """
+    repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
+    res = _run_init(repo, NEO4J_PASSWORD="Ambient-Old-Pass1")
+    assert res.returncode == 0, res.stderr
+    values = _dotenv_values(repo / SECRETS_FILE_NAME)
+    assert re.fullmatch(r"[0-9a-f]{64}", values["NEO4J_PASSWORD"]), "phải sinh mật khẩu mới"
+    assert values["NEO4J_AUTH"] == "neo4j/" + values["NEO4J_PASSWORD"]
+    output = res.stdout + res.stderr
+    assert "Ambient-Old-Pass1" not in output
+    assert "KEEP_NEO4J_PASSWORD" in res.stderr, "phải nói rõ biến môi trường bị bỏ qua và cách giữ mật khẩu"
 
 
 @needs_bash
 def test_init_secrets_keeps_an_existing_neo4j_password(tmp_path):
     repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
-    res = _run_init(repo, NEO4J_PASSWORD="Old-Pass_1234")
+    # KEEP_ thắng NEO4J_PASSWORD trong môi trường (bị bỏ qua).
+    res = _run_init(repo, KEEP_NEO4J_PASSWORD="Old-Pass_1234", NEO4J_PASSWORD="Ambient-Pass-456")
     assert res.returncode == 0, res.stderr
     values = _dotenv_values(repo / SECRETS_FILE_NAME)
     assert values["NEO4J_PASSWORD"] == "Old-Pass_1234"
     assert values["NEO4J_AUTH"] == "neo4j/Old-Pass_1234"
     assert re.fullmatch(r"[0-9a-f]{64}", values["WATCHTOWER_HTTP_API_TOKEN"]), "token watchtower luôn sinh mới"
     assert "Old-Pass_1234" not in res.stdout + res.stderr
+    assert "Ambient-Pass-456" not in res.stdout + res.stderr
 
 
 @needs_bash
@@ -773,7 +847,7 @@ def test_init_secrets_keeps_an_existing_neo4j_password(tmp_path):
 )
 def test_init_secrets_rejects_neo4j_passwords_unsafe_for_env_files(tmp_path, bad):
     repo = _make_repo(tmp_path, INIT_SECRETS_SCRIPT)
-    res = _run_init(repo, NEO4J_PASSWORD=bad)
+    res = _run_init(repo, KEEP_NEO4J_PASSWORD=bad)
     assert res.returncode != 0
     assert sorted(p.name for p in repo.iterdir()) == ["scripts"], "lỗi thì không được tạo file nào"
     if bad != "neo4j":  # "neo4j" xuất hiện hợp lệ trong thông báo lỗi
@@ -811,14 +885,27 @@ def test_init_secrets_refuses_sudo_into_another_users_checkout(tmp_path):
 # hiện tại của "DB" nằm trong $FAKE_DB_PASSWORD_FILE; ALTER đổi nó sang mật khẩu mới), và quy
 # tắc database `system` — chỉ nhận lệnh quản trị (ALTER/SHOW...), còn lệnh quản trị phải chạy
 # trên `system` (Cypher thường như `RETURN 1` trên system bị Neo4j từ chối).
+# FAKE_DOCKER_DAEMON=down: mọi lệnh lỗi như khi user không có quyền với docker.sock.
+# FAKE_NEO4J_RUNNING=missing: daemon ổn nhưng không có container. FAKE_ALTER_NOOP=1: ALTER
+# "thành công" mà mật khẩu không đổi (để kiểm tra bước xác minh sau ALTER).
 _FAKE_DOCKER = r"""#!/usr/bin/env bash
 set -u
 log="$FAKE_DOCKER_LOG"
 d="$log/$(printf '%03d' "$(find "$log" -mindepth 1 -maxdepth 1 | wc -l)")"
 mkdir -p "$d"
 printf '%s\n' "$@" > "$d/argv"
+if [[ "${FAKE_DOCKER_DAEMON:-up}" == "down" ]]; then
+  echo "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock" >&2
+  exit 1
+fi
 case "${1-}" in
+  info)
+    exit 0 ;;
   inspect)
+    if [[ "${FAKE_NEO4J_RUNNING:-true}" == "missing" ]]; then
+      echo "Error: No such object: ${!#}" >&2
+      exit 1
+    fi
     echo "${FAKE_NEO4J_RUNNING:-true}"
     exit 0 ;;
   exec)
@@ -843,7 +930,7 @@ case "${1-}" in
       echo "This is an administration command and it should be executed against the system database." >&2
       exit 1
     fi
-    if grep -q "ALTER CURRENT USER" "$d/stdin"; then
+    if grep -q "ALTER CURRENT USER" "$d/stdin" && [[ "${FAKE_ALTER_NOOP:-0}" != 1 ]]; then
       printf '%s' "$FAKE_NEW_PASSWORD" > "$FAKE_DB_PASSWORD_FILE"
     fi
     exit 0 ;;
@@ -943,3 +1030,48 @@ def test_rotate_neo4j_password_refuses_bad_input_without_touching_the_db(tmp_pat
     assert db.read_text(encoding="utf-8") == old
     output = res.stdout + res.stderr
     assert "Wrong-Pass-999" not in output and _NEW_NEO4J_PASSWORD not in output
+
+
+@needs_bash
+def test_rotate_neo4j_password_fails_when_the_new_password_does_not_work_after_alter(tmp_path):
+    """ALTER báo thành công nhưng mật khẩu mới vẫn không đăng nhập được → không được báo ✓."""
+    old = "Old-Pass_1234"
+    repo, env, log, db = _rotate_setup(tmp_path, db_password=old)
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": old, "FAKE_ALTER_NOOP": "1"})
+    assert res.returncode != 0
+    assert "✓" not in res.stdout
+    assert "mật khẩu mới" in res.stderr
+    assert sum(1 for c in _docker_calls(log) if c["stdin"] and "ALTER" in c["stdin"]) == 1
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    ("fake_env", "expected", "not_expected"),
+    [
+        # Không có quyền với docker.sock: KHÔNG được bảo "container không chạy" (người dùng sẽ
+        # `docker compose up -d neo4j` rồi gặp lại đúng lỗi đó).
+        ({"FAKE_DOCKER_DAEMON": "down"}, "group docker", "docker compose up -d neo4j"),
+        ({"FAKE_NEO4J_RUNNING": "missing"}, "docker compose up -d neo4j", "group docker"),
+        ({"FAKE_NEO4J_RUNNING": "false"}, "docker compose up -d neo4j", "group docker"),
+    ],
+    ids=["daemon-unreachable", "no-container", "stopped"],
+)
+def test_rotate_neo4j_password_explains_why_docker_is_unusable(tmp_path, fake_env, expected, not_expected):
+    old = "Old-Pass_1234"
+    repo, env, log, db = _rotate_setup(tmp_path, db_password=old)
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": old, **fake_env})
+    assert res.returncode != 0
+    assert expected in res.stderr and not_expected not in res.stderr, res.stderr
+    assert not [c for c in _docker_calls(log) if c["argv"][:1] == ["exec"]], "không được chạy cypher-shell"
+    assert db.read_text(encoding="utf-8") == old
+
+
+@needs_bash
+def test_rotate_neo4j_password_warns_when_old_and_new_password_are_equal(tmp_path):
+    """Mật khẩu cũ = mật khẩu trong .env.secrets → không ALTER, nhưng phải nói rõ là CHƯA đổi."""
+    repo, env, log, db = _rotate_setup(tmp_path, db_password=_NEW_NEO4J_PASSWORD)
+    res = _run_script(repo, ROTATE_NEO4J_SCRIPT, {**env, "NEO4J_OLD_PASSWORD": _NEW_NEO4J_PASSWORD})
+    assert res.returncode == 0, res.stderr
+    assert "KHÔNG được đổi" in res.stderr
+    assert not [c for c in _docker_calls(log) if c["argv"][:1] == ["exec"]]
+    assert _NEW_NEO4J_PASSWORD not in res.stdout + res.stderr

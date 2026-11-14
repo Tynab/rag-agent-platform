@@ -409,7 +409,7 @@ Mật khẩu Neo4j và token HTTP API của watchtower **không** nằm trong `.
 scripts/init-secrets.sh
 ```
 
-Script sinh giá trị ngẫu nhiên mạnh (64 ký tự hex, `openssl rand` hoặc `/dev/urandom`) cho `NEO4J_PASSWORD`, `NEO4J_AUTH` (= `neo4j/<NEO4J_PASSWORD>`, mật khẩu khởi tạo của container neo4j) và `WATCHTOWER_HTTP_API_TOKEN`; **không bao giờ ghi đè** `.env.secrets` đã có (chạy lại an toàn) và không in giá trị ra màn hình. Danh sách key + chú thích: `.env.secrets.example`. Cần `bash` (Windows: chạy trong WSL hoặc Git Bash).
+Script sinh giá trị ngẫu nhiên mạnh (64 ký tự hex, `openssl rand` hoặc `/dev/urandom`) cho `NEO4J_PASSWORD`, `NEO4J_AUTH` (= `neo4j/<NEO4J_PASSWORD>`, mật khẩu khởi tạo của container neo4j) và `WATCHTOWER_HTTP_API_TOKEN`; **không bao giờ ghi đè** `.env.secrets` đã có (chạy lại an toàn; file đã có mà thiếu/rỗng key — vd. copy nguyên `.env.secrets.example` — thì báo tên key lỗi và thoát 1, không sửa file) và không in giá trị ra màn hình. Danh sách key + chú thích: `.env.secrets.example`. Cần `bash` (Windows: chạy trong WSL hoặc Git Bash).
 
 > - Thiếu `.env.secrets` thì `docker compose up` / `config` dừng ngay với lỗi `env file .../.env.secrets not found` — chạy `scripts/init-secrets.sh`.
 > - `NEO4J_AUTH` chỉ có tác dụng ở lần start **đầu tiên** của volume `neo4j_data` rỗng. Đổi mật khẩu Neo4j về sau (volume đã có dữ liệu): sửa `NEO4J_PASSWORD` **và** `NEO4J_AUTH` trong `.env.secrets` (hoặc đổi tên file cũ rồi chạy lại `scripts/init-secrets.sh`), chạy `scripts/rotate-neo4j-password.sh` (hỏi mật khẩu cũ), rồi `docker compose up -d`.
@@ -611,6 +611,7 @@ Chỉ dành cho máy đã chạy rag-agent-platform **trước** khi có `.env.s
    ```bash
    scripts/init-secrets.sh
    ```
+   Script bỏ qua biến `NEO4J_PASSWORD` còn export trong shell (vd. từng `source .env`) — luôn sinh mật khẩu mới, trừ khi đặt tường minh `KEEP_NEO4J_PASSWORD` (xem "Giữ tạm" bên dưới).
 4. **Đổi (rotate) cả hai secret** vì giá trị cũ còn trong lịch sử git:
    - *Token watchtower*: bước 3 đã sinh token mới; token cũ hết hiệu lực khi watchtower được recreate ở bước 5.
    - *Mật khẩu Neo4j*: volume `neo4j_data` vẫn dùng mật khẩu cũ (`NEO4J_AUTH` chỉ áp dụng cho volume rỗng), nên phải đổi **trong DB** sang `NEO4J_PASSWORD` mới của `.env.secrets` — chạy khi container neo4j đang chạy (container cũ từ trước khi pull là được; nếu đã dừng: `docker compose up -d neo4j`):
@@ -622,11 +623,12 @@ Chỉ dành cho máy đã chạy rag-agent-platform **trước** khi có `.env.s
 5. **Khởi động lại stack** với cấu hình mới, kiểm tra, rồi xóa bản sao lưu (chứa secret cũ, nay đã vô hiệu):
    ```bash
    docker compose up -d
+   docker compose ps neo4j          # chờ tới khi neo4j "healthy" (JVM khởi động mất vài chục giây)
    curl -s http://localhost:8090/graph/status | jq .connected        # → true
    rm .env.pre-secrets.bak
    ```
 
-> **Giữ tạm mật khẩu Neo4j cũ** (khi chưa đổi được ngay, vd. không chạy được `cypher-shell`): ở bước 3 truyền mật khẩu cũ — `NEO4J_PASSWORD="$(sed -n 's/^NEO4J_PASSWORD=//p' .env.pre-secrets.bak | tail -n 1)" scripts/init-secrets.sh` — rồi bỏ qua phần Neo4j ở bước 4; stack chạy ngay với volume cũ. Mật khẩu đó vẫn nằm trong lịch sử git nên **phải đổi sớm**. Vì `init-secrets.sh` không bao giờ ghi đè file đã có, đưa mật khẩu mới vào bằng cách đổi tên file cũ:
+> **Giữ tạm mật khẩu Neo4j cũ** (khi chưa đổi được ngay, vd. không chạy được `cypher-shell`): ở bước 3 truyền mật khẩu cũ qua biến riêng `KEEP_NEO4J_PASSWORD` — `KEEP_NEO4J_PASSWORD="$(sed -n 's/^NEO4J_PASSWORD=//p' .env.pre-secrets.bak | tail -n 1)" scripts/init-secrets.sh` — rồi bỏ qua phần Neo4j ở bước 4; stack chạy ngay với volume cũ. Mật khẩu đó vẫn nằm trong lịch sử git nên **phải đổi sớm**. Vì `init-secrets.sh` không bao giờ ghi đè file đã có, đưa mật khẩu mới vào bằng cách đổi tên file cũ:
 > ```bash
 > mv .env.secrets .env.secrets.old      # .gitignore chặn .env.secrets.*
 > scripts/init-secrets.sh               # file mới: mật khẩu Neo4j + token watchtower mới
@@ -1949,6 +1951,7 @@ curl -s -X POST http://localhost:8090/ask \
 | `rag-api` / `agent-api` crash khi start | Thiếu env var bắt buộc | `docker compose logs rag-api` — tìm `RuntimeError` |
 | `docker compose up` báo `env file .../.env.secrets not found` | Chưa tạo file secret (cài mới, hoặc vừa pull bản có `.env.secrets`) | Chạy `scripts/init-secrets.sh` bằng user thường — bản cài cũ xem [Nâng cấp bản cài cũ](#nâng-cấp-bản-cài-cũ--chuyển-secret-sang-envsecrets) |
 | `docker compose` báo `permission denied` khi đọc `.env.secrets` | File được tạo bằng `sudo` nên thuộc root | `sudo chown "$USER": .env.secrets && chmod 600 .env.secrets`; lần sau chạy `scripts/init-secrets.sh` không có sudo |
+| `scripts/init-secrets.sh` báo `.env.secrets đã tồn tại nhưng KHÔNG dùng được` (kèm tên key rỗng/thiếu) | File tạo tay — vd. copy nguyên `.env.secrets.example` (giá trị rỗng). Chạy stack với file đó thì watchtower nhận token rỗng, neo4j không nhận mật khẩu khởi tạo, rag-api đăng nhập Neo4j bằng chuỗi rỗng | `mv .env.secrets .env.secrets.broken && scripts/init-secrets.sh`; volume `neo4j_data` đã có dữ liệu thì đổi mật khẩu DB bằng `scripts/rotate-neo4j-password.sh` |
 | `/ask` trả về 404 "chưa được ingest" | Chưa chạy `/ingest` | `curl -X POST localhost:8090/ingest -d '{"project":"..."}'` |
 | `/ingest` trả về `"status": "empty"` | Không có subfolder trong `data/raw/` | Tạo subfolder và đặt file vào đó |
 | `/ask` với `module` không trả kết quả | Module sai tên hoặc chưa ingest | Tên module = tên thư mục con chính xác |
@@ -2041,7 +2044,7 @@ Một số test đáng chú ý khi sửa code:
 
 | Test | Kiểm tra |
 |---|---|
-| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, chạy với `docker` giả); image bên thứ ba pin được qua `*_IMAGE_TAG`; neo4j không cài plugin; healthcheck của `rag-api`/`agent-api` dùng `python` (không curl) và được chạy thật với server HTTP tạm |
+| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret, file đã có mà thiếu/rỗng key → lỗi, bỏ qua `NEO4J_PASSWORD` trong môi trường — giữ mật khẩu chỉ qua `KEEP_NEO4J_PASSWORD`) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, xác minh mật khẩu mới sau ALTER, phân biệt "không gọi được Docker" với "container không chạy", chạy với `docker` giả); image bên thứ ba pin được qua `*_IMAGE_TAG`; neo4j không cài plugin; healthcheck của `rag-api`/`agent-api` dùng `python` (không curl) và được chạy thật với server HTTP tạm |
 | `tests/test_role_registry*.py` | Bảng hành vi dẫn xuất từ `AgentConfig` và các bất biến của role registry |
 | `tests/test_workflow_queue*.py` | Hàng đợi FIFO, `WORKFLOW_CONCURRENCY`, hủy workflow và các race hủy/hoàn tất |
 | `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |

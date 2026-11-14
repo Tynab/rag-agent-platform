@@ -103,12 +103,25 @@ if [[ -z "$old_password" ]]; then
 fi
 
 command -v docker >/dev/null 2>&1 || die "không tìm thấy lệnh docker."
-if [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
+if ! running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"; then
+  # inspect lỗi vì không gọi được daemon (thiếu quyền / daemon tắt) khác hẳn với "chưa có container".
+  if ! docker info >/dev/null 2>&1; then
+    die "không gọi được Docker daemon (daemon chưa chạy, hoặc user $(id -un) chưa thuộc group docker).
+     Thêm user vào group docker rồi đăng nhập lại, hoặc chạy: sudo scripts/rotate-neo4j-password.sh
+     và NHẬP mật khẩu cũ khi được hỏi (sudo bỏ biến môi trường; đừng đưa mật khẩu vào tham số lệnh)."
+  fi
+  die "không có container $CONTAINER — khởi động trước: docker compose up -d neo4j"
+fi
+if [[ "$running" != "true" ]]; then
   die "container $CONTAINER không chạy — khởi động trước: docker compose up -d neo4j"
 fi
 
 if [[ "$old_password" == "$new_password" ]]; then
-  echo "• Mật khẩu cũ trùng NEO4J_PASSWORD trong .env.secrets — không có gì để đổi."
+  {
+    echo "⚠ Mật khẩu cũ trùng NEO4J_PASSWORD trong .env.secrets — mật khẩu Neo4j KHÔNG được đổi."
+    echo "  Muốn đổi sang mật khẩu mới: mv .env.secrets .env.secrets.old && scripts/init-secrets.sh"
+    echo "  rồi chạy lại script này với mật khẩu cũ (NEO4J_OLD_PASSWORD hoặc nhập khi được hỏi)."
+  } >&2
   exit 0
 fi
 
