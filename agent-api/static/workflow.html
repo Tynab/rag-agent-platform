@@ -203,7 +203,15 @@
       flex-wrap: wrap;
       gap: 8px;
     }
+    /* Chip là <button> thật (Tab tới được, Enter/Space mở) — reset kiểu mặc định của button
+       (font, màu, căn giữa, appearance) để trông như thẻ cũ. */
     .recent-chip {
+      display: block;
+      margin: 0;
+      font: inherit;
+      color: inherit;
+      text-align: left;
+      appearance: none;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
@@ -212,8 +220,21 @@
       transition: border-color .15s;
     }
     .recent-chip:hover { border-color: var(--accent); }
-    .recent-chip .rc-id { font-family: monospace; font-size: 12px; color: var(--accent-l); }
-    .recent-chip .rc-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .recent-chip:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent-l); outline-offset: 2px; }
+    /* Workflow đang mở (?id= trên URL) — aria-current="true" */
+    .recent-chip[aria-current="true"] { border-color: var(--accent); }
+    .recent-chip .rc-id { display: block; font-family: monospace; font-size: 12px; color: var(--accent-l); }
+    .recent-chip .rc-meta { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+    /* Chữ chỉ dành cho trình đọc màn hình (vd. tên trạng thái thay cho icon ✓ ✗ ⏳) */
+    .sr-only {
+      position: absolute;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+      border: 0;
+    }
 
     /* ── Workflow view ───────────────────────────────────────── */
     .wf-view { display: none; }
@@ -309,6 +330,7 @@
       padding: 12px 2px 10px;
     }
 
+    /* Node là <button> thật (Tab tới được, Enter/Space chọn tab) — reset kiểu mặc định */
     .step-node {
       display: flex;
       flex-direction: column;
@@ -316,7 +338,18 @@
       min-width: 72px;
       cursor: pointer;
       flex-shrink: 0;
+      margin: 0;
+      padding: 0;
+      border: none;
+      background: none;
+      font: inherit;
+      color: inherit;
+      appearance: none;
     }
+    /* Viền focus bàn phím vẽ quanh vòng tròn (steps-track cuộn ngang, chỉ có 2px đệm hai
+       bên → viền quanh cả node bị cắt ở node đầu/cuối); nằm ngoài vòng .selected (3px). */
+    .step-node:focus-visible { outline: none; }
+    .step-node:focus-visible .step-circle { outline: 2px solid var(--accent-l); outline-offset: 4px; }
 
     .step-circle {
       width: 40px;
@@ -330,7 +363,9 @@
       justify-content: center;
       font-size: 13px;
       font-weight: 700;
-      transition: all .25s;
+      /* Liệt kê thuộc tính thay vì "all": viền focus (outline) hiện ngay, không "trôi" từ màu
+         trạng thái sang màu focus */
+      transition: background-color .25s, border-color .25s, color .25s, box-shadow .25s;
       position: relative;
       z-index: 1;
     }
@@ -697,6 +732,11 @@
     /* min-width:0 + overflow-wrap: tên file dài xuống dòng thay vì đẩy size / nút ⬇
        ra ngoài khung (bị cắt) trên màn hẹp */
     .ft-name  { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; font-family: 'SF Mono','Fira Code',monospace; color: var(--text); }
+    /* Tên file là <button> (bàn phím mở được file; click nổi lên onclick của .ft-item) —
+       reset kiểu button, giữ nguyên dáng chữ của .ft-name */
+    .ft-open  { flex: 0 1 auto; margin: 0 auto 0 0; padding: 0; border: none; background: none;
+                appearance: none; text-align: left; line-height: inherit; cursor: pointer; }
+    .ft-open:focus-visible { outline: 2px solid var(--accent-l); outline-offset: 2px; border-radius: 4px; }
     .ft-size  { font-size: 11px; color: var(--muted); white-space: nowrap; }
     .ft-dl    { margin-left: 6px; opacity: 0; transition: opacity .15s; text-decoration: none; flex-shrink: 0; }
     /* Hiện nút ⬇ khi hover, khi focus bằng bàn phím, và luôn hiện trên thiết bị
@@ -996,6 +1036,7 @@ const ARTIFACT_ROLES = new Set(['fe', 'mobile', 'be', 'dba', 'devsecops', 'tech_
 // Còn role đã xong mà /artifacts chưa có mục nào (vd. role không sinh file) → thử lại thưa
 const ART_RETRY_MS   = 30000;
 const TOAST_MAX      = 4;      // số toast hiện cùng lúc tối đa — cũ nhất bị bỏ trước
+const REVOKE_DELAY_MS = 10000; // giữ object URL của file zip tải xuống bao lâu trước khi thu hồi
 
 // Tên ngôn ngữ của fence / artifact → grammar highlight.js (hlLanguageOf). null = cố ý KHÔNG
 // tô màu: không có grammar (Terraform/HCL), sơ đồ (mermaid, sơ đồ ASCII → plaintext), văn bản
@@ -1415,6 +1456,11 @@ function renderCancelUi() {
 
 /* ── Progress tracker ───────────────────────────────────────────────── */
 const STEP_TITLES = { failed: 'Bước này thất bại', warn: 'Một số file không sinh được' };
+// Trạng thái bước đọc cho trình đọc màn hình (aria-label của node trên dải tiến trình)
+const STEP_STATE_TEXT = {
+  done: 'hoàn thành', warn: 'hoàn thành, một số file không sinh được', failed: 'thất bại',
+  active: 'đang chạy', todo: 'chưa chạy',
+};
 
 function renderProgress(data) {
   const completed = new Set(data.completed_steps || []);
@@ -1425,6 +1471,8 @@ function renderProgress(data) {
   if (!_stepEls) {
     // Dựng 15 node + 14 connector một lần; các lần poll sau chỉ toggle class
     track.innerHTML = '';
+    // Node là <button type="button">: Tab tới được, Enter/Space kích hoạt onclick (trình
+    // duyệt tự lo) — trước đây là <div> nên bàn phím không chọn được bước.
     _stepEls = STEPS.map((step, i) => {
       let conn = null;
       if (i > 0) {
@@ -1432,13 +1480,15 @@ function renderProgress(data) {
         conn.className = 'step-connector';
         track.appendChild(conn);
       }
-      const node = document.createElement('div');
+      const node = document.createElement('button');
+      node.type = 'button';
       node.className = 'step-node';
       node.onclick = () => selectTab(step.role);
+      // Trong <button> chỉ được chứa phrasing content → <span> (CSS giữ nguyên dáng)
       node.innerHTML = `
-        <div class="step-circle"></div>
-        <div class="step-label">${step.label}</div>
-        <div class="step-sublabel">${step.name}</div>`;
+        <span class="step-circle" aria-hidden="true"></span>
+        <span class="step-label">${esc(step.label)}</span>
+        <span class="step-sublabel">${esc(step.name)}</span>`;
       track.appendChild(node);
       return { node, conn, circle: node.querySelector('.step-circle'), state: null };
     });
@@ -1471,6 +1521,12 @@ function renderProgress(data) {
     if (el.state !== state) {
       el.state = state;
       el.node.title = STEP_TITLES[state] || '';
+      // Vòng tròn chỉ có icon (✓ / ✗ / spinner / số) → tên đọc cho trình đọc màn hình nằm ở
+      // aria-label, kèm trạng thái. Bước đang chạy = "bước hiện tại" của quy trình.
+      el.node.setAttribute('aria-label',
+        `Bước ${i + 1}/${STEPS.length}: ${step.label} — ${step.name} (${STEP_STATE_TEXT[state]})`);
+      if (state === 'active') el.node.setAttribute('aria-current', 'step');
+      else el.node.removeAttribute('aria-current');
       if (state === 'done' || state === 'warn') {
         el.circle.innerHTML = `<svg><use href="#icon-check"/></svg>`;
       } else if (state === 'failed') {
@@ -1937,13 +1993,19 @@ async function showRecent() {
     data.workflows.forEach(w => {
       const iconMap = { pending:'⏳', running:'⟳', completed:'✓', failed:'✗', cancelled:'⊘' };
       const icon    = iconMap[w.status] || '?';
-      const chip    = document.createElement('div');
+      const stLabel = (STATUS_MAP[w.status] || {}).label || w.status;
+      // <button type="button">: Tab tới được, Enter/Space mở workflow (trước đây là <div>)
+      const chip    = document.createElement('button');
+      chip.type      = 'button';
       chip.className = 'recent-chip';
       chip.title     = fmtFullTime(w.created_at);
+      // Workflow đang mở (?id= trên URL) — đánh dấu cho cả mắt lẫn trình đọc màn hình
+      if (w.workflow_id === currentId) chip.setAttribute('aria-current', 'true');
       // Dữ liệu server (đặc biệt project do người dùng nhập) → luôn esc() (chống stored XSS).
+      // Icon trạng thái ẩn với trình đọc màn hình, thay bằng tên trạng thái (sr-only).
       chip.innerHTML = `
-        <div class="rc-id">${icon} ${esc(String(w.workflow_id).substring(0, 16))}…</div>
-        <div class="rc-meta">${esc(w.project || 'no project')} · ${esc(w.completed_steps)}/${esc(w.total_steps)} steps · ${esc(fmtTime(w.created_at))}</div>`;
+        <span class="rc-id"><span aria-hidden="true">${icon}</span><span class="sr-only">${esc(stLabel)}:</span> ${esc(String(w.workflow_id).substring(0, 16))}…</span>
+        <span class="rc-meta">${esc(w.project || 'no project')} · ${esc(w.completed_steps)}/${esc(w.total_steps)} steps · ${esc(fmtTime(w.created_at))}</span>`;
       chip.onclick = () => {
         document.getElementById('wid-input').value = w.workflow_id;
         trackWorkflow(w.workflow_id);
@@ -2262,14 +2324,16 @@ function renderFileTree(role, files) {
       const encPath = encodeURIComponent(f.filename);
       // Truyền role/path qua data-* (esc cho ngữ cảnh attribute) thay vì nhét vào chuỗi JS
       // trong onclick — tên file chứa \ hoặc ' không thể thoát khỏi chuỗi JS.
+      // Tên file là <button> để bàn phím mở được file: Enter/Space → click nổi lên onclick
+      // của cả hàng (hàng chứa link ⬇ nên không thể tự làm role="button").
       html += `<div class="ft-item" data-role="${esc(role)}" data-path="${esc(f.filename)}"
            onclick="viewArtifact(this.dataset.role, this.dataset.path)">
-        <span class="ft-icon">${icon}</span>
-        <span class="ft-name">${esc(fname)}</span>
+        <span class="ft-icon" aria-hidden="true">${icon}</span>
+        <button type="button" class="ft-name ft-open">${esc(fname)}</button>
         <span class="ft-size">${fmtSize(f.size)}</span>
         <a class="btn btn-secondary btn-sm ft-dl"
            href="/workflow/${wid}/artifacts/${role}/${encPath}?download=1"
-           download="${esc(fname)}"
+           download="${esc(fname)}" aria-label="Tải xuống ${esc(fname)}" title="Tải xuống"
            onclick="event.stopPropagation()">⬇</a>
       </div>`;
     }
@@ -2360,14 +2424,15 @@ async function downloadRoleZip(role) {
     if (missing === files.length) { toast('✗ Không tải được file nào — thử lại sau.', 'err'); return; }
     const blob = await zip.generateAsync({ type: 'blob' });
     const url  = URL.createObjectURL(blob);
-    // Anchor phải nằm trong DOM thì click() mới chắc chắn tải được (Firefox); thu hồi object
-    // URL sau một nhịp — revoke ngay sau click() có thể hủy tải trước khi trình duyệt đọc blob.
+    // Anchor phải nằm trong DOM thì click() mới chắc chắn tải được (Firefox); gỡ anchor ngay,
+    // nhưng chỉ thu hồi object URL sau REVOKE_DELAY_MS — revoke sớm (ngay sau click() hoặc
+    // khi zip lớn / máy chậm) có thể hủy tải trước khi trình duyệt đọc xong blob.
     const a    = document.createElement('a');
     a.href = url; a.download = `${role}-artifacts.zip`; a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
     if (missing) toast(`⚠ Đã tải ${role}-artifacts.zip — thiếu ${missing}/${files.length} file không tải được.`, 'warn');
     else toast(`✓ Đã tải ${role}-artifacts.zip`, 'ok');
   } catch (e) { toast(`✗ Lỗi: ${e.message}`, 'err'); }

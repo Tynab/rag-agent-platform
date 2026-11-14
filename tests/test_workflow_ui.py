@@ -18,8 +18,14 @@
   view + banner + backoff 2.5s → 30s, tab ẩn thì tạm dừng. Chạy bằng node với DOM giả,
   fetch theo kịch bản và setTimeout giả (_SM_RUNNER).
 
-F12 (race khi đổi workflow / poll trùng) và layout/animation thật cần trình duyệt → kiểm
-bằng Playwright thủ công, không nằm trong pytest.
+- Đồng bộ backend: mảng STEPS của UI (role, thứ tự, label, tên rút gọn) và các số "15 bước"
+  hiển thị cứng khớp WORKFLOW_STEPS / AGENTS của agent-api/agents.py (đọc bằng regex, không cần node).
+- Bàn phím: chip Recent, node dải tiến trình, tên file artifact là <button type="button">
+  (Tab tới được; Enter/Space = click là hành vi gốc của trình duyệt), aria-label / aria-current,
+  viền :focus-visible. Download All thu hồi object URL sau REVOKE_DELAY_MS, không ngay sau click.
+
+F12 (race khi đổi workflow / poll trùng), layout/animation thật và phím Enter/Space thật cần
+trình duyệt → kiểm bằng Playwright thủ công, không nằm trong pytest.
 """
 
 import ast
@@ -364,12 +370,12 @@ const html = fs.readFileSync(process.argv[1], 'utf8');
 const src = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).join('\n');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 
-function makeEl(id) {
+function makeEl(id, tag = 'DIV') {
   const cls = new Set();
   let first = null;
   const el = {
-    id, style: {}, textContent: '', innerHTML: '', disabled: false, title: '', value: '',
-    dataset: {}, scrollLeft: 0, children: [], parent: null,
+    id, tagName: tag, style: {}, textContent: '', innerHTML: '', disabled: false, title: '', value: '',
+    dataset: {}, scrollLeft: 0, children: [], parent: null, attrs: {},
     classList: {
       toggle(c, on) { if (on === undefined) on = !cls.has(c); if (on) cls.add(c); else cls.delete(c); return on; },
       add(c) { cls.add(c); }, remove(c) { cls.delete(c); }, contains(c) { return cls.has(c); },
@@ -379,7 +385,9 @@ function makeEl(id) {
     get firstChild() { return first || (first = makeEl('')); },
     appendChild(c) { c.parent = el; el.children.push(c); return c; },
     remove() { if (el.parent) el.parent.children = el.parent.children.filter(x => x !== el); el.parent = null; },
-    setAttribute() {}, addEventListener() {}, focus() {}, select() {}, setSelectionRange() {},
+    setAttribute(k, v) { el.attrs[k] = String(v); }, removeAttribute(k) { delete el.attrs[k]; },
+    getAttribute(k) { return k in el.attrs ? el.attrs[k] : null; }, hasAttribute(k) { return k in el.attrs; },
+    addEventListener() {}, focus() {}, select() {}, setSelectionRange() {},
     click() { logs.clicks.push({ attached: !!el.parent, href: el.href, download: el.download,
                                  revokedBefore: logs.revoked.length }); },
     querySelector() { return makeEl(''); }, querySelectorAll() { return []; },
@@ -393,7 +401,7 @@ const logs = { clicks: [], revoked: [], clip: [], zip: [] };
 const document = {
   hidden: false,
   getElementById(id) { return els[id] || (els[id] = makeEl(id)); },
-  createElement() { return makeEl(''); },
+  createElement(tag) { return makeEl('', String(tag).toUpperCase()); },
   addEventListener(type, fn) { listeners[type] = fn; },
   body: makeEl('body'),
   head: makeEl('head'),
@@ -447,7 +455,7 @@ const ctx = {
       if (artQueue.length) artLast = artQueue.shift();
       return resp({ status: 200, body: { artifacts: artLast } });
     }
-    if (url === '/workflows') return resp({ status: 200, body: { workflows: [] } });
+    if (url === '/workflows') return resp({ status: 200, body: { workflows: input.workflows || [] } });
     const r = url.endsWith('/cancel') ? input.cancel : queue.shift();
     if (!r) throw new Error('kịch bản hết response cho ' + url);
     if (r.network) throw new TypeError('Failed to fetch');
@@ -510,6 +518,7 @@ function snap() {
     toastCls: g('toast-stack').children.map(t => t.className),
     url: ctx.window.location.search, pushes: pushes.length,
     input: g('wid-input').value, copyBtn: g('copy-btn').style.display,
+    revoked: [...logs.revoked], otherTimers: timers.filter(t => !t.done && t.fn !== pollFn).map(t => t.ms),
   };
 }
 
@@ -983,18 +992,28 @@ def test_download_all_attaches_anchor_revokes_later_and_reports_missing_files():
     res = _run_sm(
         [["track", "wf-1"],
          ["eval", "artifactsCache = { fe: [{ filename: 'a.ts', size: 1 }, { filename: 'b.ts', size: 2 }] }; 0"],
-         ["await", "downloadRoleZip('fe')"], ["snap"], ["timers", 1000]],
+         ["eval", "REVOKE_DELAY_MS"],
+         ["await", "downloadRoleZip('fe')"], ["snap"], ["timers", 10000], ["snap"]],
         [_ok(_A), _ok({"path": "a.ts", "language": "ts", "content": "A"}), {"status": 404, "body": {}}],
     )
     logs = res["logs"]
+    delay, before, after = res["out"][1], res["out"][3], res["out"][4]
+    # Revoke sớm (ngay sau click, hoặc chỉ sau ~1s với zip lớn / máy chậm) có thể hủy tải.
+    assert delay == 10000, f"REVOKE_DELAY_MS={delay} — đổi thì sửa luôn thao tác timers ở trên"
     assert logs["clicks"] == [{"attached": True, "href": "blob:zip-1", "download": "fe-artifacts.zip",
                                "revokedBefore": 0}]
     assert ["file", "fe/a.ts", "A"] in logs["zip"]
     assert logs["bodyChildren"] == 0, "anchor phải được gỡ sau khi click"
-    assert logs["revoked"] == ["blob:zip-1"], "object URL được thu hồi sau một nhịp (timer), không ngay lúc click"
-    s = res["out"][2]
-    assert s["toasts"][-1].startswith("⚠") and "1/2" in s["toasts"][-1]
+    # Đã click + gỡ anchor nhưng CHƯA thu hồi URL: còn đúng một timer REVOKE_DELAY_MS đang chờ.
+    assert before["revoked"] == [], "object URL bị thu hồi ngay sau click()"
+    assert delay in before["otherTimers"]
+    assert after["revoked"] == ["blob:zip-1"], "timer REVOKE_DELAY_MS phải thu hồi object URL"
+    assert delay not in after["otherTimers"]
+    assert before["toasts"][-1].startswith("⚠") and "1/2" in before["toasts"][-1]
     assert "alert(" not in _inline_script()
+    # Không helper tải xuống nào khác gọi revokeObjectURL trực tiếp (ngoài setTimeout).
+    revokes = re.findall(r"^.*revokeObjectURL.*$", _inline_script(), re.M)
+    assert revokes and all("setTimeout(" in line and "REVOKE_DELAY_MS" in line for line in revokes), revokes
 
 
 def test_running_step_change_is_revealed_in_the_progress_strip():
@@ -1087,3 +1106,156 @@ def test_ui_artifact_roles_match_backend():
     m = re.search(r"const ARTIFACT_ROLES\s*=\s*new Set\(\[([^\]]*)\]\)", _inline_script())
     assert m, "không thấy ARTIFACT_ROLES trong workflow.html"
     assert set(re.findall(r"'([a-z_]+)'", m.group(1))) == set(artifacts.ARTIFACT_ROLES)
+
+
+# ── Danh sách bước của UI khớp registry agent-api (R1a) ───────────────────────
+
+def _ui_steps() -> list[dict]:
+    """Đọc mảng STEPS trong workflow.html bằng regex (không cần node → test không bao giờ skip)."""
+    m = re.search(r"const STEPS\s*=\s*\[(.*?)\];", _inline_script(), re.S)
+    assert m, "không thấy const STEPS = [...] trong workflow.html"
+    body = m.group(1)
+    entries = re.findall(r"\{([^{}]*)\}", body)
+    # Mỗi mục có đúng một `role:` — regex hỏng / mục viết kiểu khác thì fail chứ không bỏ sót.
+    assert entries and len(entries) == len(re.findall(r"\brole\s*:", body)), "không parse được hết STEPS"
+    steps = []
+    for e in entries:
+        fields = {k: v for k, _q, v in re.findall(r"(\w+)\s*:\s*(['\"])(.*?)\2", e)}
+        assert {"role", "label", "name"} <= fields.keys(), f"mục STEPS thiếu role/label/name: {e.strip()}"
+        steps.append(fields)
+    return steps
+
+
+def test_ui_steps_match_backend_workflow_steps_and_agents():
+    """Thêm / bớt / đổi thứ tự role ở agents.py mà quên sửa STEPS của UI → fail (UI lệch backend)."""
+    import agents
+
+    ui = _ui_steps()
+    roles = [s["role"] for s in ui]
+    assert roles == list(agents.WORKFLOW_STEPS), "thứ tự role của STEPS (UI) khác WORKFLOW_STEPS"
+    assert roles == sorted(agents.AGENTS, key=lambda r: agents.AGENTS[r].step_id), "khác thứ tự step_id của AGENTS"
+    for i, s in enumerate(ui, 1):
+        cfg = agents.AGENTS[s["role"]]
+        assert cfg.role == s["role"] and cfg.step_id == i
+        # AGENTS name: "<Label> Agent — <mô tả>". Label của UI phải đúng phần trước " Agent".
+        m = re.match(r"(.+?) Agent — (.+)$", cfg.name)
+        assert m, f"tên agent không đúng dạng '<Label> Agent — <mô tả>': {cfg.name}"
+        assert s["label"] == m.group(1), f"{s['role']}: label UI {s['label']!r} ≠ {m.group(1)!r}"
+        # name của UI là bản rút gọn của mô tả: mỗi từ là tiền tố của một từ trong mô tả
+        # ("CI/CD & Infra" ⊂ "Infrastructure, CI/CD & Deployment") — đủ bắt role bị lệch vị trí.
+        desc = [w.strip(",").lower() for w in m.group(2).split()]
+        short = [w.lower() for w in s["name"].split() if w != "&"]
+        assert short and all(any(d.startswith(w) for d in desc) for w in short), (
+            f"{s['role']}: name UI {s['name']!r} không phải bản rút gọn của {m.group(2)!r}"
+        )
+
+
+def test_hardcoded_step_counts_match_workflow_steps():
+    """Các con số "15" hiển thị cứng trong trang phải bằng số bước thật."""
+    import agents
+
+    html = HTML.read_text(encoding="utf-8")
+    n = len(agents.WORKFLOW_STEPS)
+    for pat in (r"(\d+)-Step SDLC Pipeline", r"/\s*(\d+)\s*hoàn thành", r"tiến trình (\d+) bước"):
+        found = re.findall(pat, html)
+        assert found, f"không thấy {pat!r} trong workflow.html"
+        assert all(int(x) == n for x in found), f"{pat!r}: {found} ≠ {n} bước"
+
+
+# ── Bàn phím: chip Recent, node dải tiến trình, tên file artifact (R2a) ─────────
+
+_NODES = ("_stepEls.map(e => ({ tag: e.node.tagName, type: e.node.type, disabled: e.node.disabled,"
+          " tabindex: e.node.getAttribute('tabindex'), label: e.node.getAttribute('aria-label'),"
+          " current: e.node.getAttribute('aria-current'), click: typeof e.node.onclick }))")
+
+
+def test_step_nodes_are_keyboard_buttons_with_state_label_and_aria_current():
+    """Node là <button type=button> (Tab tới được; Enter/Space = click — hành vi gốc của trình duyệt,
+    kiểm thật bằng Playwright), aria-label mang trạng thái, aria-current="step" theo bước đang chạy."""
+    at_ta = _rec("running", completed_steps=ROLES[:3], step_outputs={r: "x" for r in ROLES[:3]})
+    fin = _rec("completed", completed_steps=ROLES, step_outputs={r: "x" for r in ROLES})
+    other = _rec("running", workflow_id="wf-2", completed_steps=["ba"],
+                 step_outputs={"ba": "[LỖI trong ba] x"}, failed_steps=["ba"])
+    res = _run_sm(
+        [["track", "wf-1"], ["eval", _NODES],
+         ["eval", "_stepEls[2].node.onclick(); [activeTab, userPickedTab]"],
+         ["tick"], ["eval", _NODES],
+         ["track", "wf-2"], ["eval", _NODES]],
+        [_ok(at_ta), _ok(fin), _ok(other)],
+    )
+    running, picked, finished, switched = res["out"]
+    assert len(running) == len(ROLES)
+    for n in running:
+        assert n["tag"] == "BUTTON" and n["type"] == "button", "node phải là <button type=button>"
+        assert not n["disabled"] and n["tabindex"] in (None, "0") and n["click"] == "function"
+    assert running[0]["label"] == "Bước 1/15: BA — Business Analysis (hoàn thành)"
+    assert running[3]["label"] == "Bước 4/15: TA — Technical Architecture (đang chạy)"
+    assert running[4]["label"].endswith("(chưa chạy)")
+    assert [i for i, n in enumerate(running) if n["current"]] == [3] and running[3]["current"] == "step"
+    assert picked == ["sa", True], "click (= Enter/Space trên <button>) phải chọn tab của bước"
+    assert all(n["current"] is None for n in finished), "workflow xong → không còn bước hiện tại"
+    assert all(n["label"].endswith("(hoàn thành)") for n in finished)
+    # Node dựng một lần, dùng lại khi đổi workflow → aria-current / label phải theo workflow mới.
+    assert [i for i, n in enumerate(switched) if n["current"]] == [1]
+    assert switched[0]["label"].endswith("(thất bại)") and switched[1]["label"].endswith("(đang chạy)")
+
+
+_WFS = [
+    {"workflow_id": "wf-1", "status": "completed", "project": "<img src=x onerror=alert(1)>",
+     "completed_steps": 15, "total_steps": 15, "created_at": _TODAY},
+    {"workflow_id": "wf-2", "status": "running", "project": "B", "completed_steps": 2, "total_steps": 15,
+     "created_at": _TODAY},
+]
+_CHIPS = ("document.getElementById('recent-grid').children.map(c => ({ tag: c.tagName, type: c.type,"
+          " disabled: c.disabled, tabindex: c.getAttribute('tabindex'), current: c.getAttribute('aria-current'),"
+          " html: c.innerHTML, click: typeof c.onclick }))")
+
+
+def test_recent_chips_are_keyboard_buttons_and_mark_the_open_workflow():
+    res = _run_sm(
+        [["track", "wf-2"], ["recent"], ["eval", _CHIPS],
+         ["eval", "document.getElementById('recent-grid').children[0].onclick(); 0"], ["flush"], ["snap"]],
+        [_ok(_B), _ok(_A)],
+        workflows=_WFS,
+    )
+    chips, snap = res["out"][0], res["out"][2]
+    assert len(chips) == 2
+    for c in chips:
+        assert c["tag"] == "BUTTON" and c["type"] == "button", "chip phải là <button type=button>"
+        assert not c["disabled"] and c["tabindex"] in (None, "0") and c["click"] == "function"
+        assert "<div" not in c["html"], "<button> chỉ chứa phrasing content (span), không div"
+    # Workflow đang mở (?id=wf-2) được đánh dấu; chip khác thì không.
+    assert [c["current"] for c in chips] == [None, "true"]
+    # Icon trạng thái ẩn với trình đọc màn hình, có tên trạng thái thay thế; project vẫn được esc().
+    assert '<span aria-hidden="true">✓</span><span class="sr-only">Completed:</span>' in chips[0]["html"]
+    assert "&lt;img src=x onerror=alert(1)&gt;" in chips[0]["html"] and "<img" not in chips[0]["html"]
+    # Click (= Enter/Space trên <button>) mở workflow của chip.
+    assert snap["view"] == "block" and snap["input"] == "wf-1" and snap["url"] == "?id=wf-1"
+    assert res["fetchLog"][-1] == "GET /workflow/wf-1"
+
+
+def test_file_tree_name_is_a_button_and_download_icon_has_a_label():
+    res = _run_sm([["eval", "renderFileTree('fe', [{ filename: 'src/a\"<b>.ts', size: 3 }])"]])
+    html = res["out"][0]
+    item = re.search(r'<div class="ft-item" data-role="fe" data-path="src/a&quot;&lt;b&gt;.ts"\s+'
+                     r'onclick="viewArtifact\(this\.dataset\.role, this\.dataset\.path\)">(.*?)</div>', html, re.S)
+    assert item, "hàng file phải giữ data-role/data-path + onclick cũ"
+    row = item.group(1)
+    # Tên file là <button> bên trong hàng: Enter/Space → click nổi lên onclick của hàng.
+    assert '<button type="button" class="ft-name ft-open">a&quot;&lt;b&gt;.ts</button>' in row
+    assert 'role="button"' not in html, "hàng chứa link ⬇ — không được tự làm role=button"
+    assert re.search(r'<a class="[^"]*ft-dl"[^>]*aria-label="Tải xuống a&quot;&lt;b&gt;.ts"', row, re.S)
+
+
+def test_keyboard_focus_styles_and_button_resets():
+    """Hợp đồng CSS (nhìn thật kiểm bằng Playwright): viền :focus-visible theo theme, button giữ dáng cũ."""
+    for sel in (".recent-chip:focus-visible", ".step-node:focus-visible .step-circle", ".ft-open:focus-visible"):
+        assert "outline: 2px solid var(--accent-l)" in _css_rule(sel), sel
+    for sel in (".recent-chip", ".step-node"):
+        rule = _css_rule(sel)
+        assert "font: inherit" in rule and "appearance: none" in rule, sel
+    assert "text-align: left" in _css_rule(".recent-chip")
+    html = HTML.read_text(encoding="utf-8")
+    assert 'tabindex="-1"' not in html
+    # Giảm chuyển động: rule toàn cục vẫn còn (bao cả transition của viền focus / chip).
+    assert re.search(r"@media \(prefers-reduced-motion: reduce\)\s*\{\s*\*, \*::before, \*::after", html)

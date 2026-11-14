@@ -212,9 +212,9 @@ Tắt tính năng: `CLARIFIER_REGEN_LOOPS=0` trong `.env`.
 **Thêm role mới:**
 1. Khai báo `MODEL_XXX = os.environ.get("XXX_MODEL", "<default>")`, thêm `XXX_MODEL` vào `.env` và khối `environment:` của agent-api trong `docker-compose.yml`.
 2. Thêm `AgentConfig` vào `AGENTS` (step_id, role, name, model, depends_on, rag_query_hint, system_prompt) và đặt các field hành vi ở bảng trên — mặc định là role `"report"` không có hành vi đặc biệt.
-3. Chèn role vào `WORKFLOW_STEPS` (và danh sách step trong `open-webui-tools/yan_agent_workflow.py`).
+3. Chèn role vào `WORKFLOW_STEPS` (và danh sách step trong `open-webui-tools/yan_agent_workflow.py`, mảng `STEPS` của giao diện `agent-api/static/workflow.html` — `label` là phần trước " Agent" trong `name` — cùng các số "15 bước" hiển thị trong trang).
 4. Nếu `regen_eligible=True`: thêm alias tên role vào `_REGEN_ROLE_RE` trong `workflow.py`. Nếu `wants_db_hint=True`: thêm câu chữ gợi ý DB cho role trong `_build_context_parts`.
-5. Chạy `python -m pytest tests/test_role_registry*.py` — test kiểm tra bảng dẫn xuất và các bất biến (codegen ⇒ trích artifact, TL board/review chỉ cho codegen, planning roles không re-gen...).
+5. Chạy `python -m pytest tests/test_role_registry*.py tests/test_workflow_ui.py` — test kiểm tra bảng dẫn xuất và các bất biến (codegen ⇒ trích artifact, TL board/review chỉ cho codegen, planning roles không re-gen...) và việc `STEPS` của UI khớp `WORKFLOW_STEPS`/`AGENTS` (thứ tự, label, tên rút gọn, số bước).
 
 ---
 
@@ -1033,7 +1033,9 @@ sqlite3 data/memory/workflows.sqlite3 \
 **Điều hướng và hiển thị:**
 
 - **Back/Forward:** URL `/ui?id=<workflow_id>` luôn khớp với workflow đang theo dõi. Mỗi lần mở một workflow khác thì có thêm một mục lịch sử; Back/Forward của trình duyệt chuyển qua lại giữa các workflow (workflow vừa rời đi sẽ ngừng poll). Back về `/ui` (không có `?id=`) thì quay lại màn hình trống. Bấm Track lại cùng ID hoặc tải lại trang không tạo mục lịch sử trùng.
-- **Recent:** mục của hôm nay chỉ hiện giờ, mục của ngày khác hiện ngày + giờ. Di chuột lên mục để xem thời điểm đầy đủ.
+- **Recent:** mục của hôm nay chỉ hiện giờ, mục của ngày khác hiện ngày + giờ. Di chuột lên mục để xem thời điểm đầy đủ. Workflow đang mở (`?id=` trên URL) có viền nổi bật.
+- **Dùng bằng bàn phím:** mục Recent, các bước trên sơ đồ 15 bước, tab và tên file artifact đều là nút thật — dùng `Tab` / `Shift+Tab` để di chuyển, `Enter` hoặc `Space` để mở (viền focus màu tím chỉ hiện khi dùng bàn phím). Trình đọc màn hình đọc được tên và trạng thái từng bước (vd. "Bước 4/15: TA — Technical Architecture (đang chạy)"), bước đang chạy được đánh dấu là bước hiện tại. Khi hệ điều hành bật giảm chuyển động (prefers-reduced-motion), các hiệu ứng nhấp nháy/xoay/chuyển cảnh được tắt.
+- **Download All:** file zip của một role được tạo ngay trên trình duyệt; liên kết tạm của file được giữ khoảng 10 giây sau khi bấm tải rồi mới thu hồi, để trình duyệt kịp lưu file kể cả khi zip lớn.
 - **Copy ID / Copy code chạy cả trên http thường:** Clipboard API của trình duyệt chỉ có trong secure context (https hoặc localhost). Khi mở UI qua `http://<ip>:8091`, UI tự chuyển sang cách sao chép cũ (`document.execCommand('copy')`). Mọi phản hồi (sao chép, hủy workflow, tải zip) hiện dưới dạng toast ở góc dưới phải, trình đọc màn hình cũng đọc được. Nếu không sao chép được, toast hiện luôn Workflow ID để chép tay.
 - **Bảng và output dài:** ô bảng tự xuống dòng (cột đầu chỉ giữ một dòng khi mọi ô của cột đều ngắn). Bảng chỉ cuộn ngang trong khung riêng khi có quá nhiều cột, bảng cao cuộn dọc với hàng tiêu đề dính trên. Thanh tab các bước dính ngay dưới header khi cuộn output dài. Bước đang chạy tự được cuộn vào khung của dải tiến trình. Trên điện thoại, thanh trạng thái thu gọn và vẫn có nút hủy.
 - **Khối code:** chỉ khối có ghi ngôn ngữ mà highlight.js hỗ trợ mới được tô màu; khối không ghi ngôn ngữ (sơ đồ ASCII, cây thư mục, log) không bao giờ bị tô. Việc tô màu chỉ chạy khi khối sắp hiện trên màn hình. Một số tên ngôn ngữ được đổi trước khi tô (bảng `HL_ALIASES` trong `workflow.html`): `tf`/`hcl`/`terraform`/`mermaid`/`text` → không tô; `conf` → nginx; `Dockerfile` → dockerfile; `Jenkinsfile`/`gradle` → groovy; `env` → ini; `shell`/`zsh` → bash. Mỗi khối code (và trình xem file artifact) có nút **Copy**.
@@ -1917,5 +1919,5 @@ Một số test đáng chú ý khi sửa code:
 | `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |
 | `tests/test_agent_app.py` | Endpoint agent-api (`/health`, `/agents`, `/agent/{role}`, `/workflow/*`, `/workflows`, artifacts, `/ui`, `/ui/static`) + recovery lúc khởi động |
 | `tests/test_rag_api_endpoints.py` | Endpoint rag-api (`/ingest`, `/reset-ingest`, `/ask`, `/retrieve`, `/projects`, `/graph/status`, entities) và `_query_rag` của agent-api |
-| `tests/test_workflow_ui.py` | UI `/ui`: không CDN, file vendor + LICENSE + phiên bản, trạng thái/poll (phần chạy JS của trang cần `node`; tự skip nếu không có) |
+| `tests/test_workflow_ui.py` | UI `/ui`: không CDN, file vendor + LICENSE + phiên bản, trạng thái/poll, `STEPS` khớp `WORKFLOW_STEPS`/`AGENTS`, truy cập bằng bàn phím, thu hồi URL tải zip trễ (phần chạy JS của trang cần `node`; tự skip nếu không có) |
 | `tests/test_ingest_incremental*.py` | Ingest tăng dần, `skipped_unchanged`, `stale_removed`, reset an toàn khi Ollama lỗi |
