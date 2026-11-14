@@ -6,7 +6,8 @@
 #
 #   ALTER CURRENT USER SET PASSWORD FROM <cũ> TO <mới>
 #
-# bằng cypher-shell bên trong container neo4j ĐANG CHẠY (database `system`).
+# bằng cypher-shell bên trong container neo4j ĐANG CHẠY (lệnh quản trị → database `system`;
+# kiểm tra đăng nhập bằng `RETURN 1` → database mặc định).
 #
 #   Mật khẩu MỚI: NEO4J_PASSWORD trong .env.secrets (tạo bằng scripts/init-secrets.sh).
 #   Mật khẩu CŨ : biến môi trường NEO4J_OLD_PASSWORD, hoặc nhập (ẩn) khi script hỏi.
@@ -64,11 +65,17 @@ cypher_quote() {
   printf "'%s'" "$s"
 }
 
-# stdin = Cypher; $1 = mật khẩu đăng nhập (truyền qua env, không qua argv).
+# stdin = Cypher; $1 = mật khẩu đăng nhập (truyền qua env, không qua argv); $2 = database
+# (tùy chọn; bỏ trống = database mặc định của server). Lệnh quản trị (ALTER CURRENT USER...)
+# phải chạy trên `system`, còn Cypher thường (RETURN 1) thì `system` từ chối.
 run_cypher() {
+  local args=(--format plain)
+  if [[ -n "${2:-}" ]]; then
+    args+=(--database "$2")
+  fi
   NEO4J_USERNAME="$neo4j_user" NEO4J_PASSWORD="$1" \
     docker exec -i -e NEO4J_USERNAME -e NEO4J_PASSWORD "$CONTAINER" \
-    cypher-shell --database system --format plain
+    cypher-shell "${args[@]}"
 }
 
 [[ -f "$SECRETS_FILE" ]] || die "chưa có $SECRETS_FILE — chạy scripts/init-secrets.sh trước."
@@ -114,7 +121,7 @@ fi
 echo "==> Đổi mật khẩu Neo4j của user $neo4j_user trong container $CONTAINER..."
 if ! printf 'ALTER CURRENT USER SET PASSWORD FROM %s TO %s;\n' \
     "$(cypher_quote "$old_password")" "$(cypher_quote "$new_password")" \
-    | run_cypher "$old_password" >/dev/null; then
+    | run_cypher "$old_password" system >/dev/null; then
   die "cypher-shell báo lỗi (xem thông báo ở trên): sai mật khẩu cũ, user đang bị khóa tạm do đăng nhập
      sai nhiều lần (chờ vài giây rồi chạy lại), hoặc Neo4j chưa sẵn sàng (docker compose ps neo4j)."
 fi

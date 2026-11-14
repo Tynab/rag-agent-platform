@@ -807,8 +807,10 @@ def test_init_secrets_refuses_sudo_into_another_users_checkout(tmp_path):
     assert not (repo / SECRETS_FILE_NAME).exists()
 
 
-# docker giả: ghi argv / env / stdin của từng lần gọi và mô phỏng xác thực của Neo4j
-# (mật khẩu hiện tại của "DB" nằm trong $FAKE_DB_PASSWORD_FILE; ALTER đổi nó sang mật khẩu mới).
+# docker giả: ghi argv / env / stdin của từng lần gọi và mô phỏng Neo4j: xác thực (mật khẩu
+# hiện tại của "DB" nằm trong $FAKE_DB_PASSWORD_FILE; ALTER đổi nó sang mật khẩu mới), và quy
+# tắc database `system` — chỉ nhận lệnh quản trị (ALTER/SHOW...), còn lệnh quản trị phải chạy
+# trên `system` (Cypher thường như `RETURN 1` trên system bị Neo4j từ chối).
 _FAKE_DOCKER = r"""#!/usr/bin/env bash
 set -u
 log="$FAKE_DOCKER_LOG"
@@ -822,8 +824,23 @@ case "${1-}" in
   exec)
     cat > "$d/stdin"
     printf '%s\n' "${NEO4J_USERNAME-}" "${NEO4J_PASSWORD-}" > "$d/env"
+    db="${NEO4J_DATABASE:-neo4j}"
+    args=("$@")
+    for ((i = 0; i < ${#args[@]} - 1; i++)); do
+      if [[ "${args[i]}" == "--database" || "${args[i]}" == "-d" ]]; then db="${args[i+1]}"; fi
+    done
     if [[ "${NEO4J_PASSWORD-}" != "$(cat "$FAKE_DB_PASSWORD_FILE")" ]]; then
       echo "The client is unauthorized due to authentication failure." >&2
+      exit 1
+    fi
+    admin=0
+    if grep -qE '^[[:space:]]*(ALTER|SHOW|CREATE|DROP|GRANT|DENY|REVOKE)[[:space:]]' "$d/stdin"; then admin=1; fi
+    if [[ "$db" == "system" && "$admin" == 0 ]]; then
+      echo "Not a recognised system command or procedure. This Cypher command can only be executed in a user database." >&2
+      exit 1
+    fi
+    if [[ "$db" != "system" && "$admin" == 1 ]]; then
+      echo "This is an administration command and it should be executed against the system database." >&2
       exit 1
     fi
     if grep -q "ALTER CURRENT USER" "$d/stdin"; then
@@ -893,6 +910,8 @@ def test_rotate_neo4j_password_passes_secrets_via_env_and_stdin_only(tmp_path):
     assert argv[:2] == ["exec", "-i"] and "cypher-shell" in argv
     assert argv[argv.index("--database") + 1] == "system"
     assert {"NEO4J_USERNAME", "NEO4J_PASSWORD"} <= set(argv), "docker exec -e KEY (không kèm giá trị)"
+    probes = [c for c in calls if c["stdin"] == "RETURN 1;\n"]
+    assert probes and all("system" not in c["argv"] for c in probes), "RETURN 1 phải chạy trên database mặc định, không phải system"
     output = res.stdout + res.stderr
     assert old not in output and _NEW_NEO4J_PASSWORD not in output
 
