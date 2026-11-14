@@ -460,6 +460,88 @@ def test_service_healthy_dependencies_have_healthcheck(compose):
     assert not bad, f"depends_on service_healthy nhưng service đích không có healthcheck: {bad}"
 
 
+def _built_services(compose: dict) -> dict[str, dict]:
+    return {name: svc for name, svc in compose["services"].items() if svc.get("build")}
+
+
+def _dockerfile(svc: dict) -> Path:
+    build = svc["build"]
+    context = build if isinstance(build, str) else build.get("context", ".")
+    dockerfile = "Dockerfile" if isinstance(build, str) else build.get("dockerfile", "Dockerfile")
+    return ROOT / context / dockerfile
+
+
+def _healthcheck_port(test: list[str]) -> int:
+    m = re.search(r"http://127\.0\.0\.1:(\d+)/health\b", " ".join(test))
+    assert m, f"healthcheck phải gọi http://127.0.0.1:<port>/health: {test}"
+    return int(m.group(1))
+
+
+def test_built_service_healthchecks_do_not_depend_on_curl(compose):
+    """R5a: image build local không cài curl/wget (không apt-get) → healthcheck dùng python của image."""
+    built = _built_services(compose)
+    assert set(built) == {"rag-api", "agent-api"}
+    for name, svc in built.items():
+        test = (svc.get("healthcheck") or {}).get("test")
+        assert isinstance(test, list) and test[:3] == ["CMD", "python", "-c"], (
+            f"{name}: healthcheck phải là [\"CMD\", \"python\", \"-c\", ...] (image không có curl): {test}"
+        )
+        assert not re.search(r"\b(curl|wget)\b", " ".join(test)), f"{name}: healthcheck không được gọi curl/wget"
+
+        lines = [ln for ln in _dockerfile(svc).read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")]
+        text = "\n".join(lines)
+        assert re.search(r"^FROM\s+python:", text, re.M), f"{name}: base image phải có python (healthcheck dùng python)"
+        assert not re.search(r"\b(curl|wget)\b", text), f"{name}: Dockerfile không cần cài curl/wget nữa"
+        # Cổng healthcheck = cổng uvicorn trong Dockerfile = cổng container được publish.
+        port = _healthcheck_port(test)
+        assert f'"--port", "{port}"' in text, f"{name}: healthcheck gọi cổng {port} nhưng uvicorn không nghe cổng đó"
+        assert any(str(p).endswith(f":{port}") for p in svc.get("ports") or []), f"{name}: cổng {port} không khớp ports:"
+
+
+@pytest.mark.parametrize("service", ["rag-api", "agent-api"])
+def test_built_service_healthcheck_command_detects_healthy_and_unhealthy(compose, service):
+    """Chạy đúng lệnh `python -c` của healthcheck với server HTTP tạm: 200 → exit 0; 500 / không ai nghe → exit ≠ 0."""
+    import http.server
+    import socket
+    import threading
+
+    test = compose["services"][service]["healthcheck"]["test"]
+    code, port = test[3], _healthcheck_port(test)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        status = 200
+
+        def do_GET(self):  # tên method do http.server quy định
+            self.send_response(self.status if self.path == "/health" else 404)
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok"}')
+
+        def log_message(self, *args):
+            pass
+
+    def run_check(target_port: int) -> int:
+        patched = code.replace(f"127.0.0.1:{port}/", f"127.0.0.1:{target_port}/")
+        assert patched != code
+        return subprocess.run([sys.executable, "-c", patched], capture_output=True, timeout=30).returncode
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        live_port = server.server_address[1]
+        assert run_check(live_port) == 0, "server trả 200 → healthcheck phải exit 0"
+        Handler.status = 500
+        assert run_check(live_port) != 0, "server trả 500 → healthcheck phải exit khác 0"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    with socket.socket() as s:  # lấy một cổng trống rồi đóng → không ai nghe
+        s.bind(("127.0.0.1", 0))
+        closed_port = s.getsockname()[1]
+    assert run_check(closed_port) != 0, "không kết nối được → healthcheck phải exit khác 0"
+
+
 def test_neo4j_runs_without_plugins_and_code_does_not_need_them(compose):
     """D5a: rag-api chỉ dùng Cypher thuần → neo4j không cài plugin (APOC tải jar từ internet mỗi lần tạo container)."""
     assert "NEO4J_PLUGINS" not in _env_keys(compose["services"]["neo4j"]), (

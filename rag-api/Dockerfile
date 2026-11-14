@@ -5,9 +5,10 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-RUN apt-get update && apt-get -y upgrade && \
-    apt-get install -y --no-install-recommends curl && \
-    rm -rf /var/lib/apt/lists/*
+# R5a: không còn lớp apt-get (trước đây chỉ để cài curl cho healthcheck và chạy
+# `apt-get upgrade`). Healthcheck trong docker-compose.yml dùng python của image.
+# Bản vá OS đến từ base image: rebuild định kỳ với `--pull` để lấy python:3.11-slim mới,
+# vd. `docker compose build --pull rag-api && docker compose up -d rag-api`.
 
 COPY requirements.txt .
 

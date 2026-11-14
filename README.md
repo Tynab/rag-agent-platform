@@ -1837,8 +1837,13 @@ docker compose up -d --build rag-api
 
 # Rebuild cả hai
 docker compose up -d --build agent-api rag-api
+
+# Rebuild kèm kéo base image mới nhất (bản vá bảo mật OS) — nên chạy định kỳ
+docker compose build --pull agent-api rag-api && docker compose up -d agent-api rag-api
 ```
 
+> **Bản vá OS (R5a):** Dockerfile của `rag-api`/`agent-api` không còn `apt-get` (trước đây chỉ để cài `curl` cho healthcheck; rag-api còn `apt-get upgrade`) — healthcheck nay dùng `python` có sẵn trong image. Gói hệ điều hành vì vậy chỉ được cập nhật khi **base image** `python:3.1x-slim` được kéo lại: rebuild định kỳ với `--pull` như lệnh trên. `--build` không kèm `--pull` sẽ dùng lại base image đã cache.
+>
 > Restart/rebuild agent-api **không** mất lịch sử workflow (SQLite trong `./data/memory`), nhưng workflow đang chạy hoặc đang chờ sẽ chuyển sang `failed` ("Bị gián đoạn do agent-api khởi động lại") và phải chạy lại — kiểm tra `curl -s localhost:8091/workflows | jq '.workflows[] | select(.status == "running" or .status == "pending")'` trước khi rebuild.
 
 ### Theo dõi log
@@ -1872,6 +1877,13 @@ docker stats
 # Vào shell container
 docker exec -it agent-api bash
 docker exec -it ollama bash
+
+# Xem kết quả healthcheck gần nhất
+docker inspect --format '{{json .State.Health}}' rag-api | jq '.Status, .Log[-1]'
+
+# Gọi /health từ BÊN TRONG container — image rag-api/agent-api không có curl, dùng python
+docker exec rag-api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5).read().decode())"
+docker exec agent-api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=5).read().decode())"
 ```
 
 ### Watchtower — Auto-update
@@ -2029,7 +2041,7 @@ Một số test đáng chú ý khi sửa code:
 
 | Test | Kiểm tra |
 |---|---|
-| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, chạy với `docker` giả); image bên thứ ba pin được qua `*_IMAGE_TAG` |
+| `tests/test_config_wiring.py` | Mọi env var code đọc đều được truyền qua khối `environment:` (hoặc `env_file: .env.secrets`) của service trong `docker-compose.yml`; `.env` không chứa giá trị secret, `.env.secrets` bị gitignore, mỗi secret chỉ tới đúng service dùng nó; `scripts/init-secrets.sh` (không ghi đè, quyền 600, không in secret) và `scripts/rotate-neo4j-password.sh` (secret chỉ qua env/stdin, chạy với `docker` giả); image bên thứ ba pin được qua `*_IMAGE_TAG`; neo4j không cài plugin; healthcheck của `rag-api`/`agent-api` dùng `python` (không curl) và được chạy thật với server HTTP tạm |
 | `tests/test_role_registry*.py` | Bảng hành vi dẫn xuất từ `AgentConfig` và các bất biến của role registry |
 | `tests/test_workflow_queue*.py` | Hàng đợi FIFO, `WORKFLOW_CONCURRENCY`, hủy workflow và các race hủy/hoàn tất |
 | `tests/test_workflow_store.py` | SQLite store, retention 500 bản ghi, khôi phục sau restart |
